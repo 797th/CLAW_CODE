@@ -28,6 +28,10 @@ pub struct ApiRequest {
 /// Streamed events emitted while processing a single assistant turn.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AssistantEvent {
+    Thinking {
+        thinking: String,
+        signature: Option<String>,
+    },
     TextDelta(String),
     ToolUse {
         id: String,
@@ -730,6 +734,16 @@ fn build_assistant_message(
 
     for event in events {
         match event {
+            AssistantEvent::Thinking {
+                thinking,
+                signature,
+            } => {
+                flush_text_block(&mut text, &mut blocks);
+                blocks.push(ContentBlock::Thinking {
+                    thinking,
+                    signature,
+                });
+            }
             AssistantEvent::TextDelta(delta) => text.push_str(&delta),
             AssistantEvent::ToolUse { id, name, input } => {
                 flush_text_block(&mut text, &mut blocks);
@@ -1729,6 +1743,47 @@ mod tests {
         assert!(error
             .to_string()
             .contains("assistant stream produced no content"));
+    }
+
+    #[test]
+    fn build_assistant_message_places_thinking_block_before_text_and_tool_use() {
+        // given
+        let events = vec![
+            AssistantEvent::Thinking {
+                thinking: "pondering".to_string(),
+                signature: Some("sig".to_string()),
+            },
+            AssistantEvent::TextDelta("hello".to_string()),
+            AssistantEvent::ToolUse {
+                id: "tool-1".to_string(),
+                name: "echo".to_string(),
+                input: "payload".to_string(),
+            },
+            AssistantEvent::MessageStop,
+        ];
+
+        // when
+        let (message, _, _) = build_assistant_message(events)
+            .expect("assistant message should preserve thinking, text, and tool blocks");
+
+        // then
+        assert_eq!(
+            message.blocks,
+            vec![
+                ContentBlock::Thinking {
+                    thinking: "pondering".to_string(),
+                    signature: Some("sig".to_string()),
+                },
+                ContentBlock::Text {
+                    text: "hello".to_string(),
+                },
+                ContentBlock::ToolUse {
+                    id: "tool-1".to_string(),
+                    name: "echo".to_string(),
+                    input: "payload".to_string(),
+                },
+            ]
+        );
     }
 
     #[test]
