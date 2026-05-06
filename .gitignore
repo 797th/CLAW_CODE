@@ -9,6 +9,7 @@ archive/
 .claw/settings.local.json
 .claw/sessions/
 .claw/plugins/
+.claw/memory/
 .claw/memory/logs/
 .claw/memory/.last-dream
 .claw/memory/dream.lock
@@ -16,6 +17,7 @@ archive/
 **/.claw/settings.local.json
 **/.claw/sessions/
 **/.claw/plugins/
+**/.claw/memory/
 **/.claw/memory/logs/
 **/.claw/memory/.last-dream
 **/.claw/memory/dream.lock

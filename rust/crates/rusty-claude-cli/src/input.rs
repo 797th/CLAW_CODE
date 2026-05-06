@@ -109,6 +109,7 @@ impl LineEditor {
         let config = Config::builder()
             .completion_type(CompletionType::List)
             .edit_mode(EditMode::Emacs)
+            .bracketed_paste(true)
             .build();
         let mut editor = Editor::<SlashCommandHelper, DefaultHistory>::with_config(config)
             .expect("rustyline editor should initialize");
