@@ -50,7 +50,7 @@ use runtime::{
     ContentBlock, ConversationMessage, ConversationRuntime, McpServer, McpServerManager,
     McpServerSpec, McpTool, MemoryManager, MessageRole, ModelPricing, PermissionMode,
     PermissionPolicy, ProjectContext, PromptCacheEvent, ResolvedPermissionMode, RuntimeError,
-    Session, TokenUsage, ToolError, ToolExecutor, UsageTracker,
+    Session, TokenUsage, ToolError, ToolExecutor, TurnSummary, UsageTracker,
 };
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
@@ -4690,6 +4690,33 @@ impl LiveCli {
         Ok(MemoryManager::new(cwd, config.memory().clone()))
     }
 
+    fn append_turn_log(&self, input: &str, summary: &TurnSummary) {
+        let Ok(manager) = self.memory_manager() else {
+            return;
+        };
+        if !manager.config().auto_memory_enabled() {
+            return;
+        }
+        let assistant_text: String = summary
+            .assistant_messages
+            .iter()
+            .flat_map(|m| m.blocks.iter())
+            .filter_map(|block| match block {
+                ContentBlock::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let trimmed = assistant_text.trim();
+        if trimmed.is_empty() {
+            return;
+        }
+        let prompt_snippet = memory_log_field(input, 1000);
+        let response_snippet = memory_log_field(trimmed, 500);
+        let entry = format!("turn prompt: {prompt_snippet}\n  response summary: {response_snippet}");
+        let _ = manager.append_daily_log(&entry);
+    }
+
     fn replace_runtime(&mut self, runtime: BuiltRuntime) -> Result<(), Box<dyn std::error::Error>> {
         self.runtime.shutdown_plugins()?;
         self.runtime = runtime;
@@ -4808,6 +4835,7 @@ impl LiveCli {
                     );
                 }
                 self.persist_session()?;
+                self.append_turn_log(input, &summary);
                 self.maybe_auto_dream_after_success();
                 Ok(())
             }
@@ -9200,6 +9228,22 @@ fn truncate_for_summary(value: &str, limit: usize) -> String {
     }
 }
 
+fn truncate_utf8_bytes(value: &str, max_bytes: usize) -> &str {
+    if value.len() <= max_bytes {
+        return value;
+    }
+    let mut end = max_bytes;
+    while !value.is_char_boundary(end) {
+        end = end.saturating_sub(1);
+    }
+    &value[..end]
+}
+
+fn memory_log_field(value: &str, max_bytes: usize) -> String {
+    let truncated = truncate_utf8_bytes(value.trim(), max_bytes);
+    serde_json::to_string(truncated).unwrap_or_else(|_| "\"\"".to_string())
+}
+
 fn truncate_output_for_display(content: &str, max_lines: usize, max_chars: usize) -> String {
     let original = content.trim_end_matches('\n');
     if original.is_empty() {
@@ -11728,6 +11772,62 @@ mod tests {
         assert_eq!(compacted, r#"{"command":"ls -la","cwd":"/tmp"}"#);
         assert!(truncated.ends_with('…'));
         assert!(truncated.chars().count() <= 281);
+    }
+
+    #[test]
+    fn truncate_utf8_bytes_backs_up_to_character_boundary() {
+        // given
+        let prefix = "a".repeat(499);
+        let value = format!("{prefix}\u{00e9}tail");
+
+        // when
+        let truncated = super::truncate_utf8_bytes(&value, 500);
+
+        // then
+        assert_eq!(truncated, prefix);
+        assert!(truncated.len() <= 500);
+    }
+
+    #[test]
+    fn truncate_utf8_bytes_keeps_short_and_boundary_aligned_text() {
+        // given
+        let short = "plain ascii";
+        let boundary_aligned = "a".repeat(500);
+        let value = format!("{boundary_aligned}\u{00e9}");
+
+        // then
+        assert_eq!(super::truncate_utf8_bytes(short, 500), short);
+        assert_eq!(super::truncate_utf8_bytes(&value, 500), boundary_aligned);
+    }
+
+    #[test]
+    fn memory_log_field_json_escapes_multiline_markdown() {
+        // given
+        let value = "hello\n- injected\r\n```";
+
+        // when
+        let encoded = super::memory_log_field(value, 100);
+
+        // then
+        assert!(encoded.starts_with('"'));
+        assert!(encoded.ends_with('"'));
+        assert!(!encoded.contains('\n'));
+        assert!(encoded.contains("\\n"));
+        assert!(encoded.contains("\\r"));
+    }
+
+    #[test]
+    fn memory_log_field_truncates_without_splitting_utf8() {
+        // given
+        let prefix = "a".repeat(499);
+        let value = format!("{prefix}\u{00e9}tail");
+
+        // when
+        let encoded = super::memory_log_field(&value, 500);
+        let decoded: String = serde_json::from_str(&encoded).expect("encoded string");
+
+        // then
+        assert_eq!(decoded, prefix);
     }
 
     #[test]

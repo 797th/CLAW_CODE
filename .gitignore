@@ -9,8 +9,22 @@ archive/
 .claw/settings.local.json
 .claw/sessions/
 .claw/plugins/
+.claw/memory/
+.claw/memory/logs/
+.claw/memory/.last-dream
+.claw/memory/dream.lock
+# Claw artifacts created by tests in nested workspaces
+**/.claw/settings.local.json
+**/.claw/sessions/
+**/.claw/plugins/
+**/.claw/memory/
+**/.claw/memory/logs/
+**/.claw/memory/.last-dream
+**/.claw/memory/dream.lock
 rust/.claw/
 .clawhip/
 status-help.txt
 tmp-cliclaw-bin/
 .env
+dream.log
+memory_state.json
