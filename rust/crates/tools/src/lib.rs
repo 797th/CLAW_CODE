@@ -2192,9 +2192,37 @@ fn run_web_fetch(input: WebFetchInput) -> Result<String, String> {
     to_pretty_json(execute_web_fetch(&input)?)
 }
 
-#[allow(clippy::needless_pass_by_value)]
+#[allow(clippy::needless_pass_by_value, clippy::unnecessary_wraps)]
 fn run_web_search(input: WebSearchInput) -> Result<String, String> {
-    to_pretty_json(execute_web_search(&input)?)
+    let max_results = input.max_results.unwrap_or(5).clamp(1, 20);
+
+    // Try SearXNG first (JSON API, zero-auth), fall back to DuckDuckGo HTML scraping.
+    let mut hits = try_searxng_search(&input.query, max_results)
+        .unwrap_or_else(|| fetch_duckduckgo_hits(&input.query));
+
+    if let Some(allowed) = input.allowed_domains.as_ref() {
+        hits.retain(|hit| host_matches_list(&hit.url, allowed));
+    }
+    if let Some(blocked) = input.blocked_domains.as_ref() {
+        hits.retain(|hit| !host_matches_list(&hit.url, blocked));
+    }
+
+    dedupe_hits(&mut hits);
+    hits.truncate(max_results);
+
+    if hits.is_empty() {
+        return Ok(format!("No web search results found for: {}", input.query));
+    }
+
+    let mut lines = vec![format!("Search results for: {}\n", input.query)];
+    for (i, hit) in hits.iter().enumerate() {
+        lines.push(format!("{}. {}", i + 1, hit.title));
+        lines.push(format!("   {}", hit.url));
+        if !hit.snippet.is_empty() {
+            lines.push(format!("   {}", hit.snippet));
+        }
+    }
+    Ok(lines.join("\n"))
 }
 
 fn run_todo_write(input: TodoWriteInput) -> Result<String, String> {
@@ -2659,14 +2687,6 @@ struct WebFetchOutput {
 }
 
 #[derive(Debug, Serialize)]
-struct WebSearchOutput {
-    query: String,
-    results: Vec<WebSearchResultItem>,
-    #[serde(rename = "durationSeconds")]
-    duration_seconds: f64,
-}
-
-#[derive(Debug, Serialize)]
 struct TodoWriteOutput {
     #[serde(rename = "oldTodos")]
     old_todos: Vec<TodoItem>,
@@ -3072,16 +3092,6 @@ struct ReplOutput {
 }
 
 #[derive(Debug, Serialize)]
-#[serde(untagged)]
-enum WebSearchResultItem {
-    SearchResult {
-        tool_use_id: String,
-        content: Vec<SearchHit>,
-    },
-    Commentary(String),
-}
-
-#[derive(Debug, Serialize)]
 struct SearchHit {
     title: String,
     url: String,
@@ -3120,58 +3130,6 @@ fn execute_web_fetch(input: &WebFetchInput) -> Result<WebFetchOutput, String> {
         result,
         duration_ms: started.elapsed().as_millis(),
         url: final_url,
-    })
-}
-
-#[allow(clippy::unnecessary_wraps)]
-fn execute_web_search(input: &WebSearchInput) -> Result<WebSearchOutput, String> {
-    let started = Instant::now();
-    let max_results = input.max_results.unwrap_or(5).clamp(1, 20);
-
-    // Try SearXNG first (JSON API, zero-auth), fall back to DuckDuckGo HTML scraping.
-    let mut hits = try_searxng_search(&input.query, max_results)
-        .unwrap_or_else(|| fetch_duckduckgo_hits(&input.query));
-
-    if let Some(allowed) = input.allowed_domains.as_ref() {
-        hits.retain(|hit| host_matches_list(&hit.url, allowed));
-    }
-    if let Some(blocked) = input.blocked_domains.as_ref() {
-        hits.retain(|hit| !host_matches_list(&hit.url, blocked));
-    }
-
-    dedupe_hits(&mut hits);
-    hits.truncate(max_results);
-
-    let summary = if hits.is_empty() {
-        format!("No web search results matched the query {:?}.", input.query)
-    } else {
-        let rendered_hits = hits
-            .iter()
-            .map(|hit| {
-                if hit.snippet.is_empty() {
-                    format!("- [{}]({})", hit.title, hit.url)
-                } else {
-                    format!("- [{}]({})\n  {}", hit.title, hit.url, hit.snippet)
-                }
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-        format!(
-            "Search results for {:?}. Synthesize results into a direct answer and include a Sources section.\n{}",
-            input.query, rendered_hits
-        )
-    };
-
-    Ok(WebSearchOutput {
-        query: input.query.clone(),
-        results: vec![
-            WebSearchResultItem::Commentary(summary),
-            WebSearchResultItem::SearchResult {
-                tool_use_id: String::from("web_search_1"),
-                content: hits,
-            },
-        ],
-        duration_seconds: started.elapsed().as_secs_f64(),
     })
 }
 
