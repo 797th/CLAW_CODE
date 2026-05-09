@@ -343,6 +343,7 @@ fn fill_random_bytes(buffer: &mut [u8]) -> io::Result<()> {
 }
 
 #[cfg(not(unix))]
+#[allow(clippy::unnecessary_wraps, clippy::cast_possible_truncation)]
 fn fill_random_bytes(buffer: &mut [u8]) -> io::Result<()> {
     use std::time::{SystemTime, UNIX_EPOCH};
 

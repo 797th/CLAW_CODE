@@ -7,7 +7,6 @@
 ///
 /// Phase 1 constraint: Subagents do not communicate with each other; they return
 /// text/code to the Manager which aggregates. Cross-agent context sharing is Phase 2.
-
 use api::{
     ApiError, InputContentBlock, InputMessage, MessageRequest, OutputContentBlock, ProviderClient,
 };
@@ -42,20 +41,13 @@ Example output:
   {"id":3,"agent":"database","brief":"Write the SQL schema for a users table with id, email, password_hash, and created_at columns."}
 ]"#;
 
-const FRONTEND_SYSTEM_PROMPT: &str = r#"You are the FrontendAgent — a specialist in UI, React, HTML, CSS, and browser APIs.
-You receive a focused task brief and must produce concrete, working code or a clear implementation.
-Output your code in fenced code blocks. Be precise — the Manager will aggregate your output directly."#;
+const FRONTEND_SYSTEM_PROMPT: &str = "You are the FrontendAgent \u{2014} a specialist in UI, React, HTML, CSS, and browser APIs.\nYou receive a focused task brief and must produce concrete, working code or a clear implementation.\nOutput your code in fenced code blocks. Be precise \u{2014} the Manager will aggregate your output directly.";
 
-const BACKEND_SYSTEM_PROMPT: &str = r#"You are the BackendAgent — a specialist in server-side logic, REST/GraphQL APIs, authentication, and Rust/Node.js/Python.
-You receive a focused task brief and must produce concrete, working code or a clear implementation.
-Output your code in fenced code blocks. Be precise — the Manager will aggregate your output directly."#;
+const BACKEND_SYSTEM_PROMPT: &str = "You are the BackendAgent \u{2014} a specialist in server-side logic, REST/GraphQL APIs, authentication, and Rust/Node.js/Python.\nYou receive a focused task brief and must produce concrete, working code or a clear implementation.\nOutput your code in fenced code blocks. Be precise \u{2014} the Manager will aggregate your output directly.";
 
-const DATABASE_SYSTEM_PROMPT: &str = r#"You are the DatabaseAgent — a specialist in SQL schema design, migrations, indexing, and query optimization.
-You receive a focused task brief and must produce concrete SQL or migration files.
-Output your code in fenced code blocks. Be precise — the Manager will aggregate your output directly."#;
+const DATABASE_SYSTEM_PROMPT: &str = "You are the DatabaseAgent \u{2014} a specialist in SQL schema design, migrations, indexing, and query optimization.\nYou receive a focused task brief and must produce concrete SQL or migration files.\nOutput your code in fenced code blocks. Be precise \u{2014} the Manager will aggregate your output directly.";
 
-const GENERIC_SYSTEM_PROMPT: &str = r#"You are a specialized coding agent. You receive a focused task brief and must produce concrete, working code or a clear implementation plan.
-Output your code in fenced code blocks. Be precise — the Manager will aggregate your output directly."#;
+const GENERIC_SYSTEM_PROMPT: &str = "You are a specialized coding agent. You receive a focused task brief and must produce concrete, working code or a clear implementation plan.\nOutput your code in fenced code blocks. Be precise \u{2014} the Manager will aggregate your output directly.";
 
 fn persona_for_agent(agent: &str) -> &'static str {
     match agent {
@@ -202,11 +194,7 @@ async fn decompose_prompt(
 // ---------------------------------------------------------------------------
 
 /// Execute a single sub-task against a specialized subagent model.
-async fn run_subagent(
-    client: Arc<ProviderClient>,
-    model: String,
-    task: SubTask,
-) -> SubTaskResult {
+async fn run_subagent(client: Arc<ProviderClient>, model: String, task: SubTask) -> SubTaskResult {
     let system_prompt = persona_for_agent(&task.agent).to_string();
     let request = MessageRequest {
         model: model.clone(),
@@ -294,9 +282,7 @@ pub fn run_orchestrate(
         .map_err(|e| MaoError::Tokio(e.to_string()))?;
 
     rt.block_on(async {
-        let client = Arc::new(
-            ProviderClient::from_model(manager_model).map_err(MaoError::Api)?,
-        );
+        let client = Arc::new(ProviderClient::from_model(manager_model).map_err(MaoError::Api)?);
 
         // ── Step 1.2: Manager decomposes the prompt ──────────────────────
         eprintln!("[mao] Manager decomposing prompt with model {manager_model}…");
@@ -307,9 +293,7 @@ pub fn run_orchestrate(
         let worker_client = if worker_model == manager_model {
             Arc::clone(&client)
         } else {
-            Arc::new(
-                ProviderClient::from_model(worker_model).map_err(MaoError::Api)?,
-            )
+            Arc::new(ProviderClient::from_model(worker_model).map_err(MaoError::Api)?)
         };
 
         let task_count = tasks.len();

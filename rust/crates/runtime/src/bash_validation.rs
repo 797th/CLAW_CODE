@@ -178,11 +178,11 @@ fn command_has_write_redirect(command: &str) -> Option<&'static str> {
                     // Determine which operator was found.
                     if bytes.get(i + 1) == Some(&b'>') {
                         return Some(">>");
-                    } else if bytes.get(i + 1) == Some(&b'&') {
-                        return Some(">&");
-                    } else {
-                        return Some(">");
                     }
+                    if bytes.get(i + 1) == Some(&b'&') {
+                        return Some(">&");
+                    }
+                    return Some(">");
                 }
             }
             _ => {}

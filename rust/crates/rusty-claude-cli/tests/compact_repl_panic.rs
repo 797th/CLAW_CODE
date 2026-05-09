@@ -84,7 +84,7 @@ fn python_pty_command(claw: &str) -> Command {
     let mut command = Command::new("python3");
     command.args([
         "-c",
-        r#"
+        r"
 import os
 import pty
 import subprocess
@@ -101,7 +101,7 @@ os.close(master)
 sys.stdout.buffer.write(stdout)
 sys.stderr.buffer.write(stderr)
 raise SystemExit(child.returncode)
-"#,
+",
         claw,
     ]);
     command

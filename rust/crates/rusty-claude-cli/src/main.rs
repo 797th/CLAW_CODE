@@ -171,7 +171,6 @@ impl ModelProvenance {
     }
 }
 
-
 fn max_tokens_for_model(model: &str) -> u32 {
     api::max_tokens_for_model(model)
 }
@@ -498,18 +497,16 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             manager_model,
             worker_model,
             output_format,
-        } => {
-            match mao::run_orchestrate(&manager_model, &worker_model, &prompt) {
-                Ok(result) => match output_format {
-                    CliOutputFormat::Json => println!("{}", result.render_json()),
-                    CliOutputFormat::Text => println!("{}", result.render_text()),
-                },
-                Err(e) => {
-                    eprintln!("orchestration error: {e}");
-                    std::process::exit(1);
-                }
+        } => match mao::run_orchestrate(&manager_model, &worker_model, &prompt) {
+            Ok(result) => match output_format {
+                CliOutputFormat::Json => println!("{}", result.render_json()),
+                CliOutputFormat::Text => println!("{}", result.render_text()),
+            },
+            Err(e) => {
+                eprintln!("orchestration error: {e}");
+                std::process::exit(1);
             }
-        }
+        },
         CliAction::HelpTopic {
             topic,
             output_format,
@@ -3733,8 +3730,7 @@ fn run_resume_command(
         SlashCommand::Plugins { action, target } => {
             // Only list is supported in resume mode (no runtime to reload)
             match action.as_deref() {
-                Some("install") | Some("uninstall") | Some("enable") | Some("disable")
-                | Some("update") => {
+                Some("install" | "uninstall" | "enable" | "disable" | "update") => {
                     return Err(
                         "resumed /plugins mutations are interactive-only; start `claw` and run `/plugins` in the REPL".into(),
                     );
@@ -4713,7 +4709,8 @@ impl LiveCli {
         }
         let prompt_snippet = memory_log_field(input, 1000);
         let response_snippet = memory_log_field(trimmed, 500);
-        let entry = format!("turn prompt: {prompt_snippet}\n  response summary: {response_snippet}");
+        let entry =
+            format!("turn prompt: {prompt_snippet}\n  response summary: {response_snippet}");
         let _ = manager.append_daily_log(&entry);
     }
 
@@ -4732,7 +4729,7 @@ impl LiveCli {
 
         match result {
             Ok(run) => {
-                self.system_prompt = build_system_prompt()?;
+                self.system_prompt = build_system_prompt(&self.model)?;
                 println!(
                     "Dream complete\n  Memory dir      {}\n  Files written   {}\n  Logs read       {}\n  Input bytes     {}",
                     run.memory_dir.display(),
@@ -4787,7 +4784,7 @@ impl LiveCli {
         let shutdown_result = runtime.shutdown_plugins();
         match (result, shutdown_result) {
             (Ok(Some(run)), Ok(())) => {
-                if let Ok(system_prompt) = build_system_prompt() {
+                if let Ok(system_prompt) = build_system_prompt(&self.model) {
                     self.system_prompt = system_prompt;
                 }
                 eprintln!(
@@ -4796,7 +4793,7 @@ impl LiveCli {
                     run.log_count
                 );
             }
-            (Ok(None), Ok(())) | (Err(runtime::DreamerError::NoLogs), Ok(())) => {}
+            (Ok(None) | Err(runtime::DreamerError::NoLogs), Ok(())) => {}
             (Err(runtime::DreamerError::Locked), Ok(())) => {}
             (Err(error), Ok(())) => eprintln!("auto-dream skipped: {error}"),
             (_, Err(error)) => eprintln!("auto-dream cleanup failed: {error}"),

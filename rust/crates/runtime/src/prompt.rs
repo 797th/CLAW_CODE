@@ -910,9 +910,15 @@ mod tests {
         std::env::set_var("HOME", &root);
         std::env::set_var("CLAW_CONFIG_HOME", root.join("missing-home"));
         std::env::set_current_dir(&root).expect("change cwd");
-        let prompt = super::load_system_prompt(&root, "2026-03-31", "linux", "6.8")
-            .expect("system prompt should load")
-            .join("\n\n");
+        let prompt = super::load_system_prompt(
+            &root,
+            "2026-03-31",
+            "linux",
+            "6.8",
+            ModelFamilyIdentity::Claude,
+        )
+        .expect("system prompt should load")
+        .join("\n\n");
         std::env::set_current_dir(previous).expect("restore cwd");
         if let Some(value) = original_home {
             std::env::set_var("HOME", value);

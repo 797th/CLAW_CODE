@@ -1432,7 +1432,7 @@ fn run_task_packet(input: TaskPacket) -> Result<String, String> {
     }))
 }
 
-#[allow(clippy::needless_pass_by_value)]
+#[allow(clippy::needless_pass_by_value, clippy::single_match_else)]
 fn run_task_get(input: TaskIdInput) -> Result<String, String> {
     let registry = global_task_registry();
     match registry.get(&input.task_id) {
@@ -1494,7 +1494,7 @@ fn run_task_list(_input: Value) -> Result<String, String> {
     }))
 }
 
-#[allow(clippy::needless_pass_by_value)]
+#[allow(clippy::needless_pass_by_value, clippy::single_match_else)]
 fn run_task_stop(input: TaskIdInput) -> Result<String, String> {
     let registry = global_task_registry();
     match registry.stop(&input.task_id) {
@@ -1516,22 +1516,7 @@ fn run_task_stop(input: TaskIdInput) -> Result<String, String> {
                         agent.name, request.dropped_messages
                     )
                 })),
-                Ok(_) if is_terminal_agent_status(&agent.status) => Err(format!(
-                    "agent {} is already in terminal state: {}",
-                    agent.agent_id, agent.status
-                )),
-                Ok(_) => {
-                    persist_agent_stopped_state(
-                        &agent,
-                        "Stop requested before the next delegated turn started.",
-                    )?;
-                    to_pretty_json(json!({
-                        "task_id": agent.agent_id,
-                        "status": "stopped",
-                        "message": format!("Agent {} stopped", agent.name)
-                    }))
-                }
-                Err(_) if is_terminal_agent_status(&agent.status) => Err(format!(
+                Ok(_) | Err(_) if is_terminal_agent_status(&agent.status) => Err(format!(
                     "agent {} is already in terminal state: {}",
                     agent.agent_id, agent.status
                 )),
@@ -1539,7 +1524,7 @@ fn run_task_stop(input: TaskIdInput) -> Result<String, String> {
                     "agent {} is not attached to the current session and cannot be stopped",
                     agent.agent_id
                 )),
-                Err(_) => {
+                Ok(_) | Err(_) => {
                     persist_agent_stopped_state(
                         &agent,
                         "Stop requested before the next delegated turn started.",
@@ -1569,7 +1554,7 @@ fn run_task_update(input: TaskUpdateInput) -> Result<String, String> {
     }
 }
 
-#[allow(clippy::needless_pass_by_value)]
+#[allow(clippy::needless_pass_by_value, clippy::single_match_else)]
 fn run_task_output(input: TaskIdInput) -> Result<String, String> {
     let registry = global_task_registry();
     match registry.output(&input.task_id) {
@@ -2799,10 +2784,10 @@ impl AgentControlState {
     }
 
     fn refresh_from_manifest(&mut self, manifest: &AgentOutput) {
-        self.name = manifest.name.clone();
-        self.manifest_file = manifest.manifest_file.clone();
-        self.output_file = manifest.output_file.clone();
-        self.session_file = manifest.session_file.clone();
+        self.name.clone_from(&manifest.name);
+        self.manifest_file.clone_from(&manifest.manifest_file);
+        self.output_file.clone_from(&manifest.output_file);
+        self.session_file.clone_from(&manifest.session_file);
     }
 }
 
@@ -2847,6 +2832,7 @@ impl AgentControlRegistry {
             .is_some_and(|control| control.running)
     }
 
+    #[allow(clippy::unnecessary_wraps)]
     fn enqueue_prompt(&self, manifest: &AgentOutput, prompt: String) -> Result<bool, String> {
         let mut inner = self
             .inner
@@ -3859,10 +3845,11 @@ where
     } else {
         "resumed"
     };
+    let model = resolve_agent_model(manifest.model.as_deref());
     let job = AgentJob {
         manifest: manifest.clone(),
         prompt: input.message,
-        system_prompt: build_agent_system_prompt(&normalized_subagent_type)?,
+        system_prompt: build_agent_system_prompt(&normalized_subagent_type, &model)?,
         allowed_tools: allowed_tools_for_subagent(&normalized_subagent_type),
     };
 
@@ -4071,10 +4058,11 @@ fn build_agent_job_from_manifest(
     prompt: String,
 ) -> Result<AgentJob, String> {
     let normalized_subagent_type = normalize_subagent_type(manifest.subagent_type.as_deref());
+    let model = resolve_agent_model(manifest.model.as_deref());
     Ok(AgentJob {
         manifest: manifest.clone(),
         prompt,
-        system_prompt: build_agent_system_prompt(&normalized_subagent_type)?,
+        system_prompt: build_agent_system_prompt(&normalized_subagent_type, &model)?,
         allowed_tools: allowed_tools_for_subagent(&normalized_subagent_type),
     })
 }
@@ -5334,7 +5322,10 @@ async fn stream_with_provider(
             },
             ApiStreamEvent::ContentBlockStop(stop) => {
                 if let Some((thinking, signature)) = pending_thinking.remove(&stop.index) {
-                    events.push(AssistantEvent::Thinking { thinking, signature });
+                    events.push(AssistantEvent::Thinking {
+                        thinking,
+                        signature,
+                    });
                 }
                 if let Some((id, name, input)) = pending_tools.remove(&stop.index) {
                     events.push(AssistantEvent::ToolUse { id, name, input });
@@ -5502,7 +5493,10 @@ fn push_output_block(
             if streaming_tool_input {
                 pending_thinking.insert(block_index, (thinking, signature));
             } else {
-                events.push(AssistantEvent::Thinking { thinking, signature });
+                events.push(AssistantEvent::Thinking {
+                    thinking,
+                    signature,
+                });
             }
         }
         OutputContentBlock::RedactedThinking { .. } => {}
@@ -5752,6 +5746,7 @@ fn normalize_subagent_type(subagent_type: Option<&str>) -> String {
     }
 }
 
+#[allow(clippy::trivially_copy_pass_by_ref)]
 fn is_zero_usize(value: &usize) -> bool {
     *value == 0
 }
@@ -6850,8 +6845,8 @@ mod tests {
         agent_permission_policy, allowed_tools_for_subagent, append_agent_output,
         build_agent_system_prompt, classify_lane_failure, derive_agent_state,
         execute_agent_with_spawn, execute_send_message_with_spawn, execute_tool,
-        extract_recovery_outcome, final_assistant_text, global_agent_registry, global_cron_registry,
-        maybe_commit_provenance, mvp_tool_specs, permission_mode_from_plugin,
+        extract_recovery_outcome, final_assistant_text, global_agent_registry,
+        global_cron_registry, maybe_commit_provenance, mvp_tool_specs, permission_mode_from_plugin,
         persist_agent_terminal_state, push_output_block, run_task_output, run_task_packet,
         run_task_stop, AgentInput, AgentJob, GlobalToolRegistry, LaneEventName, LaneFailureClass,
         ProviderRuntimeClient, SendMessageInput, SubagentToolExecutor, TaskIdInput,

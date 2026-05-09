@@ -95,6 +95,7 @@ pub struct RuntimePermissionRuleConfig {
 
 /// Runtime memory settings shared by CLI and future entrypoints.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[allow(clippy::struct_field_names)]
 pub struct MemoryConfig {
     auto_memory_enabled: bool,
     auto_memory_directory: Option<String>,

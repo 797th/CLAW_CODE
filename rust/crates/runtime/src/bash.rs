@@ -117,6 +117,7 @@ fn detect_and_emit_ship_prepared(command: &str) {
     };
     if tokens.get(git_idx + 1) != Some(&"push") {
         return;
+    }
     // Scan remaining tokens for a branch name that targets main or master.
     // Flags start with `-`; refspecs can be `main`, `master`, `HEAD:main`, etc.
     let targets_main = tokens[git_idx + 2..].iter().any(|&t| {

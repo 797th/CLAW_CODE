@@ -226,7 +226,10 @@ pub fn metadata_for_model(model: &str) -> Option<ProviderMetadata> {
     // NVIDIA NIM models are namespaced as "openai/gpt-oss-*" and served via
     // the NVIDIA NIM OpenAI-compatible endpoint. Route them before the generic
     // openai/ prefix check so they always hit the NVIDIA NIM config.
-    if canonical.starts_with("openai/gpt-oss") || canonical.starts_with("gpt-oss") || canonical.starts_with("gptoss") {
+    if canonical.starts_with("openai/gpt-oss")
+        || canonical.starts_with("gpt-oss")
+        || canonical.starts_with("gptoss")
+    {
         return Some(ProviderMetadata {
             provider: ProviderKind::NvidiaNim,
             auth_env: "NVIDIA_API_KEY",
@@ -310,7 +313,9 @@ pub fn detect_provider_kind(model: &str) -> ProviderKind {
 pub const fn model_family_identity_for_kind(kind: ProviderKind) -> runtime::ModelFamilyIdentity {
     match kind {
         ProviderKind::Anthropic => runtime::ModelFamilyIdentity::Claude,
-        ProviderKind::Xai | ProviderKind::OpenAi => runtime::ModelFamilyIdentity::Generic,
+        ProviderKind::Xai | ProviderKind::OpenAi | ProviderKind::NvidiaNim => {
+            runtime::ModelFamilyIdentity::Generic
+        }
     }
 }
 
@@ -330,9 +335,7 @@ pub fn max_tokens_for_model(model: &str) -> u32 {
         64_000
     };
 
-    model_token_limit(model)
-        .map(|limit| heuristic.min(limit.max_output_tokens))
-        .unwrap_or(heuristic)
+    model_token_limit(model).map_or(heuristic, |limit| heuristic.min(limit.max_output_tokens))
 }
 
 /// Returns the effective max output tokens for a model, preferring a plugin

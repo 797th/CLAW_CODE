@@ -250,6 +250,7 @@ impl MemoryManager {
         load_memory_prompt(&self.memory_dir()).map_err(DreamerError::Io)
     }
 
+    #[must_use]
     pub fn dream_config(&self) -> DreamerConfig {
         DreamerConfig::new(self.memory_dir())
     }
@@ -490,7 +491,9 @@ pub fn auto_dream_gate(
             .unwrap_or(Duration::ZERO);
         if elapsed < AUTO_DREAM_MIN_INTERVAL {
             return Ok(DreamGate::TooSoon {
-                remaining: AUTO_DREAM_MIN_INTERVAL - elapsed,
+                remaining: AUTO_DREAM_MIN_INTERVAL
+                    .checked_sub(elapsed)
+                    .unwrap_or(Duration::ZERO),
             });
         }
     }
@@ -853,7 +856,7 @@ fn utc_date_string(time: SystemTime) -> String {
         .unwrap_or(Duration::ZERO)
         .as_secs()
         / 86_400;
-    let (year, month, day) = civil_from_days(days as i64);
+    let (year, month, day) = civil_from_days(days.cast_signed());
     format!("{year:04}-{month:02}-{day:02}")
 }
 
@@ -869,7 +872,11 @@ fn civil_from_days(days_since_unix_epoch: i64) -> (i32, u32, u32) {
     let d = doy - (153 * mp + 2) / 5 + 1;
     let m = mp + if mp < 10 { 3 } else { -9 };
     let year = y + i64::from(m <= 2);
-    (year as i32, m as u32, d as u32)
+    (
+        i32::try_from(year).unwrap_or(0),
+        u32::try_from(m).unwrap_or(1),
+        u32::try_from(d).unwrap_or(1),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -935,7 +942,7 @@ mod tests {
         assert!(result
             .files
             .iter()
-            .any(|file| file.path == PathBuf::from("benchmark.md")));
+            .any(|file| file.path == std::path::Path::new("benchmark.md")));
     }
 
     #[test]

@@ -354,6 +354,7 @@ fn doctor_and_resume_status_emit_json_when_requested() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn resumed_inventory_commands_emit_structured_json_when_requested() {
     let root = unique_temp_dir("resume-inventory-json");
     let config_home = root.join("config-home");
