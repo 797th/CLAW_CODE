@@ -564,6 +564,7 @@ fn get_actions_section() -> String {
     [
         "# Executing actions with care".to_string(),
         "Carefully consider reversibility and blast radius. Local, reversible actions like editing files or running tests are usually fine. Actions that affect shared systems, publish state, delete data, or otherwise have high blast radius should be explicitly authorized by the user or durable workspace instructions.".to_string(),
+        "Use WebSearch when the query requires current events, live prices, recent news, or any fact that changes over time. Do not search for things answerable from training knowledge. Synthesize results into a direct answer.".to_string(),
     ]
     .join("\n")
 }

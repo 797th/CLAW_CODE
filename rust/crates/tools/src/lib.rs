@@ -519,11 +519,17 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "WebSearch",
-            description: "Search the web for current information and return cited results.",
+            description: "Search the web for current information and return cited results. Use when the query requires current events, live prices, recent news, or any fact that changes over time.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "query": { "type": "string", "minLength": 2 },
+                    "max_results": {
+                        "type": "integer",
+                        "default": 5,
+                        "minimum": 1,
+                        "maximum": 20
+                    },
                     "allowed_domains": {
                         "type": "array",
                         "items": { "type": "string" }
@@ -2364,6 +2370,7 @@ struct WebFetchInput {
 #[derive(Debug, Deserialize)]
 struct WebSearchInput {
     query: String,
+    max_results: Option<usize>,
     allowed_domains: Option<Vec<String>>,
     blocked_domains: Option<Vec<String>>,
 }
@@ -3078,6 +3085,8 @@ enum WebSearchResultItem {
 struct SearchHit {
     title: String,
     url: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    snippet: String,
 }
 
 fn execute_web_fetch(input: &WebFetchInput) -> Result<WebFetchOutput, String> {
@@ -3114,22 +3123,14 @@ fn execute_web_fetch(input: &WebFetchInput) -> Result<WebFetchOutput, String> {
     })
 }
 
+#[allow(clippy::unnecessary_wraps)]
 fn execute_web_search(input: &WebSearchInput) -> Result<WebSearchOutput, String> {
     let started = Instant::now();
-    let client = build_http_client()?;
-    let search_url = build_search_url(&input.query)?;
-    let response = client
-        .get(search_url)
-        .send()
-        .map_err(|error| error.to_string())?;
+    let max_results = input.max_results.unwrap_or(5).clamp(1, 20);
 
-    let final_url = response.url().clone();
-    let html = response.text().map_err(|error| error.to_string())?;
-    let mut hits = extract_search_hits(&html);
-
-    if hits.is_empty() && final_url.host_str().is_some() {
-        hits = extract_search_hits_from_generic_links(&html);
-    }
+    // Try SearXNG first (JSON API, zero-auth), fall back to DuckDuckGo HTML scraping.
+    let mut hits = try_searxng_search(&input.query, max_results)
+        .unwrap_or_else(|| fetch_duckduckgo_hits(&input.query));
 
     if let Some(allowed) = input.allowed_domains.as_ref() {
         hits.retain(|hit| host_matches_list(&hit.url, allowed));
@@ -3139,18 +3140,24 @@ fn execute_web_search(input: &WebSearchInput) -> Result<WebSearchOutput, String>
     }
 
     dedupe_hits(&mut hits);
-    hits.truncate(8);
+    hits.truncate(max_results);
 
     let summary = if hits.is_empty() {
         format!("No web search results matched the query {:?}.", input.query)
     } else {
         let rendered_hits = hits
             .iter()
-            .map(|hit| format!("- [{}]({})", hit.title, hit.url))
+            .map(|hit| {
+                if hit.snippet.is_empty() {
+                    format!("- [{}]({})", hit.title, hit.url)
+                } else {
+                    format!("- [{}]({})\n  {}", hit.title, hit.url, hit.snippet)
+                }
+            })
             .collect::<Vec<_>>()
             .join("\n");
         format!(
-            "Search results for {:?}. Include a Sources section in the final answer.\n{}",
+            "Search results for {:?}. Synthesize results into a direct answer and include a Sources section.\n{}",
             input.query, rendered_hits
         )
     };
@@ -3166,6 +3173,70 @@ fn execute_web_search(input: &WebSearchInput) -> Result<WebSearchOutput, String>
         ],
         duration_seconds: started.elapsed().as_secs_f64(),
     })
+}
+
+/// Try `SearXNG` JSON API. Returns `None` if `SEARXNG_URL` is not set or the
+/// request fails, so the caller can fall back to `DuckDuckGo`.
+fn try_searxng_search(query: &str, max_results: usize) -> Option<Vec<SearchHit>> {
+    let base = std::env::var("SEARXNG_URL").ok()?;
+    let client = build_http_client().ok()?;
+    let base = base.trim_end_matches('/');
+    let mut url = reqwest::Url::parse(&format!("{base}/search")).ok()?;
+    url.query_pairs_mut()
+        .append_pair("q", query)
+        .append_pair("format", "json");
+    let response = client.get(url).send().ok()?;
+    if !response.status().is_success() {
+        return None;
+    }
+    let json: serde_json::Value = response.json().ok()?;
+    let results = json.get("results")?.as_array()?;
+    let hits = results
+        .iter()
+        .take(max_results)
+        .filter_map(|item| {
+            let title = item.get("title")?.as_str()?.to_string();
+            let url = item.get("url")?.as_str()?.to_string();
+            let snippet = item
+                .get("content")
+                .and_then(|c| c.as_str())
+                .unwrap_or("")
+                .to_string();
+            Some(SearchHit {
+                title,
+                url,
+                snippet,
+            })
+        })
+        .collect::<Vec<_>>();
+    if hits.is_empty() {
+        None
+    } else {
+        Some(hits)
+    }
+}
+
+/// Fetch search hits from `DuckDuckGo` HTML (zero-config fallback).
+fn fetch_duckduckgo_hits(query: &str) -> Vec<SearchHit> {
+    let Ok(client) = build_http_client() else {
+        return Vec::new();
+    };
+    let Ok(mut url) = reqwest::Url::parse("https://html.duckduckgo.com/html/") else {
+        return Vec::new();
+    };
+    url.query_pairs_mut().append_pair("q", query);
+    let Ok(response) = client.get(url).send() else {
+        return Vec::new();
+    };
+    let final_url = response.url().clone();
+    let Ok(html) = response.text() else {
+        return Vec::new();
+    };
+    let mut hits = extract_search_hits(&html);
+    if hits.is_empty() && final_url.host_str().is_some() {
+        hits = extract_search_hits_from_generic_links(&html);
+    }
+    hits
 }
 
 fn build_http_client() -> Result<Client, String> {
@@ -3190,19 +3261,6 @@ fn normalize_fetch_url(url: &str) -> Result<String, String> {
         }
     }
     Ok(parsed.to_string())
-}
-
-fn build_search_url(query: &str) -> Result<reqwest::Url, String> {
-    if let Ok(base) = std::env::var("CLAWD_WEB_SEARCH_BASE_URL") {
-        let mut url = reqwest::Url::parse(&base).map_err(|error| error.to_string())?;
-        url.query_pairs_mut().append_pair("q", query);
-        return Ok(url);
-    }
-
-    let mut url = reqwest::Url::parse("https://html.duckduckgo.com/html/")
-        .map_err(|error| error.to_string())?;
-    url.query_pairs_mut().append_pair("q", query);
-    Ok(url)
 }
 
 fn normalize_fetched_content(body: &str, content_type: &str) -> String {
@@ -3343,6 +3401,7 @@ fn extract_search_hits(html: &str) -> Vec<SearchHit> {
             hits.push(SearchHit {
                 title: title.trim().to_string(),
                 url: decoded_url,
+                snippet: String::new(),
             });
         }
         remaining = &after_tag[end_anchor_idx + 4..];
@@ -3385,6 +3444,7 @@ fn extract_search_hits_from_generic_links(html: &str) -> Vec<SearchHit> {
             hits.push(SearchHit {
                 title: title.trim().to_string(),
                 url: decoded_url,
+                snippet: String::new(),
             });
         }
         remaining = &after_tag[end_anchor_idx + 4..];
