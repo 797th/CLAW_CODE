@@ -1,7 +1,7 @@
 /// MAO Phase 1: Agent Topologies & Task Delegation
 ///
 /// Implements the core parent-child orchestration hierarchy:
-///   1. ManagerAgent decomposes the user prompt into typed sub-task briefs (JSON)
+///   1. `ManagerAgent` decomposes the user prompt into typed sub-task briefs (JSON)
 ///   2. Specialized Subagents (Frontend, Backend, Database, Generic) execute briefs concurrently
 ///   3. Results aggregate into a unified response returned to the user
 ///
@@ -82,7 +82,7 @@ pub struct SubTaskResult {
 
 #[derive(Debug)]
 pub enum MaoError {
-    Api(api::ApiError),
+    Api(Box<api::ApiError>),
     ParseJson(String),
     NoTasks,
     Tokio(String),
@@ -103,7 +103,7 @@ impl std::error::Error for MaoError {}
 
 impl From<api::ApiError> for MaoError {
     fn from(e: api::ApiError) -> Self {
-        Self::Api(e)
+        Self::Api(Box::new(e))
     }
 }
 
@@ -111,7 +111,7 @@ impl From<api::ApiError> for MaoError {
 // Step 1.2: Decomposition loop — Manager decomposes the user prompt
 // ---------------------------------------------------------------------------
 
-/// Send prompt to the ManagerAgent and return parsed SubTasks.
+/// Send prompt to the `ManagerAgent` and return parsed `SubTask`s.
 /// The Manager is given up to `max_refinement_cycles` inference turns to
 /// produce valid JSON; on each failed parse it is asked to correct itself.
 async fn decompose_prompt(
@@ -282,7 +282,9 @@ pub fn run_orchestrate(
         .map_err(|e| MaoError::Tokio(e.to_string()))?;
 
     rt.block_on(async {
-        let client = Arc::new(ProviderClient::from_model(manager_model).map_err(MaoError::Api)?);
+        let client = Arc::new(
+            ProviderClient::from_model(manager_model).map_err(|e| MaoError::Api(Box::new(e)))?,
+        );
 
         // ── Step 1.2: Manager decomposes the prompt ──────────────────────
         eprintln!("[mao] Manager decomposing prompt with model {manager_model}…");
@@ -293,7 +295,9 @@ pub fn run_orchestrate(
         let worker_client = if worker_model == manager_model {
             Arc::clone(&client)
         } else {
-            Arc::new(ProviderClient::from_model(worker_model).map_err(MaoError::Api)?)
+            Arc::new(
+                ProviderClient::from_model(worker_model).map_err(|e| MaoError::Api(Box::new(e)))?,
+            )
         };
 
         let task_count = tasks.len();
@@ -314,14 +318,16 @@ impl OrchestrationOutput {
     pub fn render_text(&self) -> String {
         let mut out = String::new();
         for r in &self.results {
-            out.push_str(&format!(
-                "\n## Task {} — {} agent\n\n**Brief:** {}\n\n",
+            use std::fmt::Write as _;
+            let _ = write!(
+                out,
+                "\n## Task {} \u{2014} {} agent\n\n**Brief:** {}\n\n",
                 r.task.id,
                 capitalize(&r.task.agent),
                 r.task.brief,
-            ));
+            );
             if let Some(err) = &r.error {
-                out.push_str(&format!("**Error:** {err}\n"));
+                let _ = writeln!(out, "**Error:** {err}");
             } else {
                 out.push_str(&r.output);
                 out.push('\n');

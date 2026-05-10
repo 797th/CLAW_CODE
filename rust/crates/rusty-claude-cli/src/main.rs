@@ -68,12 +68,12 @@ const DEFAULT_MODEL: &str = "openai/gpt-oss-120b";
 enum ModelSource {
     /// Explicit `--model` / `--model=` CLI flag.
     Flag,
-    /// ANTHROPIC_MODEL environment variable (when no flag was passed).
+    /// `ANTHROPIC_MODEL` environment variable (when no flag was passed).
     Env,
     /// `model` key in `.claw.json` / `.claw/settings.json` (when neither
     /// flag nor env set it).
     Config,
-    /// Compiled-in DEFAULT_MODEL fallback.
+    /// Compiled-in `DEFAULT_MODEL` fallback.
     Default,
 }
 
@@ -274,7 +274,7 @@ Run `claw --help` for usage."
 
 /// #77: Classify a stringified error message into a machine-readable kind.
 ///
-/// Returns a snake_case token that downstream consumers can switch on instead
+/// Returns a `snake_case` token that downstream consumers can switch on instead
 /// of regex-scraping the prose. The classification is best-effort prefix/keyword
 /// matching against the error messages produced throughout the CLI surface.
 fn classify_error_kind(message: &str) -> &'static str {
@@ -308,9 +308,9 @@ fn classify_error_kind(message: &str) -> &'static str {
     }
 }
 
-/// #77: Split a multi-line error message into (short_reason, optional_hint).
+/// #77: Split a multi-line error message into (`short_reason`, `optional_hint`).
 ///
-/// The short_reason is the first line (up to the first newline), and the hint
+/// The `short_reason` is the first line (up to the first newline), and the hint
 /// is the remaining text or `None` if there's no newline. This prevents the
 /// runbook prose from being stuffed into the `error` field that downstream
 /// parsers expect to be the short reason alone.
@@ -360,6 +360,7 @@ fn merge_prompt_with_stdin(prompt: &str, stdin_content: Option<&str>) -> String 
     format!("{prompt}\n\n{trimmed}")
 }
 
+#[allow(clippy::too_many_lines)]
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = env::args().skip(1).collect();
     match parse_args(&args)? {
@@ -617,9 +618,9 @@ enum CliAction {
     /// MAO Phase 1: decompose prompt → spawn specialized subagents → aggregate results.
     Orchestrate {
         prompt: String,
-        /// High-reasoning model for the ManagerAgent decomposition step.
+        /// High-reasoning model for the `ManagerAgent` decomposition step.
         manager_model: String,
-        /// Model used by spawned Subagents (may equal manager_model).
+        /// Model used by spawned `Subagent`s (may equal `manager_model`).
         worker_model: String,
         output_format: CliOutputFormat,
     },
@@ -995,9 +996,9 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
         // only intercepts the bare single-word form. Catch all multi-word
         // forms here and return a structured guidance error so no network
         // call or session is created.
-        "permissions" => Err(format!(
-            "`claw permissions` is a slash command. Start `claw` and run `/permissions` inside the REPL.\n  Usage  /permissions [read-only|workspace-write|danger-full-access]"
-        )),
+        "permissions" => Err(
+            "`claw permissions` is a slash command. Start `claw` and run `/permissions` inside the REPL.\n  Usage  /permissions [read-only|workspace-write|danger-full-access]".to_string()
+        ),
         "skills" => {
             let args = join_optional_args(&rest[1..]);
             match classify_skills_slash_command(args.as_deref()) {
@@ -1033,7 +1034,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
             let mut i = 0;
             while i < args.len() {
                 if (args[i] == "--worker-model" || args[i] == "--worker") && i + 1 < args.len() {
-                    worker_model = args[i + 1].clone();
+                    worker_model.clone_from(&args[i + 1]);
                     i += 2;
                 } else {
                     prompt_parts.push(args[i].as_str());
@@ -1573,8 +1574,7 @@ fn validate_model_syntax(model: &str) -> Result<(), String> {
     // Check for spaces (malformed)
     if trimmed.contains(' ') {
         return Err(format!(
-            "invalid model syntax: '{}' contains spaces. Use provider/model format or known alias",
-            trimmed
+            "invalid model syntax: '{trimmed}' contains spaces. Use provider/model format or known alias"
         ));
     }
     // Check provider/model format: provider_id/model_id
@@ -1582,8 +1582,7 @@ fn validate_model_syntax(model: &str) -> Result<(), String> {
     if parts.len() != 2 || parts[0].is_empty() || parts[1].is_empty() {
         // #154: hint if the model looks like it belongs to a different provider
         let mut err_msg = format!(
-            "invalid model syntax: '{}'. Expected provider/model (e.g., anthropic/claude-opus-4-6) or known alias (opus, sonnet, haiku)",
-            trimmed
+            "invalid model syntax: '{trimmed}'. Expected provider/model (e.g., anthropic/claude-opus-4-6) or known alias (opus, sonnet, haiku)"
         );
         if trimmed.starts_with("gpt-") || trimmed.starts_with("gpt_") {
             err_msg.push_str("\nDid you mean `openai/");
@@ -1672,7 +1671,7 @@ fn launcher_name_from_value(value: &str) -> Option<String> {
     Path::new(trimmed)
         .file_stem()
         .and_then(|stem| stem.to_str())
-        .map(|stem| stem.to_string())
+        .map(ToString::to_string)
 }
 
 fn current_launcher_name() -> Option<String> {
@@ -1683,7 +1682,7 @@ fn current_launcher_name() -> Option<String> {
             env::current_exe().ok().and_then(|path| {
                 path.file_stem()
                     .and_then(|stem| stem.to_str())
-                    .map(|stem| stem.to_string())
+                    .map(ToString::to_string)
             })
         })
 }
@@ -3710,7 +3709,7 @@ fn run_resume_command(
                 message: Some(handle_agents_slash_command(args.as_deref(), &cwd)?),
                 json: Some(
                     serde_json::to_value(handle_agents_slash_command_json(args.as_deref(), &cwd)?)
-                        .unwrap_or_else(|_| serde_json::json!(null)),
+                        .unwrap_or(serde_json::json!(null)),
                 ),
             })
         }
@@ -3729,13 +3728,12 @@ fn run_resume_command(
         }
         SlashCommand::Plugins { action, target } => {
             // Only list is supported in resume mode (no runtime to reload)
-            match action.as_deref() {
-                Some("install" | "uninstall" | "enable" | "disable" | "update") => {
-                    return Err(
-                        "resumed /plugins mutations are interactive-only; start `claw` and run `/plugins` in the REPL".into(),
-                    );
-                }
-                _ => {}
+            if let Some("install" | "uninstall" | "enable" | "disable" | "update") =
+                action.as_deref()
+            {
+                return Err(
+                    "resumed /plugins mutations are interactive-only; start `claw` and run `/plugins` in the REPL".into(),
+                );
             }
             let cwd = env::current_dir()?;
             let loader = ConfigLoader::default_for(&cwd);
@@ -4793,8 +4791,10 @@ impl LiveCli {
                     run.log_count
                 );
             }
-            (Ok(None) | Err(runtime::DreamerError::NoLogs), Ok(())) => {}
-            (Err(runtime::DreamerError::Locked), Ok(())) => {}
+            (
+                Ok(None) | Err(runtime::DreamerError::NoLogs | runtime::DreamerError::Locked),
+                Ok(()),
+            ) => {}
             (Err(error), Ok(())) => eprintln!("auto-dream skipped: {error}"),
             (_, Err(error)) => eprintln!("auto-dream cleanup failed: {error}"),
         }
@@ -5420,7 +5420,7 @@ impl LiveCli {
                 // Propagate ok:false → non-zero exit so automation callers
                 // can rely on exit code instead of inspecting the envelope.
                 // (#68: mcp error envelopes previously always exited 0.)
-                let is_error = value.get("ok").and_then(|v| v.as_bool()) == Some(false);
+                let is_error = value.get("ok").and_then(serde_json::Value::as_bool) == Some(false);
                 println!("{}", serde_json::to_string_pretty(&value)?);
                 if is_error {
                     std::process::exit(1);
@@ -6195,8 +6195,7 @@ fn format_status_report(
             Some(raw) if raw != model => {
                 format!("\n  Model source     {} (raw: {raw})", p.source.as_str())
             }
-            Some(_) => format!("\n  Model source     {}", p.source.as_str()),
-            None => format!("\n  Model source     {}", p.source.as_str()),
+            Some(_) | None => format!("\n  Model source     {}", p.source.as_str()),
         })
         .unwrap_or_default();
     blocks.extend([
@@ -6692,9 +6691,13 @@ fn render_config_json(
 
     if let Some(section) = section {
         let section_rendered: Option<String> = match section {
+            #[allow(clippy::redundant_closure_for_method_calls)]
             "env" => runtime_config.get("env").map(|v| v.render()),
+            #[allow(clippy::redundant_closure_for_method_calls)]
             "hooks" => runtime_config.get("hooks").map(|v| v.render()),
+            #[allow(clippy::redundant_closure_for_method_calls)]
             "model" => runtime_config.get("model").map(|v| v.render()),
+            #[allow(clippy::redundant_closure_for_method_calls)]
             "plugins" => runtime_config
                 .get("plugins")
                 .or_else(|| runtime_config.get("enabledPlugins"))
@@ -8238,6 +8241,7 @@ fn resolve_cli_auth_source() -> Result<AuthSource, Box<dyn std::error::Error>> {
     Ok(resolve_cli_auth_source_for_cwd()?)
 }
 
+#[allow(clippy::result_large_err)]
 fn resolve_cli_auth_source_for_cwd() -> Result<AuthSource, api::ApiError> {
     resolve_startup_auth_source(|| Ok(None))
 }
@@ -10740,6 +10744,7 @@ mod tests {
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     #[test]
     fn removed_login_and_logout_subcommands_error_helpfully() {
         let login = parse_args(&["login".to_string()]).expect_err("login should be removed");
@@ -10921,7 +10926,7 @@ mod tests {
         // path (where they surface a misleading "missing Anthropic
         // credentials" error or burn API tokens on an empty prompt).
         let empty_err =
-            parse_args(&["".to_string()]).expect_err("empty positional arg should be rejected");
+            parse_args(&[String::new()]).expect_err("empty positional arg should be rejected");
         assert!(
             empty_err.starts_with("empty prompt:"),
             "empty-arg error should be specific, got: {empty_err}"
@@ -10932,7 +10937,7 @@ mod tests {
             whitespace_err.starts_with("empty prompt:"),
             "whitespace-only error should be specific, got: {whitespace_err}"
         );
-        let multi_empty_err = parse_args(&["".to_string(), "".to_string()])
+        let multi_empty_err = parse_args(&[String::new(), String::new()])
             .expect_err("multiple empty positional args should be rejected");
         assert!(
             multi_empty_err.starts_with("empty prompt:"),
@@ -11164,6 +11169,7 @@ mod tests {
         );
     }
 
+    #[allow(clippy::too_many_lines)]
     #[test]
     fn status_degrades_gracefully_on_malformed_mcp_config_143() {
         // #143: previously `claw status` hard-failed on any config parse error,
@@ -11266,7 +11272,7 @@ mod tests {
         );
         assert_eq!(
             json.pointer("/allowed_tools/restricted")
-                .and_then(|v| v.as_bool()),
+                .and_then(serde_json::Value::as_bool),
             Some(false),
             "default status should expose unrestricted tool state: {json}"
         );

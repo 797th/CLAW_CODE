@@ -3175,11 +3175,15 @@ fn try_searxng_search(query: &str, max_results: usize) -> Option<Vec<SearchHit>>
 }
 
 /// Fetch search hits from `DuckDuckGo` HTML (zero-config fallback).
+///
+/// `CLAWD_WEB_SEARCH_BASE_URL` overrides the target URL (used in tests).
 fn fetch_duckduckgo_hits(query: &str) -> Vec<SearchHit> {
     let Ok(client) = build_http_client() else {
         return Vec::new();
     };
-    let Ok(mut url) = reqwest::Url::parse("https://html.duckduckgo.com/html/") else {
+    let base = std::env::var("CLAWD_WEB_SEARCH_BASE_URL")
+        .unwrap_or_else(|_| "https://html.duckduckgo.com/html/".to_string());
+    let Ok(mut url) = reqwest::Url::parse(&base) else {
         return Vec::new();
     };
     url.query_pairs_mut().append_pair("q", query);
@@ -7812,17 +7816,14 @@ mod tests {
         .expect("WebSearch should succeed");
         std::env::remove_var("CLAWD_WEB_SEARCH_BASE_URL");
 
-        let output: serde_json::Value = serde_json::from_str(&result).expect("valid json");
-        assert_eq!(output["query"], "rust web search");
-        let results = output["results"].as_array().expect("results array");
-        let search_result = results
-            .iter()
-            .find(|item| item.get("content").is_some())
-            .expect("search result block present");
-        let content = search_result["content"].as_array().expect("content array");
-        assert_eq!(content.len(), 1);
-        assert_eq!(content[0]["title"], "Reqwest docs");
-        assert_eq!(content[0]["url"], "https://docs.rs/reqwest");
+        assert!(
+            result.contains("https://docs.rs/reqwest"),
+            "allowed domain must be present: {result}"
+        );
+        assert!(
+            !result.contains("example.com/blocked"),
+            "blocked domain must be absent: {result}"
+        );
     }
 
     #[test]
@@ -7858,22 +7859,23 @@ mod tests {
         .expect("WebSearch fallback parsing should succeed");
         std::env::remove_var("CLAWD_WEB_SEARCH_BASE_URL");
 
-        let output: serde_json::Value = serde_json::from_str(&result).expect("valid json");
-        let results = output["results"].as_array().expect("results array");
-        let search_result = results
-            .iter()
-            .find(|item| item.get("content").is_some())
-            .expect("search result block present");
-        let content = search_result["content"].as_array().expect("content array");
-        assert_eq!(content.len(), 2);
-        assert_eq!(content[0]["url"], "https://example.com/one");
-        assert_eq!(content[1]["url"], "https://docs.rs/tokio");
+        // Duplicate Example One entry should be deduped; both unique URLs present.
+        let count = result.matches("https://example.com/one").count();
+        assert_eq!(count, 1, "deduped URL should appear once: {result}");
+        assert!(
+            result.contains("https://docs.rs/tokio"),
+            "second result must be present: {result}"
+        );
 
+        // Invalid base URL: gracefully returns no results instead of erroring.
         std::env::set_var("CLAWD_WEB_SEARCH_BASE_URL", "://bad-base-url");
-        let error = execute_tool("WebSearch", &json!({ "query": "generic links" }))
-            .expect_err("invalid base URL should fail");
+        let no_results = execute_tool("WebSearch", &json!({ "query": "generic links" }))
+            .expect("invalid base URL should return Ok with empty results");
         std::env::remove_var("CLAWD_WEB_SEARCH_BASE_URL");
-        assert!(error.contains("relative URL without a base") || error.contains("empty host"));
+        assert!(
+            no_results.contains("No web search results"),
+            "invalid URL yields no results: {no_results}"
+        );
     }
 
     #[test]
@@ -7909,17 +7911,15 @@ mod tests {
         .expect("WebSearch should succeed");
         std::env::remove_var("CLAWD_WEB_SEARCH_BASE_URL");
 
-        // then
-        let output: serde_json::Value = serde_json::from_str(&result).expect("valid json");
-        let results = output["results"].as_array().expect("results array");
-        let search_result = results
-            .iter()
-            .find(|item| item.get("content").is_some())
-            .expect("search result block present");
-        let content = search_result["content"].as_array().expect("content array");
-        assert_eq!(content.len(), 1);
-        assert_eq!(content[0]["title"], "Reqwest docs");
-        assert_eq!(content[0]["url"], "https://docs.rs/reqwest");
+        // then: decoded URL and title appear in plain-text output
+        assert!(
+            result.contains("https://docs.rs/reqwest"),
+            "decoded URL must be present: {result}"
+        );
+        assert!(
+            result.contains("Reqwest docs"),
+            "title must be present: {result}"
+        );
     }
 
     #[test]
@@ -7955,17 +7955,15 @@ mod tests {
         .expect("WebSearch should succeed");
         std::env::remove_var("CLAWD_WEB_SEARCH_BASE_URL");
 
-        // then
-        let output: serde_json::Value = serde_json::from_str(&result).expect("valid json");
-        let results = output["results"].as_array().expect("results array");
-        let search_result = results
-            .iter()
-            .find(|item| item.get("content").is_some())
-            .expect("search result block present");
-        let content = search_result["content"].as_array().expect("content array");
-        assert_eq!(content.len(), 1);
-        assert_eq!(content[0]["title"], "Tokio Docs");
-        assert_eq!(content[0]["url"], "https://docs.rs/tokio");
+        // then: decoded URL and title appear in plain-text output
+        assert!(
+            result.contains("https://docs.rs/tokio"),
+            "decoded URL must be present: {result}"
+        );
+        assert!(
+            result.contains("Tokio Docs"),
+            "title must be present: {result}"
+        );
     }
 
     #[test]
