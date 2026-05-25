@@ -2323,10 +2323,50 @@ pub fn handle_agents_slash_command(args: Option<&str>, cwd: &Path) -> std::io::R
             let agents = load_agents_from_roots(&roots)?;
             Ok(render_agents_report(&agents))
         }
+        Some(args) if args.starts_with("list ") => {
+            let filter = args["list ".len()..].trim().to_lowercase();
+            let roots = discover_definition_roots(cwd, "agents");
+            let agents = load_agents_from_roots(&roots)?;
+            let filtered: Vec<_> = agents
+                .into_iter()
+                .filter(|a| a.name.to_lowercase().contains(&filter))
+                .collect();
+            Ok(render_agents_report(&filtered))
+        }
+        Some("show" | "info" | "describe") => {
+            let roots = discover_definition_roots(cwd, "agents");
+            let agents = load_agents_from_roots(&roots)?;
+            Ok(render_agents_report(&agents))
+        }
+        Some(args)
+            if args.starts_with("show ")
+                || args.starts_with("info ")
+                || args.starts_with("describe ") =>
+        {
+            let name = args
+                .split_once(' ')
+                .map(|(_, name)| name)
+                .unwrap_or_default()
+                .trim()
+                .to_lowercase();
+            let roots = discover_definition_roots(cwd, "agents");
+            let agents = load_agents_from_roots(&roots)?;
+            let matched: Vec<_> = agents
+                .into_iter()
+                .filter(|a| a.name.to_lowercase() == name)
+                .collect();
+            if matched.is_empty() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!("agent not found: {name}"),
+                ));
+            }
+            Ok(render_agents_report(&matched))
+        }
         Some(args) if is_help_arg(args) => Ok(render_agents_usage(None)),
         Some(args) => Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
-            format!("unknown agents subcommand: {args}. Supported: list, help"),
+            format!("unknown agents subcommand: {args}. Supported: list, show, help"),
         )),
     }
 }
@@ -2347,10 +2387,53 @@ pub fn handle_agents_slash_command_json(args: Option<&str>, cwd: &Path) -> std::
             let agents = load_agents_from_roots(&roots)?;
             Ok(render_agents_report_json(cwd, &agents))
         }
+        Some(args) if args.starts_with("list ") => {
+            let filter = args["list ".len()..].trim().to_lowercase();
+            let roots = discover_definition_roots(cwd, "agents");
+            let agents = load_agents_from_roots(&roots)?;
+            let filtered: Vec<_> = agents
+                .into_iter()
+                .filter(|a| a.name.to_lowercase().contains(&filter))
+                .collect();
+            Ok(render_agents_report_json(cwd, &filtered))
+        }
+        Some("show" | "info" | "describe") => {
+            let roots = discover_definition_roots(cwd, "agents");
+            let agents = load_agents_from_roots(&roots)?;
+            Ok(render_agents_report_json_with_action(cwd, &agents, "show"))
+        }
+        Some(args)
+            if args.starts_with("show ")
+                || args.starts_with("info ")
+                || args.starts_with("describe ") =>
+        {
+            let name = args
+                .split_once(' ')
+                .map(|(_, name)| name)
+                .unwrap_or_default()
+                .trim()
+                .to_lowercase();
+            let roots = discover_definition_roots(cwd, "agents");
+            let agents = load_agents_from_roots(&roots)?;
+            let matched: Vec<_> = agents
+                .into_iter()
+                .filter(|a| a.name.to_lowercase() == name)
+                .collect();
+            if matched.is_empty() {
+                return Ok(serde_json::json!({
+                    "kind": "agents",
+                    "action": "show",
+                    "status": "error",
+                    "error_kind": "agent_not_found",
+                    "requested": name,
+                }));
+            }
+            Ok(render_agents_report_json_with_action(cwd, &matched, "show"))
+        }
         Some(args) if is_help_arg(args) => Ok(render_agents_usage_json(None)),
         Some(args) => Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
-            format!("unknown agents subcommand: {args}. Supported: list, help"),
+            format!("unknown agents subcommand: {args}. Supported: list, show, help"),
         )),
     }
 }
@@ -3636,6 +3719,14 @@ fn render_agents_report(agents: &[AgentSummary]) -> String {
 }
 
 fn render_agents_report_json(cwd: &Path, agents: &[AgentSummary]) -> Value {
+    render_agents_report_json_with_action(cwd, agents, "list")
+}
+
+fn render_agents_report_json_with_action(
+    cwd: &Path,
+    agents: &[AgentSummary],
+    action: &str,
+) -> Value {
     let active = agents
         .iter()
         .filter(|agent| agent.shadowed_by.is_none())
@@ -3643,7 +3734,7 @@ fn render_agents_report_json(cwd: &Path, agents: &[AgentSummary]) -> Value {
     json!({
         "kind": "agents",
         "status": "ok",
-        "action": "list",
+        "action": action,
         "working_directory": cwd.display().to_string(),
         "count": agents.len(),
         "summary": {
@@ -5360,13 +5451,23 @@ mod tests {
         assert_eq!(help["status"], "ok");
         assert_eq!(help["usage"]["direct_cli"], "claw agents [list|help]");
 
-        // Unknown agents subcommands now return Err so CLI layer can exit 1.
-        let unexpected_err = handle_agents_slash_command_json(Some("show planner"), &workspace);
+        // `show <name>` is now valid. Known agent returns ok with matching entry.
+        let show_planner = handle_agents_slash_command_json(Some("show planner"), &workspace)
+            .expect("show planner should return Ok");
+        assert_eq!(show_planner["status"], "ok");
+        let show_agents = show_planner["agents"].as_array().expect("agents array");
+        assert_eq!(show_agents.len(), 1, "show by exact name returns one entry");
+        assert_eq!(show_agents[0]["name"], "planner");
+        // Missing agent returns Ok(json error) with error_kind:agent_not_found.
+        let show_missing =
+            handle_agents_slash_command_json(Some("show nonexistent-xyz"), &workspace)
+                .expect("show missing agent should return Ok");
+        assert_eq!(show_missing["status"], "error");
+        assert_eq!(show_missing["error_kind"], "agent_not_found");
+        assert_eq!(show_missing["requested"], "nonexistent-xyz");
+        // Truly unknown subcommands still Err.
+        let unexpected_err = handle_agents_slash_command_json(Some("frobnicate"), &workspace);
         assert!(unexpected_err.is_err());
-        assert!(unexpected_err
-            .unwrap_err()
-            .to_string()
-            .contains("show planner"));
 
         let _ = fs::remove_dir_all(workspace);
         let _ = fs::remove_dir_all(user_home);
@@ -5518,14 +5619,23 @@ mod tests {
         assert!(agents_help
             .contains("Sources          .claw/agents, ~/.claw/agents, $CLAW_CONFIG_HOME/agents"));
 
-        // Unknown agents subcommands now return Err (typed error) instead of Ok+help text
-        // so that the CLI layer can exit 1. The error message names the unexpected input.
-        let agents_unexpected_err = super::handle_agents_slash_command(Some("show planner"), &cwd);
-        assert!(agents_unexpected_err.is_err());
-        assert!(agents_unexpected_err
-            .unwrap_err()
-            .to_string()
-            .contains("show planner"));
+        // `show <name>` is now valid. For an agent that doesn't exist it returns Err(NotFound).
+        let agents_show_missing = super::handle_agents_slash_command(Some("show planner"), &cwd);
+        assert!(
+            agents_show_missing.is_err(),
+            "show of a missing agent should Err"
+        );
+        assert_eq!(
+            agents_show_missing.unwrap_err().kind(),
+            std::io::ErrorKind::NotFound
+        );
+        // Truly unknown subcommands still Err with InvalidInput.
+        let agents_unknown_err = super::handle_agents_slash_command(Some("frobnicate"), &cwd);
+        assert!(agents_unknown_err.is_err());
+        assert_eq!(
+            agents_unknown_err.unwrap_err().kind(),
+            std::io::ErrorKind::InvalidInput
+        );
 
         let skills_help =
             super::handle_skills_slash_command(Some("--help"), &cwd).expect("skills help");

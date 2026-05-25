@@ -302,6 +302,8 @@ fn classify_error_kind(message: &str) -> &'static str {
         "interactive_only"
     } else if message.starts_with("unknown agents subcommand:") {
         "unknown_agents_subcommand"
+    } else if message.starts_with("agent not found:") {
+        "agent_not_found"
     } else if message.contains("is not installed") {
         "plugin_not_found"
     } else if (message.contains("skill source") && message.contains("not found"))
