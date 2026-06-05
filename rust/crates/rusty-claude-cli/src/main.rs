@@ -5808,6 +5808,8 @@ struct SessionLifecycleSummary {
     pane_path: Option<PathBuf>,
     workspace_dirty: bool,
     abandoned: bool,
+    // #326: all panes matching this workspace, not just the first one
+    all_panes: Vec<TmuxPaneSnapshot>,
 }
 
 impl SessionLifecycleSummary {
@@ -5833,6 +5835,14 @@ impl SessionLifecycleSummary {
             "pane_path": self.pane_path.as_ref().map(|path| path.display().to_string()),
             "workspace_dirty": self.workspace_dirty,
             "abandoned": self.abandoned,
+            // #326: include all workspace panes in the JSON output
+            "panes": self.all_panes.iter().map(|p| {
+                json!({
+                    "pane_id": p.pane_id,
+                    "pane_command": p.current_command,
+                    "pane_path": p.current_path.display().to_string(),
+                })
+            }).collect::<Vec<_>>(),
         })
     }
 }
@@ -5894,23 +5904,31 @@ fn classify_session_lifecycle_from_panes(
     panes: Vec<TmuxPaneSnapshot>,
 ) -> SessionLifecycleSummary {
     let workspace_dirty = git_worktree_is_dirty(workspace);
-    let mut idle_shell = None;
+    let mut idle_shell: Option<TmuxPaneSnapshot> = None;
+    let mut all_workspace_panes: Vec<TmuxPaneSnapshot> = Vec::new();
+    let mut running_pane: Option<TmuxPaneSnapshot> = None;
     for pane in panes {
         if !pane_path_matches_workspace(&pane.current_path, workspace) {
             continue;
         }
+        all_workspace_panes.push(pane.clone());
         if is_idle_shell_command(&pane.current_command) {
             idle_shell.get_or_insert(pane);
-        } else {
-            return SessionLifecycleSummary {
-                kind: SessionLifecycleKind::RunningProcess,
-                pane_id: Some(pane.pane_id),
-                pane_command: Some(pane.current_command),
-                pane_path: Some(pane.current_path),
-                workspace_dirty,
-                abandoned: false,
-            };
+        } else if running_pane.is_none() {
+            running_pane = Some(pane);
         }
+    }
+
+    if let Some(pane) = running_pane {
+        return SessionLifecycleSummary {
+            kind: SessionLifecycleKind::RunningProcess,
+            pane_id: Some(pane.pane_id),
+            pane_command: Some(pane.current_command),
+            pane_path: Some(pane.current_path),
+            workspace_dirty,
+            abandoned: false,
+            all_panes: all_workspace_panes,
+        };
     }
 
     if let Some(pane) = idle_shell {
@@ -5921,6 +5939,7 @@ fn classify_session_lifecycle_from_panes(
             pane_path: Some(pane.current_path),
             workspace_dirty,
             abandoned: workspace_dirty,
+            all_panes: all_workspace_panes,
         }
     } else {
         SessionLifecycleSummary {
@@ -5930,6 +5949,7 @@ fn classify_session_lifecycle_from_panes(
             pane_path: None,
             workspace_dirty,
             abandoned: workspace_dirty,
+            all_panes: all_workspace_panes,
         }
     }
 }
@@ -17455,6 +17475,7 @@ mod tests {
                     pane_path: Some(PathBuf::from("/tmp/project")),
                     workspace_dirty: true,
                     abandoned: true,
+                    all_panes: vec![],
                 },
                 boot_preflight: test_boot_preflight(),
                 sandbox_status: runtime::SandboxStatus::default(),
@@ -17609,6 +17630,7 @@ mod tests {
                 pane_path: None,
                 workspace_dirty: false,
                 abandoned: false,
+                all_panes: vec![],
             },
             boot_preflight: test_boot_preflight(),
             sandbox_status: runtime::SandboxStatus::default(),
@@ -17662,6 +17684,7 @@ mod tests {
                 pane_path: None,
                 workspace_dirty: false,
                 abandoned: false,
+                all_panes: vec![],
             },
             boot_preflight: test_boot_preflight(),
             sandbox_status: runtime::SandboxStatus::default(),
@@ -17707,6 +17730,7 @@ mod tests {
                 pane_path: Some(PathBuf::from("/tmp/project")),
                 workspace_dirty: false,
                 abandoned: false,
+                all_panes: vec![],
             },
             boot_preflight: test_boot_preflight(),
             sandbox_status: runtime::SandboxStatus::default(),
