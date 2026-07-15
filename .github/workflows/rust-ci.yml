@@ -14,7 +14,7 @@ on:
       - USAGE.md
       - PARITY.md
       - PHILOSOPHY.md
-      - ROADMAP.md
+      - docs/planning/ROADMAP.md
       - docs/**
       - rust/**
   pull_request:
@@ -28,7 +28,7 @@ on:
       - USAGE.md
       - PARITY.md
       - PHILOSOPHY.md
-      - ROADMAP.md
+      - docs/planning/ROADMAP.md
       - docs/**
       - rust/**
   workflow_dispatch:

@@ -23,14 +23,20 @@ cargo run -p rusty-claude-cli -- prompt "explain this codebase"
 # JSON output for automation
 cargo run -p rusty-claude-cli -- --output-format json prompt "summarize src/main.rs"
 
-# Windows convenience launcher with broad/full-access defaults
+# The convenience launcher (same source, relaxed CWD guard)
 cargo run -p rusty-claude-cli --bin cliclaw --
 ```
 
-The workspace now emits two entrypoints from the same source:
+The workspace emits two entrypoints from the same `main.rs`:
 
 - `claw`: canonical binary name used by the docs and tests
-- `cliclaw`: convenience launcher intended for global Windows installs and permissive defaults
+- `cliclaw`: convenience launcher — same binary under a name that relaxes the working-directory guard (handy for global, run-from-anywhere installs)
+
+To install **both** binaries on macOS, Linux, or Windows, use the repo-root installer (see `../README.md`):
+
+```bash
+python3 ../install/install.py        # builds + installs claw and cliclaw, updates PATH
+```
 
 Older `cli797` installs still get the same launcher defaults if you already have that binary lying around.
 

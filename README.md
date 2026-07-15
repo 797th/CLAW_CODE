@@ -9,7 +9,7 @@
   ·
   <a href="./PARITY.md">Parity</a>
   ·
-  <a href="./ROADMAP.md">Roadmap</a>
+  <a href="./docs/planning/ROADMAP.md">Roadmap</a>
   ·
   <a href="https://discord.gg/5TUQKqFWd">UltraWorkers Discord</a>
 </p>
@@ -34,14 +34,15 @@ The canonical implementation lives in [`rust/`](./rust), and the current source 
 > [!IMPORTANT]
 > Start with [`USAGE.md`](./USAGE.md) for build, auth, CLI, session, and parity-harness workflows. Make `claw doctor` your first health check after building, use [`rust/README.md`](./rust/README.md) for crate-level details, read [`PARITY.md`](./PARITY.md) for the current Rust-port checkpoint, and see [`docs/container.md`](./docs/container.md) for the container-first workflow.
 >
-> **ACP / Zed status:** `claw-code` does not ship an ACP/Zed daemon entrypoint yet. Run `claw acp` (or `claw --acp`) for the current status instead of guessing from source layout; `claw acp serve` is currently a discoverability alias only, and real ACP support remains tracked separately in `ROADMAP.md`.
+> **ACP / Zed status:** `claw-code` does not ship an ACP/Zed daemon entrypoint yet. Run `claw acp` (or `claw --acp`) for the current status instead of guessing from source layout; `claw acp serve` is currently a discoverability alias only, and real ACP support remains tracked separately in `docs/planning/ROADMAP.md`.
 
 ## Current repository shape
 
 - **`rust/`** — canonical Rust workspace and the `claw` CLI binary
+- **`install/`** — cross-OS installer (`install.py`) with per-OS backends (`backends/{macos.sh,linux.sh,windows.ps1}`)
 - **`USAGE.md`** — task-oriented usage guide for the current product surface
 - **`PARITY.md`** — Rust-port parity status and migration notes
-- **`ROADMAP.md`** — active roadmap and cleanup backlog
+- **`docs/planning/`** — long-form planning artifacts (`ROADMAP.md`, `progress.txt`, `prd.json`, `dreaming.md`)
 - **`PHILOSOPHY.md`** — project intent and system-design framing
 - **`src/` + `tests/`** — companion Python/reference workspace and audit helpers; not the primary runtime surface
 
@@ -55,27 +56,82 @@ The canonical implementation lives in [`rust/`](./rust), and the current source 
 > ```
 > This repo (`ultraworkers/claw-code`) is **build-from-source only** — follow the steps below.
 
-```bash
-# 1. Clone and build
-git clone https://github.com/ultraworkers/claw-code
-cd claw-code/rust
-cargo build --workspace
+### One command, every OS
 
-# 2. Set your API settings for NVIDIA NIM (OpenAI-compatible)
+The installer is a single Python entry point that works identically on macOS, Linux, and Windows. It detects your OS, hands off to the matching native backend, builds both `claw` and `cliclaw`, copies them to a bin directory, and adds that directory to your PATH.
+
+```bash
+# 1. Clone
+git clone https://github.com/ultraworkers/claw-code
+cd claw-code
+
+# 2. Install (same command on macOS, Linux, and Windows)
+python3 install/install.py
+#    add --release for an optimized build
+
+# 3. Set your API settings for NVIDIA NIM (OpenAI-compatible)
 export OPENAI_BASE_URL="https://integrate.api.nvidia.com/v1"
 export OPENAI_API_KEY="nvapi-..."
+#    Default model in this fork: openai/gpt-oss-120b
 
-# Default model in this fork: openai/gpt-oss-120b
+# 4. Verify everything is wired correctly (open a new terminal so PATH is picked up)
+claw doctor
 
-# 3. Verify everything is wired correctly
-./target/debug/claw doctor
-
-# 4. Run a prompt
-./target/debug/claw prompt "say hello"
+# 5. Run a prompt
+claw prompt "say hello"
 ```
 
 > [!NOTE]
-> **Windows (PowerShell):** the binary is `claw.exe`, not `claw`. Use `.\target\debug\claw.exe` or run `cargo run -- prompt "say hello"` to skip the path lookup.
+> **Prerequisites:** Python 3 and a Rust toolchain (`cargo` + `rustc`) must be on your PATH. If Rust is missing the installer prints the install command for your OS.
+>
+> **What gets installed:** both `claw` (the standard CLI) and `cliclaw` (the same binary under a name that relaxes the working-directory guard — handy for launching from `C:\` or `~`). They share one `main.rs`; only the filename changes behavior at runtime.
+>
+> **Windows binary names:** on Windows the binaries are `claw.exe` and `cliclaw.exe`.
+
+<details>
+<summary><strong>What the installer does under the hood</strong></summary>
+
+```
+install/
+  install.py            # single cross-OS entry; parses flags, detects OS, dispatches
+  backends/
+    macos.sh            # macOS  — cargo build, copy both bins, update zsh/bash PATH
+    linux.sh            # Linux  — same shape, plus pkg-config/OpenSSL hints
+    windows.ps1         # Windows— cargo build, copy both .exe, update user PATH
+```
+
+The Python entry is a dispatcher only; each backend is independently runnable in its OS's native shell. Flags are identical everywhere:
+
+```bash
+python3 install/install.py [--release|--debug] [--no-verify] [--install-dir DIR] [--no-path-update]
+```
+
+Each backend:
+1. `cargo build --workspace` (debug or release) — produces `claw` and `cliclaw`.
+2. Copies both binaries into a bin directory (`$CARGO_HOME/bin`, `~/.cargo/bin`, or `~/.local/bin` on Unix; `%CARGO_HOME%\bin`, `%USERPROFILE%\.cargo\bin`, or `%USERPROFILE%\.local\bin` on Windows — override with `--install-dir`).
+3. Adds that directory to your PATH idempotently (Unix: appends to `~/.zshrc` / `~/.bashrc`; Windows: sets the User `Path` env var).
+4. Runs `claw --version` as a smoke test (skip with `--no-verify`).
+
+</details>
+
+### Manual build (no installer)
+
+If you'd rather build by hand:
+
+```bash
+cd claw-code/rust
+cargo build --workspace
+
+# macOS/Linux
+./target/debug/claw doctor
+./target/debug/claw prompt "say hello"
+
+# Windows PowerShell
+.\target\debug\claw.exe doctor
+.\target\debug\claw.exe prompt "say hello"
+```
+
+**Binary location:** `rust/target/debug/claw` (or `claw.exe` on Windows) after a debug build; `rust/target/release/claw` after `--release`. `cargo install --path . --force` from the `rust/` directory installs `claw` to `~/.cargo/bin`.
 
 ### Windows setup
 
@@ -87,125 +143,69 @@ export OPENAI_API_KEY="nvapi-..."
    cargo --version
    ```
    If this fails, reopen your terminal or run the PATH setup from the Rust installer output, then retry.
-3. **Clone and build** (works in PowerShell, Git Bash, or WSL):
+3. **Clone and install** (works in PowerShell, Git Bash, or WSL):
    ```powershell
    git clone https://github.com/ultraworkers/claw-code
-   cd claw-code/rust
-   cargo build --workspace
+   cd claw-code
+   python install\install.py
    ```
-4. **Run** (PowerShell — note `.exe` and backslash):
+4. **Run** (PowerShell — open a new terminal so PATH is picked up):
    ```powershell
    $env:OPENAI_BASE_URL = "https://integrate.api.nvidia.com/v1"
    $env:OPENAI_API_KEY = "nvapi-..."
-   .\target\debug\claw.exe prompt "say hello"
+   claw.exe prompt "say hello"
    ```
 
 **Git Bash / WSL** are optional alternatives, not requirements. If you prefer bash-style paths (`/c/Users/you/...` instead of `C:\Users\you\...`), Git Bash (ships with Git for Windows) works well. In Git Bash, the `MINGW64` prompt is expected and normal — not a broken install.
 
-## Post-build: locate the binary and verify
+## Locate the binary and verify
 
-After running `cargo build --workspace`, the `claw` binary is built but **not** automatically installed to your system. Here's where to find it and how to verify the build succeeded.
-
-### Binary location
-
-After `cargo build --workspace` in `claw-code/rust/`:
-
-**Debug build (default, faster compile):**
-- **macOS/Linux:** `rust/target/debug/claw`
-- **Windows:** `rust/target/debug/claw.exe`
-
-**Release build (optimized, slower compile):**
-- **macOS/Linux:** `rust/target/release/claw`
-- **Windows:** `rust/target/release/claw.exe`
-
-If you ran `cargo build` without `--release`, the binary is in the `debug/` folder.
-
-### Verify the build succeeded
-
-Test the binary directly using its path:
+After a manual `cargo build --workspace` in `claw-code/rust/`, the binaries are built but **not** installed to your system. Use the installer (`python3 install/install.py`) to install them to your PATH, or invoke them directly:
 
 ```bash
 # macOS/Linux (debug build)
-./rust/target/debug/claw --help
 ./rust/target/debug/claw doctor
 
 # Windows PowerShell (debug build)
-.\rust\target\debug\claw.exe --help
 .\rust\target\debug\claw.exe doctor
 ```
 
-If these commands succeed, the build is working. `claw doctor` is your first health check — it validates your API key, model access, and tool configuration.
+`claw doctor` is your first health check — it validates your API key, model access, and tool configuration.
 
-### Optional: Add to PATH
+### Add to PATH
 
-If you want to run `claw` from any directory without the full path, choose one of these approaches:
-
-**Option 1: Symlink (macOS/Linux)**
-```bash
-ln -s $(pwd)/rust/target/debug/claw /usr/local/bin/claw
-```
-Then reload your shell and test:
-```bash
-claw --help
-```
-
-**Option 2: Use `cargo install` (all platforms)**
-
-Build and install to Cargo's default location (`~/.cargo/bin/`, which is usually on PATH):
-```bash
-# From the claw-code/rust/ directory
-cargo install --path . --force
-
-# Then from anywhere
-claw --help
-```
-
-**Option 3: Update shell profile (bash/zsh)**
-
-Add this line to `~/.bashrc` or `~/.zshrc`:
-```bash
-export PATH="$(pwd)/rust/target/debug:$PATH"
-```
-
-Reload your shell:
-```bash
-source ~/.bashrc  # or source ~/.zshrc
-claw --help
-```
+- **Easiest:** `python3 install/install.py` — builds and installs both binaries and updates your PATH for you.
+- **macOS/Linux manual:** `cargo install --path . --force` from the `rust/` directory installs `claw` to `~/.cargo/bin`.
+- **Windows manual:** the installer is the recommended path on Windows; it sets the User `Path` env var correctly.
 
 ### Troubleshooting
 
-- **"command not found: claw"** — The binary is in `rust/target/debug/claw`, but it's not on your PATH. Use the full path `./rust/target/debug/claw` or symlink/install as above.
-- **"permission denied"** — On macOS/Linux, you may need `chmod +x rust/target/debug/claw` if the executable bit isn't set (rare).
-- **Debug vs. release** — If the build is slow, you're in debug mode (default). Add `--release` to `cargo build` for faster runtime, but the build itself will take 5–10 minutes.
+- **"command not found: claw"** — open a new terminal so the PATH update from the installer takes effect, or re-run `python3 install/install.py`.
+- **"cargo was not found"** — install Rust from <https://rustup.rs/> first; the installer needs both `cargo` and `rustc` on PATH.
+- **"permission denied"** — on macOS/Linux, you may need `chmod +x rust/target/debug/claw` after a manual build (rare).
+- **Debug vs. release** — if the build is slow, you're in debug mode (default). Add `--release` for faster runtime, but the build itself will take 5–10 minutes.
 
 > [!NOTE]
 > **Auth:** claw requires an **API key** (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, etc.) — Claude subscription login is not a supported auth path.
 
 Run the workspace test suite after verifying the binary works:
 
-NVIDIA NIM note: this fork primarily targets GPT-OSS through the OpenAI-compatible endpoint at `https://integrate.api.nvidia.com/v1`.
-
 ```bash
 cd rust
 cargo test --workspace
 ```
 
-### Windows global launcher
+> NVIDIA NIM note: this fork primarily targets GPT-OSS through the OpenAI-compatible endpoint at `https://integrate.api.nvidia.com/v1`.
 
-If you want a Claude Code-style command you can run from any folder in PowerShell:
+### The `cliclaw` launcher
 
-```powershell
-Set-ExecutionPolicy -Scope Process Bypass
-.\install-cliclaw.ps1 -Profile release
-cliclaw
+The installer builds **both** `claw` and `cliclaw`. They are the same binary (one `main.rs`); only the filename changes behavior at runtime. When launched as `cliclaw`, the CLI keeps the folder you launched from as the active workspace and allows broad working directories (such as your home folder) — useful for a global, run-from-anywhere command:
+
+```bash
+cliclaw prompt "review this repository"
 ```
 
-`cliclaw` keeps the folder you launched from as the active workspace, defaults to `danger-full-access`, and enables broad-CWD runs.
-
-It also defaults to the NVIDIA NIM GPT-OSS model family in this fork.
-
-Legacy `cli797` installs still receive the same permissive launcher defaults.
+`claw` uses the safe working-directory defaults; `cliclaw` relaxes that guard. The behavior is also overridable via the `RUSTY_CLAUDE_LAUNCHER_NAME` env var. Older `cli797` binaries map to the same permissive launcher defaults for compatibility.
 
 ## Documentation map
 
@@ -213,7 +213,7 @@ Legacy `cli797` installs still receive the same permissive launcher defaults.
 - [`rust/README.md`](./rust/README.md) — crate map, CLI surface, features, workspace layout
 - [`PARITY.md`](./PARITY.md) — parity status for the Rust port
 - [`rust/MOCK_PARITY_HARNESS.md`](./rust/MOCK_PARITY_HARNESS.md) — deterministic mock-service harness details
-- [`ROADMAP.md`](./ROADMAP.md) — active roadmap and open cleanup work
+- [`docs/planning/ROADMAP.md`](./docs/planning/ROADMAP.md) — active roadmap and open cleanup work
 - [`PHILOSOPHY.md`](./PHILOSOPHY.md) — why the project exists and how it is operated
 
 ## Ecosystem

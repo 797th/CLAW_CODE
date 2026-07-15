@@ -28,6 +28,17 @@ cargo build --workspace
 
 ## Install / build the workspace
 
+### One command, every OS (recommended)
+
+```bash
+python3 install/install.py            # debug build (default)
+python3 install/install.py --release  # optimized build
+```
+
+This works identically on macOS, Linux, and Windows. It builds both `claw` and `cliclaw`, copies them into a bin directory (`$CARGO_HOME/bin`, `~/.cargo/bin`, or `~/.local/bin` on Unix; the equivalent on Windows), and adds that directory to your PATH. Open a new terminal afterward so the PATH change takes effect. Prerequisites: Python 3 and a Rust toolchain (`cargo` + `rustc`) on PATH. See `README.md` for details and the `--install-dir` / `--no-path-update` flags.
+
+### Manual build
+
 ```bash
 cd rust
 cargo build --workspace
@@ -44,19 +55,18 @@ export OPENAI_API_KEY="nvapi-..."
 
 then `claw` defaults to `openai/gpt-oss-120b`. You can switch to `openai/gpt-oss-20b` or the short aliases `gpt-oss` / `gpt-oss-20b` as needed.
 
-On Windows, the workspace also builds `rust/target/debug/cliclaw.exe`. When launched as `cliclaw`, the CLI keeps the directory you launched from as the active workspace, defaults to `danger-full-access`, allows broad-CWD runs, and uses the NVIDIA NIM GPT-OSS model family by default.
+The installer builds **both** `claw` and `cliclaw` on every OS. On Windows these are `claw.exe` and `cliclaw.exe`. They share one `main.rs`; the filename changes behavior at runtime — when launched as `cliclaw`, the CLI keeps the directory you launched from as the active workspace, defaults to `danger-full-access`, and allows broad-CWD runs.
 
-## Windows global launcher (`cliclaw`)
+## Global launcher (`cliclaw`)
 
-If you want a Claude Code-style global command from any terminal window:
+If you want a Claude Code-style global command from any terminal window, the installer already provides it:
 
-```powershell
-Set-ExecutionPolicy -Scope Process Bypass
-.\install-cliclaw.ps1 -Profile release
-cliclaw
+```bash
+python3 install/install.py        # builds + installs both claw and cliclaw
+cliclaw                           # now available from any directory, any OS
 ```
 
-The installer builds `cliclaw.exe`, copies it into a user-level bin directory, and adds that directory to your PATH when needed. After installation, running `cliclaw` from `C:\some\project` starts the CLI in `C:\some\project`.
+The installer copies `cliclaw` into a user-level bin directory and adds that directory to your PATH when needed. After installation, running `cliclaw` from `C:\some\project` (Windows) or any folder (macOS/Linux) starts the CLI right there.
 
 ## Quick start
 
@@ -214,9 +224,9 @@ cd rust
 ./target/debug/claw --allowedTools read,glob "inspect the runtime crate"
 ```
 
-`cliclaw` bakes in the broad/full-access defaults already, so a Windows install launched through `cliclaw` behaves like:
+`cliclaw` bakes in the broad/full-access defaults already, so launching through `cliclaw` (any OS) behaves like:
 
-```powershell
+```bash
 cliclaw
 cliclaw prompt "review this repository"
 ```

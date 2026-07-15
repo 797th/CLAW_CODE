@@ -11,7 +11,7 @@ FILES = [
     ROOT / 'USAGE.md',
     ROOT / 'PARITY.md',
     ROOT / 'PHILOSOPHY.md',
-    ROOT / 'ROADMAP.md',
+    ROOT / 'docs' / 'planning' / 'ROADMAP.md',
     ROOT / '.github' / 'FUNDING.yml',
 ]
 FILES.extend(sorted((ROOT / 'docs').rglob('*.md')) if (ROOT / 'docs').exists() else [])
