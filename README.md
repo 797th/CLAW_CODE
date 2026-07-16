@@ -126,14 +126,13 @@ That opens the interactive assistant. To send one prompt and exit:
 clawcli prompt "say hello"
 ```
 
-### Always-on concise responses
+### Always-on Caveman responses
 
-`clawcli` includes a Caveman-style concise response policy in its built-in
-system prompt. It starts on the first turn for interactive, one-shot, and
-resumed sessions, so no `/caveman` command or skill installation is needed.
-Technical content stays intact: code, commands, paths, identifiers, URLs, and
-exact errors remain unchanged. Ask for normal mode or more detail whenever a
-long-form explanation is useful.
+`clawcli` includes Caveman's default full communication style in its built-in
+system prompt. It keeps technical content intact while dropping filler,
+articles, and verbosity across interactive, one-shot, resumed, and
+model-switched sessions, so no `/caveman` command or skill installation is
+needed. Say `normal mode` or `stop caveman` to use normal prose.
 
 `clawcli` also includes an always-on Superpowers-style development workflow.
 For non-trivial changes it automatically applies focused discovery,

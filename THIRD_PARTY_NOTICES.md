@@ -2,7 +2,7 @@
 
 ## Caveman
 
-Claw Code's always-on concise-response rules are adapted from
+Claw Code's always-on Caveman communication rules are adapted from
 [Julius Brussee's caveman project](https://github.com/JuliusBrussee/caveman).
 The upstream project is MIT licensed:
 

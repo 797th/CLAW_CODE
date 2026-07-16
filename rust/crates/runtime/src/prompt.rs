@@ -54,21 +54,26 @@ const MAX_INSTRUCTION_FILE_CHARS: usize = 4_000;
 const MAX_TOTAL_INSTRUCTION_CHARS: usize = 12_000;
 const MAX_GIT_DIFF_CHARS: usize = 50_000;
 
-/// Always-on concise response rules adapted from Julius Brussee's caveman
-/// skill. Keeping this in the shared prompt builder makes the behavior apply
-/// to interactive, one-shot, resumed, and model-switched sessions alike.
-pub const CAVEMAN_SYSTEM_PROMPT: &str = r#"# Always-on concise response style
+/// Always-on caveman communication rules adapted from Julius Brussee's
+/// `caveman` skill. Keeping this in the shared prompt builder makes the
+/// behavior apply to interactive, one-shot, resumed, and model-switched
+/// sessions alike.
+pub const CAVEMAN_SYSTEM_PROMPT: &str = r#"# Always-on caveman communication
 
-Use terse, high-signal language in every reply. This style is active from the first turn; do not wait for a command or skill invocation.
+Respond terse like smart caveman. Keep all technical substance; only fluff die. Default intensity is full. This style is active every response from the first turn; no command or skill invocation required.
 
-- Keep technical substance, decisions, necessary reasoning, caveats, and next steps. Remove filler, pleasantries, repetition, and empty hedging.
-- Short sentences and fragments are fine when meaning stays clear. Do not narrate tool calls or add decorative headings, tables, or emoji unless useful or requested.
+- Drop articles (`a`, `an`, `the`), filler, pleasantries, repetition, and empty hedging when meaning stays clear. Fragments and short sentences okay.
+- Use short, direct wording. Pattern: `[thing] [action] [reason]. [next step].`
+- Do not narrate tool calls. Do not add decorative headings, tables, or emoji unless useful or requested.
 - Preserve code, commands, paths, URLs, identifiers, API names, configuration keys, and exact error text verbatim. Keep code blocks unchanged.
-- Do not invent prose abbreviations. Use standard technical terms and the user's dominant language.
-- Keep code, commit messages, and pull-request descriptions professional and readable; concise does not mean caveman wording inside those artifacts.
-- Use complete, unambiguous prose for security warnings, irreversible actions, confirmations, multi-step procedures, and situations where compression could cause a mistake.
-- Never announce or label this style, and never provide a normal answer followed by a style recap.
-- If the user asks for normal mode, more detail, or clarification, follow that request for the relevant response; resume concise style afterward unless they ask to keep it off.
+- Keep standard technical terms and acronyms. Never invent prose abbreviations such as `cfg`, `impl`, `req`, or `res`. Preserve the user's dominant language.
+- Never announce or label this style. Never give a normal answer followed by a caveman recap. Do not use literal grunts unless they carry meaning.
+- For security warnings, irreversible actions, confirmations, multi-step sequences, or ambiguity caused by compression, use complete unambiguous prose. Resume terse style after clarity is restored.
+- Keep code, commit messages, and pull-request descriptions professional and readable; code artifacts are not caveman prose.
+- If the user says `stop caveman` or `normal mode`, use normal prose until the user asks to resume.
+
+Instead of: `Sure! I'd be happy to help. The issue is likely caused by your authentication middleware not properly validating token expiry.`
+Say: `Bug in auth middleware. Token expiry check wrong. Fix:`
 "#;
 
 /// Always-on software-development workflow rules adapted from Jesse Vincent's
@@ -1418,7 +1423,7 @@ mod tests {
     }
 
     #[test]
-    fn embeds_always_on_concise_response_style() {
+    fn embeds_always_on_caveman_response_style() {
         let project_context = ProjectContext {
             cwd: PathBuf::from("/tmp/project"),
             current_date: "2026-03-31".to_string(),
@@ -1430,10 +1435,14 @@ mod tests {
             .with_project_context(project_context)
             .render();
 
-        assert!(prompt.contains("# Always-on concise response style"));
-        assert!(prompt.contains("active from the first turn"));
+        assert!(prompt.contains("# Always-on caveman communication"));
+        assert!(prompt.contains("Default intensity is full"));
+        assert!(prompt.contains("Drop articles"));
+        assert!(prompt.contains("Fragments and short sentences okay"));
+        assert!(prompt.contains("Do not add decorative headings, tables, or emoji"));
         assert!(prompt.contains("Keep code blocks unchanged."));
-        assert!(prompt.contains("Use complete, unambiguous prose"));
+        assert!(prompt.contains("Never announce or label this style"));
+        assert!(prompt.contains("complete unambiguous prose"));
     }
 
     #[test]
