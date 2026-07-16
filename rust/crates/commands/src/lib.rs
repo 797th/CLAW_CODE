@@ -716,6 +716,13 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
         resume_supported: true,
     },
     SlashCommandSpec {
+        name: "workflow",
+        aliases: &[],
+        summary: "Inspect or advance the SAW-style workflow gate (Spec/Implement/Verify/Review/Done)",
+        argument_hint: Some("[status|start <task-ref>|advance|gate <kind> <detail>]"),
+        resume_supported: false,
+    },
+    SlashCommandSpec {
         name: "tokens",
         aliases: &[],
         summary: "Show token count for the current conversation",
@@ -1207,6 +1214,16 @@ pub enum SlashCommand {
     History {
         count: Option<String>,
     },
+    /// SAW-style workflow gate command (Task 8). `action` is the raw
+    /// remainder after `/workflow` (e.g. `"status"`, `"start TASK-1"`,
+    /// `"advance"`, `"gate test_run pytest passed"`), unparsed -- the
+    /// dispatcher (see `rusty-claude-cli::main`) tokenizes it further since
+    /// it needs to mutate session-owned `WorkflowState`, which this crate
+    /// does not have access to. `None` (bare `/workflow`) and unrecognized
+    /// first tokens both render usage help at dispatch time.
+    Workflow {
+        action: Option<String>,
+    },
     Unknown(String),
     Team {
         action: Option<String>,
@@ -1351,6 +1368,7 @@ impl SlashCommand {
             Self::OutputStyle { .. } => Cow::Borrowed("/output-style"),
             Self::AddDir { .. } => Cow::Borrowed("/add-dir"),
             Self::Team { .. } => Cow::Borrowed("/team"),
+            Self::Workflow { .. } => Cow::Borrowed("/workflow"),
             Self::Sandbox => Cow::Borrowed("/sandbox"),
             Self::Mcp { .. } => Cow::Borrowed("/mcp"),
             Self::Export { .. } => Cow::Borrowed("/export"),
@@ -1570,6 +1588,7 @@ pub fn validate_slash_command_input(
         "history" => SlashCommand::History {
             count: optional_single_arg(command, &args, "[count]")?,
         },
+        "workflow" => SlashCommand::Workflow { action: remainder },
         other => SlashCommand::Unknown(other.to_string()),
     }))
 }
@@ -5567,6 +5586,7 @@ pub fn handle_slash_command(
         | SlashCommand::Team { .. }
         | SlashCommand::Setup
         | SlashCommand::Custom { .. }
+        | SlashCommand::Workflow { .. }
         | SlashCommand::Unknown(_) => None,
     }
 }
@@ -6190,7 +6210,7 @@ mod tests {
         assert!(help.contains("aliases: /skill"));
         assert!(help.contains("/login"));
         assert!(!help.contains("/logout"));
-        assert_eq!(slash_command_specs().len(), 142);
+        assert_eq!(slash_command_specs().len(), 143);
         assert!(resume_supported_slash_commands().len() >= 39);
     }
 
@@ -6284,6 +6304,89 @@ mod tests {
         assert!(session_error.contains("  Usage            /session switch <session-id>"));
         assert!(plugin_error.contains("Unexpected arguments for /plugin enable."));
         assert!(plugin_error.contains("  Usage            /plugin enable <name>"));
+    }
+
+    #[test]
+    fn parses_bare_workflow_command_with_no_action() {
+        let parsed = SlashCommand::parse("/workflow")
+            .expect("parse should succeed")
+            .expect("should produce a command");
+        assert_eq!(parsed, SlashCommand::Workflow { action: None });
+    }
+
+    #[test]
+    fn parses_workflow_status_subcommand() {
+        let parsed = SlashCommand::parse("/workflow status")
+            .expect("parse should succeed")
+            .expect("should produce a command");
+        assert_eq!(
+            parsed,
+            SlashCommand::Workflow {
+                action: Some("status".to_string())
+            }
+        );
+    }
+
+    #[test]
+    fn parses_workflow_start_subcommand_with_task_ref() {
+        let parsed = SlashCommand::parse("/workflow start TASK-8")
+            .expect("parse should succeed")
+            .expect("should produce a command");
+        assert_eq!(
+            parsed,
+            SlashCommand::Workflow {
+                action: Some("start TASK-8".to_string())
+            }
+        );
+    }
+
+    #[test]
+    fn parses_workflow_advance_subcommand() {
+        let parsed = SlashCommand::parse("/workflow advance")
+            .expect("parse should succeed")
+            .expect("should produce a command");
+        assert_eq!(
+            parsed,
+            SlashCommand::Workflow {
+                action: Some("advance".to_string())
+            }
+        );
+    }
+
+    #[test]
+    fn parses_workflow_gate_subcommand_with_kind_and_multiword_detail() {
+        let parsed = SlashCommand::parse("/workflow gate test_run pytest -k foo passed")
+            .expect("parse should succeed")
+            .expect("should produce a command");
+        assert_eq!(
+            parsed,
+            SlashCommand::Workflow {
+                action: Some("gate test_run pytest -k foo passed".to_string())
+            }
+        );
+    }
+
+    #[test]
+    fn parses_workflow_unknown_subcommand_verbatim_for_dispatch_time_usage_fallback() {
+        // Unknown subcommands are not rejected at parse time -- the raw
+        // remainder is captured so the dispatcher (main.rs) can render
+        // usage help, matching the "bare or unknown -> usage help"
+        // requirement rather than a hard parse error.
+        let parsed = SlashCommand::parse("/workflow frobnicate")
+            .expect("parse should succeed")
+            .expect("should produce a command");
+        assert_eq!(
+            parsed,
+            SlashCommand::Workflow {
+                action: Some("frobnicate".to_string())
+            }
+        );
+    }
+
+    #[test]
+    fn workflow_slash_name_is_stable() {
+        let parsed = SlashCommand::Workflow { action: None };
+        assert_eq!(parsed.slash_name(), "/workflow");
     }
 
     #[test]

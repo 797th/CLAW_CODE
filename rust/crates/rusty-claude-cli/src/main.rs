@@ -66,6 +66,7 @@ use runtime::{
     RuntimeError, RuntimeInvalidHookConfig, Session, TokenUsage, ToolError, ToolExecutor,
     TurnSummary, UsageTracker,
 };
+use runtime::{GateCheck, GateEvidence, WorkflowState};
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
 use tools::{
@@ -7563,7 +7564,8 @@ fn run_resume_command(
         | SlashCommand::AddDir { .. }
         | SlashCommand::Team { .. }
         | SlashCommand::Setup
-        | SlashCommand::Custom { .. } => Err("unsupported resumed slash command".into()),
+        | SlashCommand::Custom { .. }
+        | SlashCommand::Workflow { .. } => Err("unsupported resumed slash command".into()),
     }
 }
 
@@ -9088,6 +9090,7 @@ impl LiveCli {
             SlashCommand::Plugins { action, target } => {
                 self.handle_plugins_command(action.as_deref(), target.as_deref())?
             }
+            SlashCommand::Workflow { action } => self.handle_workflow_command(action.as_deref())?,
             SlashCommand::Agents { args } => {
                 if let Err(error) = Self::print_agents(args.as_deref(), CliOutputFormat::Text) {
                     eprintln!("{error}");
@@ -9910,6 +9913,89 @@ impl LiveCli {
         Ok(false)
     }
 
+    /// Dispatch `/workflow [status|start <task-ref>|advance|gate <kind> <detail...>]`.
+    /// Task 8: pure command-layer plumbing for the SAW-style workflow gate
+    /// (`runtime::workflow::WorkflowState`, Task 7). No enforcement of
+    /// `workflow_gates` config mode happens here yet -- that's Task 9; this
+    /// only lets the model/user inspect and drive the state machine.
+    fn handle_workflow_command(
+        &mut self,
+        action: Option<&str>,
+    ) -> Result<bool, Box<dyn std::error::Error>> {
+        let mut tokens = action.unwrap_or_default().split_whitespace();
+        let subcommand = tokens.next();
+
+        match subcommand {
+            Some("status") => {
+                let workflow = self.runtime.session().workflow.clone().unwrap_or_default();
+                println!("{}", render_workflow_status(&workflow));
+                Ok(false)
+            }
+            Some("start") => {
+                let Some(task_ref) = tokens.next() else {
+                    println!("Usage: /workflow start <task-ref>");
+                    return Ok(false);
+                };
+                let workflow = self
+                    .runtime
+                    .session_mut()
+                    .workflow
+                    .get_or_insert_with(WorkflowState::default);
+                workflow.start(task_ref);
+                let phase = workflow.phase;
+                self.persist_session()?;
+                println!("Workflow started\n  Task             {task_ref}\n  Phase            {phase:?}");
+                Ok(false)
+            }
+            Some("advance") => {
+                let workflow = self
+                    .runtime
+                    .session_mut()
+                    .workflow
+                    .get_or_insert_with(WorkflowState::default);
+                let result = workflow.try_advance();
+                let phase = workflow.phase;
+                self.persist_session()?;
+                match result {
+                    GateCheck::Pass => println!("Workflow advanced\n  Phase            {phase:?}"),
+                    GateCheck::Blocked { reason } => {
+                        println!("Workflow blocked\n  Phase            {phase:?}\n  Reason           {reason}");
+                    }
+                }
+                Ok(false)
+            }
+            Some("gate") => {
+                let Some(kind) = tokens.next() else {
+                    println!("Usage: /workflow gate <kind> <detail>");
+                    return Ok(false);
+                };
+                let detail = tokens.collect::<Vec<_>>().join(" ");
+                let workflow = self
+                    .runtime
+                    .session_mut()
+                    .workflow
+                    .get_or_insert_with(WorkflowState::default);
+                let gate = workflow.phase;
+                workflow.record_evidence(GateEvidence {
+                    gate,
+                    kind: kind.to_string(),
+                    detail: detail.clone(),
+                });
+                self.persist_session()?;
+                println!(
+                    "Evidence recorded\n  Gate             {gate:?}\n  Kind             {kind}\n  Detail           {detail}"
+                );
+                Ok(false)
+            }
+            _ => {
+                println!(
+                    "Usage: /workflow [status|start <task-ref>|advance|gate <kind> <detail>]"
+                );
+                Ok(false)
+            }
+        }
+    }
+
     fn reload_runtime_features(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         let runtime = build_runtime(
             self.runtime.session().clone(),
@@ -10358,6 +10444,39 @@ fn render_session_list(active_session_id: &str) -> Result<String, Box<dyn std::e
         ));
     }
     Ok(lines.join("\n"))
+}
+
+/// Render `/workflow status`: phase, task ref, acceptance criteria, and
+/// recorded gate evidence for a `WorkflowState` (Task 8).
+fn render_workflow_status(workflow: &WorkflowState) -> String {
+    let mut lines = vec![
+        "Workflow".to_string(),
+        format!("  Phase            {:?}", workflow.phase),
+        format!(
+            "  Task             {}",
+            workflow.task_ref.as_deref().unwrap_or("<none>")
+        ),
+    ];
+    if workflow.acceptance_criteria.is_empty() {
+        lines.push("  Acceptance       <none recorded>".to_string());
+    } else {
+        lines.push("  Acceptance".to_string());
+        for ac in &workflow.acceptance_criteria {
+            lines.push(format!("    - {ac}"));
+        }
+    }
+    if workflow.evidence.is_empty() {
+        lines.push("  Evidence         <none recorded>".to_string());
+    } else {
+        lines.push("  Evidence".to_string());
+        for evidence in &workflow.evidence {
+            lines.push(format!(
+                "    - gate={:?} kind={} detail={}",
+                evidence.gate, evidence.kind, evidence.detail
+            ));
+        }
+    }
+    lines.join("\n")
 }
 
 /// #449: credentials-free session list that works without API keys.
@@ -18689,6 +18808,80 @@ mod tests {
 
         assert!(banner.contains("Tab"));
         assert!(banner.contains("completes commands, models, sessions, and paths"));
+
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+        std::env::remove_var("ANTHROPIC_API_KEY");
+    }
+
+    #[test]
+    fn workflow_command_start_advance_gate_status_mutate_and_persist_session() {
+        // Task 8: /workflow start/advance/gate/status against a real LiveCli,
+        // asserting the session-owned WorkflowState is mutated and persisted
+        // to disk (not just held in memory) after each subcommand.
+        let _guard = env_lock();
+        std::env::set_var("ANTHROPIC_API_KEY", "test-dummy-key-for-workflow-test");
+        let root = temp_dir();
+        fs::create_dir_all(&root).expect("root dir");
+
+        with_current_dir(&root, || {
+            let mut cli = LiveCli::new(
+                "anthropic/claude-sonnet-4-6".to_string(),
+                true,
+                None,
+                PermissionMode::DangerFullAccess,
+            )
+            .expect("cli should initialize");
+
+            // bare /workflow status before start: Idle, no task, no evidence.
+            cli.handle_workflow_command(Some("status"))
+                .expect("status should not error");
+            assert!(cli.runtime.session().workflow.is_none());
+
+            // /workflow start TASK-8
+            cli.handle_workflow_command(Some("start TASK-8"))
+                .expect("start should not error");
+            let workflow = cli
+                .runtime
+                .session()
+                .workflow
+                .clone()
+                .expect("start should create workflow state");
+            assert_eq!(workflow.phase, runtime::WorkflowPhase::Spec);
+            assert_eq!(workflow.task_ref.as_deref(), Some("TASK-8"));
+
+            // Persisted to disk, not just in memory.
+            let reloaded = Session::load_from_path(&cli.session.path)
+                .expect("session should load from disk after start");
+            assert_eq!(
+                reloaded.workflow.expect("persisted workflow").task_ref,
+                Some("TASK-8".to_string())
+            );
+
+            // /workflow advance is blocked without acceptance criteria.
+            cli.handle_workflow_command(Some("advance"))
+                .expect("advance should not error");
+            assert_eq!(
+                cli.runtime.session().workflow.as_ref().unwrap().phase,
+                runtime::WorkflowPhase::Spec,
+                "advance without acceptance criteria must not move past Spec"
+            );
+
+            // /workflow gate records evidence against the current (Spec) gate.
+            cli.handle_workflow_command(Some("gate test_run cargo test passed"))
+                .expect("gate should not error");
+            let workflow = cli.runtime.session().workflow.clone().unwrap();
+            assert_eq!(workflow.evidence.len(), 1);
+            assert_eq!(workflow.evidence[0].kind, "test_run");
+            assert_eq!(workflow.evidence[0].detail, "cargo test passed");
+            assert_eq!(workflow.evidence[0].gate, runtime::WorkflowPhase::Spec);
+
+            // Unknown/bare subcommands don't panic or mutate state.
+            cli.handle_workflow_command(None)
+                .expect("bare /workflow should render usage, not error");
+            cli.handle_workflow_command(Some("frobnicate"))
+                .expect("unknown subcommand should render usage, not error");
+            assert_eq!(cli.runtime.session().workflow.clone().unwrap(), workflow);
+        });
 
         fs::remove_dir_all(root).expect("cleanup temp dir");
         std::env::remove_var("ANTHROPIC_API_KEY");

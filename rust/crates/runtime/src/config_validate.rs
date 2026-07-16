@@ -232,6 +232,10 @@ const TOP_LEVEL_FIELDS: &[FieldSpec] = &[
         name: "autoDreamEnabled",
         expected: FieldType::Bool,
     },
+    FieldSpec {
+        name: "workflow_gates",
+        expected: FieldType::String,
+    },
 ];
 
 const HOOKS_FIELDS: &[FieldSpec] = &[

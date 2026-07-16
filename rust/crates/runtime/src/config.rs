@@ -164,6 +164,7 @@ pub struct RuntimeFeatureConfig {
     api_timeout: ApiTimeoutConfig,
     rules_import: RulesImportConfig,
     provider: RuntimeProviderConfig,
+    workflow_gates: WorkflowGateMode,
 }
 
 /// Controls which external AI coding framework rules are imported into the system prompt.
@@ -189,6 +190,21 @@ impl RulesImportConfig {
                 .any(|candidate| candidate.eq_ignore_ascii_case(framework)),
         }
     }
+}
+
+/// Controls whether the SAW-style workflow gate ([`crate::workflow::WorkflowState`])
+/// is enforced when advancing phases. `Off` (default) and `Advisory` do not
+/// block anything yet -- enforcement lands in a later task (#Task 9); this
+/// is plumbing only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum WorkflowGateMode {
+    /// Workflow gates are not consulted at all.
+    #[default]
+    Off,
+    /// Gate failures are surfaced but do not block progress.
+    Advisory,
+    /// Gate failures block progress (enforcement behavior added in Task 9).
+    Enforced,
 }
 
 /// Stored provider configuration from the setup wizard.
@@ -812,6 +828,7 @@ fn build_runtime_config(
         api_timeout: parse_optional_api_timeout_config(&merged_value)?,
         rules_import: parse_optional_rules_import(&merged_value)?,
         provider: parse_optional_provider_config(&merged_value)?,
+        workflow_gates: parse_optional_workflow_gate_mode(&merged_value),
     };
 
     Ok(RuntimeConfig {
@@ -936,6 +953,11 @@ impl RuntimeConfig {
         &self.feature_config.provider
     }
 
+    #[must_use]
+    pub fn workflow_gates(&self) -> WorkflowGateMode {
+        self.feature_config.workflow_gates
+    }
+
     /// Merge config-level default trusted roots with per-call roots.
     ///
     /// Config roots are defaults and are kept first; per-call roots extend the
@@ -1037,6 +1059,11 @@ impl RuntimeFeatureConfig {
     #[must_use]
     pub fn rules_import(&self) -> &RulesImportConfig {
         &self.rules_import
+    }
+
+    #[must_use]
+    pub fn workflow_gates(&self) -> WorkflowGateMode {
+        self.workflow_gates
     }
 
     /// Merge this config's default trusted roots with per-call roots.
@@ -2353,6 +2380,34 @@ fn parse_optional_rules_import(root: &JsonValue) -> Result<RulesImportConfig, Co
     }
 }
 
+/// Parse the `workflow_gates` config key ("off" | "advisory" | "enforced",
+/// case-insensitive). Unlike most enum-ish config values, an invalid mode
+/// does not fail config load: it emits a warning and falls back to `Off`,
+/// since the workflow gate is best-effort tooling, not a hard setting.
+fn parse_optional_workflow_gate_mode(root: &JsonValue) -> WorkflowGateMode {
+    let Some(object) = root.as_object() else {
+        return WorkflowGateMode::Off;
+    };
+    let Some(value) = object.get("workflow_gates").and_then(JsonValue::as_str) else {
+        return WorkflowGateMode::Off;
+    };
+    parse_workflow_gate_mode_label(value)
+}
+
+fn parse_workflow_gate_mode_label(value: &str) -> WorkflowGateMode {
+    match value.to_ascii_lowercase().as_str() {
+        "off" => WorkflowGateMode::Off,
+        "advisory" => WorkflowGateMode::Advisory,
+        "enforced" => WorkflowGateMode::Enforced,
+        _ => {
+            emit_config_warning_once(&format!(
+                "merged settings.workflow_gates: unsupported workflow gate mode \"{value}\"; using \"off\""
+            ));
+            WorkflowGateMode::Off
+        }
+    }
+}
+
 fn parse_optional_provider_config(root: &JsonValue) -> Result<RuntimeProviderConfig, ConfigError> {
     let Some(provider_value) = root.as_object().and_then(|object| object.get("provider")) else {
         return Ok(RuntimeProviderConfig::default());
@@ -2784,9 +2839,10 @@ fn deep_merge_objects(
 #[cfg(test)]
 mod tests {
     use super::{
-        deep_merge_objects, parse_permission_mode_label, ConfigFileStatus, ConfigLoader,
-        ConfigSource, McpServerConfig, McpTransport, ResolvedPermissionMode, RuntimeFeatureConfig,
-        RuntimeHookCommand, RuntimeHookConfig, RuntimePluginConfig, CLAW_SETTINGS_SCHEMA_NAME,
+        deep_merge_objects, parse_permission_mode_label, parse_workflow_gate_mode_label,
+        ConfigFileStatus, ConfigLoader, ConfigSource, McpServerConfig, McpTransport,
+        ResolvedPermissionMode, RuntimeFeatureConfig, RuntimeHookCommand, RuntimeHookConfig,
+        RuntimePluginConfig, WorkflowGateMode, CLAW_SETTINGS_SCHEMA_NAME,
     };
     use crate::json::JsonValue;
     use crate::sandbox::FilesystemIsolationMode;
@@ -4084,6 +4140,77 @@ mod tests {
             rendered.contains("model"),
             "warning should suggest the closest known key, got: {rendered}"
         );
+
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn workflow_gate_mode_defaults_to_off_when_unset() {
+        let root = temp_dir();
+        let cwd = root.join("project");
+        let home = root.join("home").join(".claw");
+        fs::create_dir_all(&home).expect("home config dir");
+        fs::create_dir_all(&cwd).expect("project dir");
+
+        let loaded = ConfigLoader::new(&cwd, &home)
+            .load()
+            .expect("empty config should load");
+
+        assert_eq!(loaded.workflow_gates(), WorkflowGateMode::Off);
+
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn workflow_gate_mode_parses_advisory_and_enforced_case_insensitively() {
+        let root = temp_dir();
+        let cwd = root.join("project");
+        let home = root.join("home").join(".claw");
+        fs::create_dir_all(&home).expect("home config dir");
+        fs::create_dir_all(&cwd).expect("project dir");
+        fs::write(
+            cwd.join(".claw.json"),
+            r#"{"workflow_gates":"Advisory"}"#,
+        )
+        .expect("write project config");
+
+        let loaded = ConfigLoader::new(&cwd, &home)
+            .load()
+            .expect("config should load");
+
+        assert_eq!(loaded.workflow_gates(), WorkflowGateMode::Advisory);
+        assert_eq!(
+            parse_workflow_gate_mode_label("enforced"),
+            WorkflowGateMode::Enforced
+        );
+        assert_eq!(
+            parse_workflow_gate_mode_label("ENFORCED"),
+            WorkflowGateMode::Enforced
+        );
+
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn workflow_gate_mode_falls_back_to_off_on_invalid_value() {
+        assert_eq!(
+            parse_workflow_gate_mode_label("bogus"),
+            WorkflowGateMode::Off
+        );
+
+        let root = temp_dir();
+        let cwd = root.join("project");
+        let home = root.join("home").join(".claw");
+        fs::create_dir_all(&home).expect("home config dir");
+        fs::create_dir_all(&cwd).expect("project dir");
+        fs::write(cwd.join(".claw.json"), r#"{"workflow_gates":"bogus"}"#)
+            .expect("write project config");
+
+        let loaded = ConfigLoader::new(&cwd, &home)
+            .load()
+            .expect("config with invalid workflow_gates should still load");
+
+        assert_eq!(loaded.workflow_gates(), WorkflowGateMode::Off);
 
         fs::remove_dir_all(root).expect("cleanup temp dir");
     }
