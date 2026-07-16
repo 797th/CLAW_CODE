@@ -10,36 +10,14 @@
 use api::{
     ApiError, InputContentBlock, InputMessage, MessageRequest, OutputContentBlock, ProviderClient,
 };
+use runtime::harness_assets::{AgentRole, HarnessAssets};
 use serde::{Deserialize, Serialize};
+use std::fs;
 use std::sync::Arc;
 
 // ---------------------------------------------------------------------------
 // Agent persona system prompts (Step 1.1)
 // ---------------------------------------------------------------------------
-
-const MANAGER_SYSTEM_PROMPT: &str = r#"You are the ManagerAgent in a multi-agent orchestration system.
-
-Your sole responsibility in this turn is to DECOMPOSE the user's task into a list of
-independent sub-task briefs. Each brief targets a single specialized subagent.
-
-RULES:
-- Output ONLY valid JSON — no prose, no markdown fences, no explanation.
-- The JSON must be an array of objects, each with exactly these fields:
-    {
-      "id": <integer, 1-based>,
-      "agent": <"frontend" | "backend" | "database" | "generic">,
-      "brief": <clear, self-contained task description as a string>
-    }
-- Keep briefs isolated: each subagent receives ONLY its own brief.
-- Prefer 2–5 sub-tasks. Combine trivially related work into one brief.
-- If the task is trivially single-agent, emit a single-element array.
-
-Example output:
-[
-  {"id":1,"agent":"backend","brief":"Create a REST endpoint POST /api/login that validates email+password against a users table and returns a JWT."},
-  {"id":2,"agent":"frontend","brief":"Build a React login form that POSTs to /api/login and stores the returned JWT in localStorage."},
-  {"id":3,"agent":"database","brief":"Write the SQL schema for a users table with id, email, password_hash, and created_at columns."}
-]"#;
 
 const FRONTEND_SYSTEM_PROMPT: &str = "You are the FrontendAgent \u{2014} a specialist in UI, React, HTML, CSS, and browser APIs.\nYou receive a focused task brief and must produce concrete, working code or a clear implementation.\nOutput your code in fenced code blocks. Be precise \u{2014} the Manager will aggregate your output directly.";
 
@@ -49,13 +27,182 @@ const DATABASE_SYSTEM_PROMPT: &str = "You are the DatabaseAgent \u{2014} a speci
 
 const GENERIC_SYSTEM_PROMPT: &str = "You are a specialized coding agent. You receive a focused task brief and must produce concrete, working code or a clear implementation plan.\nOutput your code in fenced code blocks. Be precise \u{2014} the Manager will aggregate your output directly.";
 
-fn persona_for_agent(agent: &str) -> &'static str {
-    match agent {
-        "frontend" => FRONTEND_SYSTEM_PROMPT,
-        "backend" => BACKEND_SYSTEM_PROMPT,
-        "database" => DATABASE_SYSTEM_PROMPT,
-        _ => GENERIC_SYSTEM_PROMPT,
+// ---------------------------------------------------------------------------
+// Personas: file-defined agents (Task 10) layered over hardcoded defaults
+// ---------------------------------------------------------------------------
+
+/// A single subagent persona: a name, a system prompt, and the role it plays
+/// in the workflow (implementer briefs vs. reviewer/gate personas consumed
+/// elsewhere).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Persona {
+    pub name: String,
+    pub system_prompt: String,
+    pub role: AgentRole,
+}
+
+/// The four hardcoded Phase-1 personas. These are always present as
+/// fallback defaults; `load_personas` may override any of them by name with
+/// a `.claw/agents/*.md`-defined persona.
+fn default_personas() -> Vec<Persona> {
+    vec![
+        Persona {
+            name: "frontend".to_string(),
+            system_prompt: FRONTEND_SYSTEM_PROMPT.to_string(),
+            role: AgentRole::Implementer,
+        },
+        Persona {
+            name: "backend".to_string(),
+            system_prompt: BACKEND_SYSTEM_PROMPT.to_string(),
+            role: AgentRole::Implementer,
+        },
+        Persona {
+            name: "database".to_string(),
+            system_prompt: DATABASE_SYSTEM_PROMPT.to_string(),
+            role: AgentRole::Implementer,
+        },
+        Persona {
+            name: "generic".to_string(),
+            system_prompt: GENERIC_SYSTEM_PROMPT.to_string(),
+            role: AgentRole::Implementer,
+        },
+    ]
+}
+
+/// Strip a leading `---`-delimited frontmatter block off a markdown file's
+/// contents, returning the trimmed body. Mirrors the frontmatter convention
+/// used by `runtime::harness_assets::parse_frontmatter_value`, but here we
+/// want everything *after* the block rather than a single key's value. Files
+/// with no frontmatter block are returned trimmed as-is.
+fn strip_frontmatter_body(contents: &str) -> String {
+    let mut lines = contents.lines();
+    if lines.next().map(str::trim) != Some("---") {
+        return contents.trim().to_string();
     }
+    for (idx, line) in contents.lines().enumerate().skip(1) {
+        if line.trim() == "---" {
+            return contents
+                .lines()
+                .skip(idx + 1)
+                .collect::<Vec<_>>()
+                .join("\n")
+                .trim()
+                .to_string();
+        }
+    }
+    // Opened with `---` but never closed — malformed; treat whole thing as
+    // body rather than losing content.
+    contents.trim().to_string()
+}
+
+/// Load agent personas: the four hardcoded defaults, overlaid with any
+/// custom personas discovered under `.claw/agents/*.md`. A custom persona
+/// sharing a default's name replaces it in place (preserving no particular
+/// order beyond the defaults' original order followed by new custom
+/// personas). Files that can't be read, or whose body is empty once
+/// frontmatter is stripped, are skipped with a warning — discovery of the
+/// persona list never fails outright.
+pub fn load_personas(assets: &HarnessAssets) -> Vec<Persona> {
+    let mut personas = default_personas();
+
+    for meta in &assets.agents {
+        let contents = match fs::read_to_string(&meta.path) {
+            Ok(contents) => contents,
+            Err(error) => {
+                eprintln!(
+                    "[mao] skipping persona '{}' ({}): {error}",
+                    meta.name,
+                    meta.path.display()
+                );
+                continue;
+            }
+        };
+
+        let system_prompt = strip_frontmatter_body(&contents);
+        if system_prompt.is_empty() {
+            eprintln!(
+                "[mao] skipping persona '{}' ({}): empty body after frontmatter",
+                meta.name,
+                meta.path.display()
+            );
+            continue;
+        }
+
+        let persona = Persona {
+            name: meta.name.clone(),
+            system_prompt,
+            role: meta.role,
+        };
+
+        if let Some(existing) = personas.iter_mut().find(|p| p.name == persona.name) {
+            *existing = persona;
+        } else {
+            personas.push(persona);
+        }
+    }
+
+    personas
+}
+
+/// Build the Manager's decomposition system prompt, listing only
+/// `Implementer`-role persona names in the JSON contract's `agent` union.
+/// Reviewer/Gate personas are loaded (and returned by `load_personas`) but
+/// are excluded here — they're consumed by workflow gating, not by the
+/// Manager's brief decomposition.
+fn manager_system_prompt(personas: &[Persona]) -> String {
+    let implementer_names: Vec<&str> = personas
+        .iter()
+        .filter(|p| p.role == AgentRole::Implementer)
+        .map(|p| p.name.as_str())
+        .collect();
+
+    let union = implementer_names
+        .iter()
+        .map(|name| format!("\"{name}\""))
+        .collect::<Vec<_>>()
+        .join(" | ");
+
+    let names_list = implementer_names.join(", ");
+
+    format!(
+        r#"You are the ManagerAgent in a multi-agent orchestration system.
+
+Your sole responsibility in this turn is to DECOMPOSE the user's task into a list of
+independent sub-task briefs. Each brief targets a single specialized subagent.
+
+Available specialized agents: {names_list}
+
+RULES:
+- Output ONLY valid JSON — no prose, no markdown fences, no explanation.
+- The JSON must be an array of objects, each with exactly these fields:
+    {{
+      "id": <integer, 1-based>,
+      "agent": <{union}>,
+      "brief": <clear, self-contained task description as a string>
+    }}
+- Keep briefs isolated: each subagent receives ONLY its own brief.
+- Prefer 2–5 sub-tasks. Combine trivially related work into one brief.
+- If the task is trivially single-agent, emit a single-element array.
+
+Example output:
+[
+  {{"id":1,"agent":"{first}","brief":"A clear, self-contained task description for this specialized agent."}}
+]"#,
+        names_list = names_list,
+        union = union,
+        first = implementer_names.first().copied().unwrap_or("generic"),
+    )
+}
+
+/// Look up a persona's system prompt by name, falling back to the generic
+/// persona's prompt when the Manager names an agent that isn't present
+/// (shouldn't happen given the dynamic union above, but defensive).
+fn persona_prompt_for<'a>(personas: &'a [Persona], agent_name: &str) -> &'a str {
+    personas
+        .iter()
+        .find(|p| p.name == agent_name)
+        .map(|p| p.system_prompt.as_str())
+        .unwrap_or(GENERIC_SYSTEM_PROMPT)
 }
 
 // ---------------------------------------------------------------------------
@@ -119,16 +266,18 @@ async fn decompose_prompt(
     model: &str,
     user_prompt: &str,
     max_refinement_cycles: usize,
+    personas: &[Persona],
 ) -> Result<Vec<SubTask>, MaoError> {
     let max_tokens = 2048u32;
     let mut messages: Vec<InputMessage> = vec![InputMessage::user_text(user_prompt)];
+    let system_prompt = manager_system_prompt(personas);
 
     for cycle in 0..=max_refinement_cycles {
         let request = MessageRequest {
             model: model.to_string(),
             max_tokens,
             messages: messages.clone(),
-            system: Some(MANAGER_SYSTEM_PROMPT.to_string()),
+            system: Some(system_prompt.clone()),
             ..Default::default()
         };
         let response = client.send_message(&request).await?;
@@ -194,8 +343,13 @@ async fn decompose_prompt(
 // ---------------------------------------------------------------------------
 
 /// Execute a single sub-task against a specialized subagent model.
-async fn run_subagent(client: Arc<ProviderClient>, model: String, task: SubTask) -> SubTaskResult {
-    let system_prompt = persona_for_agent(&task.agent).to_string();
+async fn run_subagent(
+    client: Arc<ProviderClient>,
+    model: String,
+    task: SubTask,
+    personas: Arc<Vec<Persona>>,
+) -> SubTaskResult {
+    let system_prompt = persona_prompt_for(&personas, &task.agent).to_string();
     let request = MessageRequest {
         model: model.clone(),
         max_tokens: 4096,
@@ -237,13 +391,15 @@ async fn spawn_subagents(
     client: Arc<ProviderClient>,
     model: &str,
     tasks: Vec<SubTask>,
+    personas: Arc<Vec<Persona>>,
 ) -> Vec<SubTaskResult> {
     let handles: Vec<_> = tasks
         .into_iter()
         .map(|task| {
             let client = Arc::clone(&client);
             let model = model.to_string();
-            tokio::spawn(run_subagent(client, model, task))
+            let personas = Arc::clone(&personas);
+            tokio::spawn(run_subagent(client, model, task, personas))
         })
         .collect();
 
@@ -271,15 +427,20 @@ async fn spawn_subagents(
 /// `manager_model`  — high-reasoning model for decomposition (e.g. openai/gpt-oss-120b)
 /// `worker_model`   — model for subagents (may be same or a cheaper model)
 /// `user_prompt`    — raw user request
+/// `personas`       — loaded personas (defaults plus any `.claw/agents/*.md`
+///                    overrides/additions); see `load_personas`.
 pub fn run_orchestrate(
     manager_model: &str,
     worker_model: &str,
     user_prompt: &str,
+    personas: Vec<Persona>,
 ) -> Result<OrchestrationOutput, MaoError> {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .map_err(|e| MaoError::Tokio(e.to_string()))?;
+
+    let personas = Arc::new(personas);
 
     rt.block_on(async {
         let client = Arc::new(
@@ -288,7 +449,7 @@ pub fn run_orchestrate(
 
         // ── Step 1.2: Manager decomposes the prompt ──────────────────────
         eprintln!("[mao] Manager decomposing prompt with model {manager_model}…");
-        let tasks = decompose_prompt(&client, manager_model, user_prompt, 2).await?;
+        let tasks = decompose_prompt(&client, manager_model, user_prompt, 2, &personas).await?;
         eprintln!("[mao] Manager produced {} sub-task(s)", tasks.len());
 
         // ── Step 1.3: Spawn subagents concurrently ───────────────────────
@@ -302,7 +463,7 @@ pub fn run_orchestrate(
 
         let task_count = tasks.len();
         eprintln!("[mao] Spawning {task_count} subagent(s) with model {worker_model}…");
-        let results = spawn_subagents(worker_client, worker_model, tasks).await;
+        let results = spawn_subagents(worker_client, worker_model, tasks, personas).await;
 
         Ok(OrchestrationOutput { results })
     })
@@ -360,5 +521,144 @@ fn capitalize(s: &str) -> String {
     match chars.next() {
         None => String::new(),
         Some(c) => c.to_uppercase().collect::<String>() + chars.as_str(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests: Task 10 — file-defined agent personas
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod persona_tests {
+    use super::*;
+    use runtime::harness_assets::AgentMeta;
+    use std::path::PathBuf;
+
+    fn fixture_path(name: &str) -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/agents")
+            .join(name)
+    }
+
+    fn default_names(personas: &[Persona]) -> Vec<&str> {
+        let mut names: Vec<&str> = personas.iter().map(|p| p.name.as_str()).collect();
+        names.sort_unstable();
+        names
+    }
+
+    #[test]
+    fn load_personas_with_no_agents_returns_exactly_the_four_defaults() {
+        let assets = HarnessAssets::default();
+        let personas = load_personas(&assets);
+
+        assert_eq!(personas.len(), 4);
+        assert_eq!(
+            default_names(&personas),
+            vec!["backend", "database", "frontend", "generic"]
+        );
+        assert!(personas.iter().all(|p| p.role == AgentRole::Implementer));
+    }
+
+    #[test]
+    fn load_personas_adds_custom_gate_persona_from_fixture() {
+        let assets = HarnessAssets {
+            agents: vec![AgentMeta {
+                name: "qas".to_string(),
+                description: "Quality assurance sentinel".to_string(),
+                path: fixture_path("qas.md"),
+                role: AgentRole::Gate,
+            }],
+            ..Default::default()
+        };
+
+        let personas = load_personas(&assets);
+
+        assert_eq!(personas.len(), 5, "expected 4 defaults + 1 custom persona");
+        let qas = personas
+            .iter()
+            .find(|p| p.name == "qas")
+            .expect("qas persona should be present");
+        assert_eq!(qas.role, AgentRole::Gate);
+        assert!(qas.system_prompt.contains("QAS gate agent"));
+        assert!(
+            !qas.system_prompt.contains("role:"),
+            "frontmatter should be stripped from the system prompt"
+        );
+    }
+
+    #[test]
+    fn load_personas_overrides_default_persona_with_same_name() {
+        let assets = HarnessAssets {
+            agents: vec![AgentMeta {
+                name: "backend".to_string(),
+                description: "Custom backend override".to_string(),
+                path: fixture_path("backend_override.md"),
+                role: AgentRole::Implementer,
+            }],
+            ..Default::default()
+        };
+
+        let personas = load_personas(&assets);
+
+        assert_eq!(
+            personas.len(),
+            4,
+            "same-name override should replace, not add, a default"
+        );
+        let backend = personas
+            .iter()
+            .find(|p| p.name == "backend")
+            .expect("backend persona should be present");
+        assert!(backend.system_prompt.contains("CUSTOM BackendAgent"));
+        assert!(!backend.system_prompt.contains("BackendAgent \u{2014} a specialist"));
+    }
+
+    #[test]
+    fn load_personas_skips_unreadable_agent_file() {
+        let assets = HarnessAssets {
+            agents: vec![AgentMeta {
+                name: "ghost".to_string(),
+                description: "does not exist on disk".to_string(),
+                path: fixture_path("does_not_exist.md"),
+                role: AgentRole::Implementer,
+            }],
+            ..Default::default()
+        };
+
+        let personas = load_personas(&assets);
+
+        assert_eq!(
+            personas.len(),
+            4,
+            "unreadable persona file should be skipped, leaving only defaults"
+        );
+        assert!(personas.iter().all(|p| p.name != "ghost"));
+    }
+
+    #[test]
+    fn manager_prompt_lists_dynamic_implementer_names_and_excludes_gate_personas() {
+        let assets = HarnessAssets {
+            agents: vec![AgentMeta {
+                name: "qas".to_string(),
+                description: "Quality assurance sentinel".to_string(),
+                path: fixture_path("qas.md"),
+                role: AgentRole::Gate,
+            }],
+            ..Default::default()
+        };
+        let personas = load_personas(&assets);
+
+        let prompt = manager_system_prompt(&personas);
+
+        for name in ["frontend", "backend", "database", "generic"] {
+            assert!(
+                prompt.contains(name),
+                "expected manager prompt to list implementer persona '{name}'"
+            );
+        }
+        assert!(
+            !prompt.contains("\"qas\""),
+            "gate persona must not appear in the Manager's agent union"
+        );
     }
 }

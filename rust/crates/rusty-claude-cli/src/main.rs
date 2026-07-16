@@ -1655,16 +1655,21 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             manager_model,
             worker_model,
             output_format,
-        } => match mao::run_orchestrate(&manager_model, &worker_model, &prompt) {
-            Ok(result) => match output_format {
-                CliOutputFormat::Json => println!("{}", result.render_json()),
-                CliOutputFormat::Text => println!("{}", result.render_text()),
-            },
-            Err(e) => {
-                eprintln!("orchestration error: {e}");
-                std::process::exit(1);
+        } => {
+            let assets =
+                runtime::harness_assets::discover(&env::current_dir().unwrap_or_default());
+            let personas = mao::load_personas(&assets);
+            match mao::run_orchestrate(&manager_model, &worker_model, &prompt, personas) {
+                Ok(result) => match output_format {
+                    CliOutputFormat::Json => println!("{}", result.render_json()),
+                    CliOutputFormat::Text => println!("{}", result.render_text()),
+                },
+                Err(e) => {
+                    eprintln!("orchestration error: {e}");
+                    std::process::exit(1);
+                }
             }
-        },
+        }
         CliAction::HelpTopic {
             topic,
             output_format,
