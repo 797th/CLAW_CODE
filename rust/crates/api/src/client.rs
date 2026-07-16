@@ -181,6 +181,17 @@ mod tests {
 
     #[test]
     fn provider_detection_prefers_model_family() {
+        let _lock = env_lock();
+        let isolated_config_home = std::env::temp_dir().join(format!(
+            "claw-api-provider-detection-{}",
+            std::process::id()
+        ));
+        let _config_home = EnvVarGuard::set_os(
+            "CLAW_CONFIG_HOME",
+            Some(isolated_config_home.clone().into_os_string()),
+        );
+        let _endpoint_type = EnvVarGuard::set("CLAW_ENDPOINT_TYPE", None);
+
         assert_eq!(detect_provider_kind("grok-3"), ProviderKind::Xai);
         assert_eq!(
             detect_provider_kind("claude-sonnet-4-6"),
@@ -199,6 +210,15 @@ mod tests {
 
     impl EnvVarGuard {
         fn set(key: &'static str, value: Option<&str>) -> Self {
+            let original = std::env::var_os(key);
+            match value {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            }
+            Self { key, original }
+        }
+
+        fn set_os(key: &'static str, value: Option<std::ffi::OsString>) -> Self {
             let original = std::env::var_os(key);
             match value {
                 Some(value) => std::env::set_var(key, value),
