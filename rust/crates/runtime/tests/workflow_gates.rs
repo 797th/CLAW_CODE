@@ -58,6 +58,39 @@ fn spec_to_implement_passes_with_acceptance_criteria() {
 }
 
 #[test]
+fn spec_to_implement_blocked_with_only_whitespace_acceptance_criteria() {
+    let mut state = started_state();
+    state.acceptance_criteria.push(String::new());
+    state.acceptance_criteria.push("   ".to_string());
+    state.acceptance_criteria.push("\t\n".to_string());
+
+    match state.try_advance() {
+        GateCheck::Blocked { reason } => {
+            assert!(
+                reason.to_lowercase().contains("ask"),
+                "whitespace-only ACs must not satisfy the gate: {reason}"
+            );
+        }
+        GateCheck::Pass => panic!(
+            "Spec -> Implement must be blocked when acceptance_criteria contains only whitespace"
+        ),
+    }
+    assert_eq!(state.phase, WorkflowPhase::Spec);
+}
+
+#[test]
+fn spec_to_implement_passes_with_one_real_ac_among_empties() {
+    let mut state = started_state();
+    state.acceptance_criteria.push(String::new());
+    state.acceptance_criteria.push("   ".to_string());
+    state.acceptance_criteria.push("returns 200 on success".to_string());
+
+    let check = state.try_advance();
+    assert!(matches!(check, GateCheck::Pass));
+    assert_eq!(state.phase, WorkflowPhase::Implement);
+}
+
+#[test]
 fn implement_to_verify_always_passes() {
     let mut state = started_state();
     state.acceptance_criteria.push("AC1".to_string());

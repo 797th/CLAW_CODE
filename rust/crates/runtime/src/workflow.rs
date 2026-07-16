@@ -29,7 +29,7 @@ pub enum WorkflowPhase {
 /// Tasks 8/9) must only record `"test_run"` evidence after they have
 /// observed a passing result, and `"review"` evidence after an actual human
 /// or model review took place.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GateEvidence {
     pub gate: WorkflowPhase,
     pub kind: String,
@@ -44,13 +44,15 @@ pub enum GateCheck {
 }
 
 /// Workflow state tracked per task/session.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct WorkflowState {
     pub phase: WorkflowPhase,
     /// Ticket/branch id the workflow is tracking.
     pub task_ref: Option<String>,
     /// Acceptance criteria; required to leave Spec. Never invented by the
-    /// model -- if empty, the model must ask the user for them.
+    /// model -- if empty (or containing only whitespace-only entries), the
+    /// model must ask the user for them. `try_advance` requires at least one
+    /// entry whose trimmed content is non-empty.
     pub acceptance_criteria: Vec<String>,
     /// Evidence recorded against gates (e.g. test-run output refs, review
     /// approvals).
@@ -84,7 +86,11 @@ impl WorkflowState {
                     .to_string(),
             },
             WorkflowPhase::Spec => {
-                if self.acceptance_criteria.is_empty() {
+                let has_real_ac = self
+                    .acceptance_criteria
+                    .iter()
+                    .any(|ac| !ac.trim().is_empty());
+                if !has_real_ac {
                     GateCheck::Blocked {
                         reason: "no acceptance criteria recorded; ask the user for acceptance \
                                  criteria before leaving Spec -- never invent them"

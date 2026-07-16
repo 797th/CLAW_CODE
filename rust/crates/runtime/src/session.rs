@@ -1233,6 +1233,10 @@ fn workflow_to_json(workflow: &WorkflowState) -> Result<JsonValue, SessionError>
     JsonValue::parse(&rendered).map_err(SessionError::from)
 }
 
+/// Deliberately fails loud (`SessionError::Format`) rather than silently
+/// dropping to `None` when the stored `"workflow"` value doesn't match
+/// `WorkflowState`'s shape -- a corrupt/truncated workflow record should
+/// surface as a load error, not silently reset gate progress to `Idle`.
 fn workflow_from_json(value: &JsonValue) -> Result<WorkflowState, SessionError> {
     let rendered = value.render();
     serde_json::from_str(&rendered)
@@ -1616,21 +1620,29 @@ mod tests {
         let mut workflow = crate::workflow::WorkflowState::default();
         workflow.start("TASK-7");
         workflow.acceptance_criteria.push("AC1".to_string());
-        session.workflow = Some(workflow);
+        workflow.record_evidence(crate::workflow::GateEvidence {
+            gate: crate::workflow::WorkflowPhase::Verify,
+            kind: "test_run".to_string(),
+            detail: "42 passed; 0 failed".to_string(),
+        });
+        workflow.record_evidence(crate::workflow::GateEvidence {
+            gate: crate::workflow::WorkflowPhase::Review,
+            kind: "review".to_string(),
+            detail: "approved by reviewer".to_string(),
+        });
+        session.workflow = Some(workflow.clone());
 
         // when
         session.save_to_path(&path).expect("session should save");
         let restored = Session::load_from_path(&path).expect("session should load");
         fs::remove_file(&path).expect("temp file should be removable");
 
-        // then
+        // then: full structural equality, including the nested Vec<GateEvidence>
+        // (two entries, different gates/kinds) round-tripped through the
+        // workflow_to_json/workflow_from_json JsonValue bridge.
         let restored_workflow = restored.workflow.expect("workflow should round-trip");
-        assert_eq!(
-            restored_workflow.phase,
-            crate::workflow::WorkflowPhase::Spec
-        );
-        assert_eq!(restored_workflow.task_ref.as_deref(), Some("TASK-7"));
-        assert_eq!(restored_workflow.acceptance_criteria, vec!["AC1".to_string()]);
+        assert_eq!(restored_workflow, workflow);
+        assert_eq!(restored_workflow.evidence.len(), 2);
     }
 
     #[test]
