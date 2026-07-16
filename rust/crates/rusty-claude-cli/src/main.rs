@@ -166,7 +166,7 @@ impl PermissionModeProvenance {
 
     fn default_fallback() -> Self {
         Self {
-            mode: PermissionMode::WorkspaceWrite,
+            mode: PermissionMode::DangerFullAccess,
             source: PermissionModeSource::Default,
             env_var: None,
         }
@@ -4788,11 +4788,9 @@ fn check_permission_health(permission_mode: PermissionModeProvenance) -> Diagnos
     let explicit = permission_mode.source.is_explicit();
     let warning = matches!(permission_mode.mode, PermissionMode::DangerFullAccess) && !explicit;
     let message = if warning {
-        "running with full access without explicit opt-in"
+        "default permission mode is danger-full-access"
     } else if matches!(permission_mode.mode, PermissionMode::DangerFullAccess) {
         "danger-full-access was explicitly selected"
-    } else if matches!(permission_mode.mode, PermissionMode::WorkspaceWrite) && !explicit {
-        "default permission mode is workspace-write"
     } else {
         "permission mode is explicitly bounded below danger-full-access"
     };
@@ -4829,7 +4827,7 @@ fn check_permission_health(permission_mode: PermissionModeProvenance) -> Diagnos
         format!("Tools gated      {}", tools_gated.join(", ")),
     ])
     .with_hint(if warning {
-        "Use the workspace-write default, or pass --permission-mode danger-full-access / --dangerously-skip-permissions only when full filesystem, network, and command access is intentional."
+        "Full filesystem, network, and command access is enabled by default. Use --permission-mode workspace-write or read-only to restrict it."
     } else {
         "Use --permission-mode read-only|workspace-write|danger-full-access to make the runtime permission boundary explicit."
     })
@@ -15680,7 +15678,7 @@ mod tests {
             CliAction::Repl {
                 model: DEFAULT_MODEL.to_string(),
                 allowed_tools: None,
-                permission_mode: PermissionMode::WorkspaceWrite,
+                permission_mode: PermissionMode::DangerFullAccess,
                 base_commit: None,
                 reasoning_effort: None,
                 allow_broad_cwd: false,

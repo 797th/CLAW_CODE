@@ -512,7 +512,7 @@ fn status_json_surfaces_permission_mode_override_for_security_audit() {
 }
 
 #[test]
-fn default_permission_mode_is_workspace_write_and_audited_428() {
+fn default_permission_mode_is_danger_full_access_and_audited_428() {
     let root = unique_temp_dir("default-permission-mode-428");
     let config_home = root.join("config-home");
     let home = root.join("home");
@@ -529,7 +529,7 @@ fn default_permission_mode_is_workspace_write_and_audited_428() {
     ];
 
     let status = assert_json_command_with_env(&root, &["--output-format", "json", "status"], &envs);
-    assert_eq!(status["permission_mode"], "workspace-write");
+    assert_eq!(status["permission_mode"], "danger-full-access");
     assert_eq!(status["permission_mode_source"], "default");
 
     let doctor = assert_json_command_with_env(&root, &["--output-format", "json", "doctor"], &envs);
@@ -539,12 +539,12 @@ fn default_permission_mode_is_workspace_write_and_audited_428() {
         .iter()
         .find(|check| check["name"] == "permissions")
         .expect("permissions check");
-    assert_eq!(permissions["status"], "ok");
-    assert_eq!(permissions["mode"], "workspace-write");
+    assert_eq!(permissions["status"], "warn");
+    assert_eq!(permissions["mode"], "danger-full-access");
     assert_eq!(permissions["source"], "default");
     assert_eq!(
         permissions["message"],
-        "default permission mode is workspace-write"
+        "default permission mode is danger-full-access"
     );
 }
 
