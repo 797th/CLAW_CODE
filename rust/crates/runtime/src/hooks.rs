@@ -514,6 +514,128 @@ enum HookCommandOutcome {
     Cancelled { message: String },
 }
 
+/// Result of running a single hook command through the JSON stdin/stdout
+/// decision protocol (see `run_hook_command`).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct HookOutcome {
+    pub decision: HookDecision,
+    pub additional_context: Option<String>,
+}
+
+impl HookOutcome {
+    /// Maps this outcome onto the legacy `PreToolUse` permission override so
+    /// callers that still consume `HookPermissionDecision` keep working: a
+    /// `Block` decision denies the tool call, `Allow` leaves the existing
+    /// permission pipeline untouched.
+    #[must_use]
+    pub fn permission_override_for_pre_tool_use(&self) -> Option<PermissionOverride> {
+        match &self.decision {
+            HookDecision::Block { .. } => Some(PermissionOverride::Deny),
+            HookDecision::Allow => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum HookDecision {
+    #[default]
+    Allow,
+    Block { reason: String },
+}
+
+/// Runs a single hook `command` for `event`, sending `payload` (with
+/// `hook_event_name` merged in) as JSON on the child's stdin and mapping the
+/// result to a `HookOutcome` per the JSON hook decision protocol:
+///
+/// - exit 0 -> Allow
+/// - exit 2 -> Block, reason = stderr
+/// - JSON stdout with `{"decision":"block","reason":...}` overrides the
+///   exit-code inference
+/// - `additionalContext` in JSON stdout (or, for non-JSON stdout, the raw
+///   stdout text) is carried as `HookOutcome::additional_context`
+pub fn run_hook_command(
+    command: &str,
+    event: HookEvent,
+    payload: &Value,
+) -> std::io::Result<HookOutcome> {
+    let mut full_payload = payload.clone();
+    if let Value::Object(map) = &mut full_payload {
+        map.insert(
+            "hook_event_name".to_string(),
+            Value::String(event.as_str().to_string()),
+        );
+    }
+    let payload_bytes = serde_json::to_vec(&full_payload)?;
+
+    let mut child = shell_command(command);
+    child.stdin(Stdio::piped());
+    child.stdout(Stdio::piped());
+    child.stderr(Stdio::piped());
+
+    match child.output_with_stdin(&payload_bytes, None)? {
+        CommandExecution::Finished(output) => Ok(hook_outcome_from_output(&output)),
+        CommandExecution::Cancelled => Ok(HookOutcome::default()),
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn run_hook_command_for_test(
+    command: &str,
+    event: HookEvent,
+    payload: &Value,
+) -> HookOutcome {
+    run_hook_command(command, event, payload).expect("hook command should run")
+}
+
+fn hook_outcome_from_output(output: &std::process::Output) -> HookOutcome {
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+
+    if let Ok(Value::Object(root)) = serde_json::from_str::<Value>(&stdout) {
+        let additional_context = root
+            .get("additionalContext")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned);
+
+        if root.get("decision").and_then(Value::as_str) == Some("block") {
+            let reason = root
+                .get("reason")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            return HookOutcome {
+                decision: HookDecision::Block { reason },
+                additional_context,
+            };
+        }
+
+        return HookOutcome {
+            decision: exit_code_decision(output.status.code(), &stderr),
+            additional_context,
+        };
+    }
+
+    let decision = exit_code_decision(output.status.code(), &stderr);
+    let additional_context = if matches!(decision, HookDecision::Allow) && !stdout.is_empty() {
+        Some(stdout)
+    } else {
+        None
+    };
+    HookOutcome {
+        decision,
+        additional_context,
+    }
+}
+
+fn exit_code_decision(code: Option<i32>, stderr: &str) -> HookDecision {
+    match code {
+        Some(2) => HookDecision::Block {
+            reason: stderr.to_string(),
+        },
+        _ => HookDecision::Allow,
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 struct ParsedHookOutput {
     messages: Vec<String>,
@@ -835,9 +957,11 @@ mod tests {
     use std::thread;
     use std::time::Duration;
 
+    use serde_json::json;
+
     use super::{
-        HookAbortSignal, HookEvent, HookProgressEvent, HookProgressReporter, HookRunResult,
-        HookRunner,
+        run_hook_command_for_test, HookAbortSignal, HookDecision, HookEvent, HookOutcome,
+        HookProgressEvent, HookProgressReporter, HookRunResult, HookRunner,
     };
     use crate::config::{RuntimeFeatureConfig, RuntimeHookCommand, RuntimeHookConfig};
     use crate::permissions::PermissionOverride;
@@ -1166,5 +1290,98 @@ mod tests {
     #[cfg(not(windows))]
     fn shell_snippet(script: &str) -> String {
         script.to_string()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exit_two_blocks_with_stderr_reason() {
+        let out = run_hook_command_for_test(
+            "sh -c 'echo nope >&2; exit 2'",
+            HookEvent::PreToolUse,
+            &json!({"tool_name":"Bash"}),
+        );
+        assert!(matches!(out.decision, HookDecision::Block { ref reason } if reason.contains("nope")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stdout_text_on_session_start_becomes_context() {
+        let out = run_hook_command_for_test(
+            "echo 'workflow: run /start-work first'",
+            HookEvent::SessionStart,
+            &json!({}),
+        );
+        assert_eq!(out.decision, HookDecision::Allow);
+        assert!(out.additional_context.unwrap().contains("/start-work"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn json_stdout_decision_overrides_exit_code() {
+        let out = run_hook_command_for_test(
+            r#"echo '{"decision":"block","reason":"missing AC"}'"#,
+            HookEvent::Stop,
+            &json!({}),
+        );
+        assert!(matches!(out.decision, HookDecision::Block { .. }));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn json_stdout_reason_is_captured() {
+        let out = run_hook_command_for_test(
+            r#"echo '{"decision":"block","reason":"missing AC"}'"#,
+            HookEvent::Stop,
+            &json!({}),
+        );
+        assert!(matches!(out.decision, HookDecision::Block { ref reason } if reason == "missing AC"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn json_stdout_additional_context_without_decision_still_allows() {
+        let out = run_hook_command_for_test(
+            r#"echo '{"additionalContext":"remember to run tests"}'"#,
+            HookEvent::UserPromptSubmit,
+            &json!({"prompt": "hi"}),
+        );
+        assert_eq!(out.decision, HookDecision::Allow);
+        assert_eq!(
+            out.additional_context.as_deref(),
+            Some("remember to run tests")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exit_zero_empty_stdout_allows_with_no_context() {
+        let out = run_hook_command_for_test("true", HookEvent::PreCompact, &json!({}));
+        assert_eq!(
+            out,
+            HookOutcome {
+                decision: HookDecision::Allow,
+                additional_context: None,
+            }
+        );
+    }
+
+    #[test]
+    fn block_decision_maps_to_deny_permission_override_for_pre_tool_use() {
+        let outcome = HookOutcome {
+            decision: HookDecision::Block {
+                reason: "no".to_string(),
+            },
+            additional_context: None,
+        };
+        assert_eq!(
+            outcome.permission_override_for_pre_tool_use(),
+            Some(PermissionOverride::Deny)
+        );
+    }
+
+    #[test]
+    fn allow_decision_has_no_permission_override() {
+        let outcome = HookOutcome::default();
+        assert_eq!(outcome.permission_override_for_pre_tool_use(), None);
     }
 }
