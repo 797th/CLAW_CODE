@@ -188,9 +188,14 @@ fn walk_bounded(
         Err(_) => return,
     };
 
-    for entry in entries.flatten() {
-        let path = entry.path();
+    // `fs::read_dir` order is OS/filesystem-dependent. Sort each batch by
+    // path so that walk order — and therefore which candidate "arrives
+    // first" when two same-tier files resolve to the same asset name — is
+    // deterministic across platforms and runs.
+    let mut sorted_entries: Vec<_> = entries.flatten().map(|entry| entry.path()).collect();
+    sorted_entries.sort();
 
+    for path in sorted_entries {
         // Never follow symlinks: reject outright if the entry itself is a
         // symlink (whether to a file or a directory). This is stricter than
         // file_ops's "escape" check but is appropriate here since we don't
@@ -296,90 +301,94 @@ fn read_and_check(path: &Path, warnings: &mut Vec<String>) -> Option<String> {
     }
 }
 
+/// Read, validate, and pull the common (`name`, `description`) fields shared
+/// by every asset kind out of a candidate file. Returns `None` (after
+/// pushing a warning) when the file is unreadable, has no frontmatter block,
+/// or has no way to determine a name. On success, also hands back the raw
+/// file contents so callers can pull kind-specific fields (`role`,
+/// `argument-hint`) out of the same parse.
+fn extract_common(
+    candidate: &Candidate,
+    warnings: &mut Vec<String>,
+    kind_label: &str,
+) -> Option<(String, String, String)> {
+    let contents = read_and_check(&candidate.path, warnings)?;
+    let name =
+        parse_frontmatter_value(&contents, "name").or_else(|| implicit_name(&candidate.path));
+    let Some(name) = name else {
+        warnings.push(format!(
+            "skipping {}: could not determine {kind_label} name",
+            candidate.path.display()
+        ));
+        return None;
+    };
+    let description = parse_frontmatter_value(&contents, "description").unwrap_or_default();
+    Some((name, description, contents))
+}
+
 fn resolve_skills(candidates: Vec<Candidate>, warnings: &mut Vec<String>) -> Vec<SkillMeta> {
-    let mut by_name: Vec<(String, u8, SkillMeta)> = Vec::new();
+    let mut store: Vec<(String, u8, PathBuf, SkillMeta)> = Vec::new();
 
     for candidate in candidates {
-        let Some(contents) = read_and_check(&candidate.path, warnings) else {
+        let Some((name, description, _contents)) = extract_common(&candidate, warnings, "skill")
+        else {
             continue;
         };
-        let name =
-            parse_frontmatter_value(&contents, "name").or_else(|| implicit_name(&candidate.path));
-        let Some(name) = name else {
-            warnings.push(format!(
-                "skipping {}: could not determine skill name",
-                candidate.path.display()
-            ));
-            continue;
-        };
-        let description = parse_frontmatter_value(&contents, "description").unwrap_or_default();
         upsert_by_precedence(
-            &mut by_name,
+            &mut store,
             name.clone(),
             candidate.tier,
+            candidate.path.clone(),
             SkillMeta {
                 name,
                 description,
                 path: candidate.path,
             },
+            warnings,
+            "skill",
         );
     }
 
-    by_name.into_iter().map(|(_, _, meta)| meta).collect()
+    store.into_iter().map(|(_, _, _, meta)| meta).collect()
 }
 
 fn resolve_commands(candidates: Vec<Candidate>, warnings: &mut Vec<String>) -> Vec<CommandMeta> {
-    let mut by_name: Vec<(String, u8, CommandMeta)> = Vec::new();
+    let mut store: Vec<(String, u8, PathBuf, CommandMeta)> = Vec::new();
 
     for candidate in candidates {
-        let Some(contents) = read_and_check(&candidate.path, warnings) else {
+        let Some((name, description, contents)) = extract_common(&candidate, warnings, "command")
+        else {
             continue;
         };
-        let name =
-            parse_frontmatter_value(&contents, "name").or_else(|| implicit_name(&candidate.path));
-        let Some(name) = name else {
-            warnings.push(format!(
-                "skipping {}: could not determine command name",
-                candidate.path.display()
-            ));
-            continue;
-        };
-        let description = parse_frontmatter_value(&contents, "description").unwrap_or_default();
         let argument_hint = parse_frontmatter_value(&contents, "argument-hint")
             .or_else(|| parse_frontmatter_value(&contents, "argument_hint"));
         upsert_by_precedence(
-            &mut by_name,
+            &mut store,
             name.clone(),
             candidate.tier,
+            candidate.path.clone(),
             CommandMeta {
                 name,
                 description,
                 path: candidate.path,
                 argument_hint,
             },
+            warnings,
+            "command",
         );
     }
 
-    by_name.into_iter().map(|(_, _, meta)| meta).collect()
+    store.into_iter().map(|(_, _, _, meta)| meta).collect()
 }
 
 fn resolve_agents(candidates: Vec<Candidate>, warnings: &mut Vec<String>) -> Vec<AgentMeta> {
-    let mut by_name: Vec<(String, u8, AgentMeta)> = Vec::new();
+    let mut store: Vec<(String, u8, PathBuf, AgentMeta)> = Vec::new();
 
     for candidate in candidates {
-        let Some(contents) = read_and_check(&candidate.path, warnings) else {
+        let Some((name, description, contents)) = extract_common(&candidate, warnings, "agent")
+        else {
             continue;
         };
-        let name =
-            parse_frontmatter_value(&contents, "name").or_else(|| implicit_name(&candidate.path));
-        let Some(name) = name else {
-            warnings.push(format!(
-                "skipping {}: could not determine agent name",
-                candidate.path.display()
-            ));
-            continue;
-        };
-        let description = parse_frontmatter_value(&contents, "description").unwrap_or_default();
         let role = match parse_frontmatter_value(&contents, "role") {
             None => AgentRole::default(),
             Some(raw) => match AgentRole::parse(&raw) {
@@ -394,36 +403,75 @@ fn resolve_agents(candidates: Vec<Candidate>, warnings: &mut Vec<String>) -> Vec
             },
         };
         upsert_by_precedence(
-            &mut by_name,
+            &mut store,
             name.clone(),
             candidate.tier,
+            candidate.path.clone(),
             AgentMeta {
                 name,
                 description,
                 path: candidate.path,
                 role,
             },
+            warnings,
+            "agent",
         );
     }
 
-    by_name.into_iter().map(|(_, _, meta)| meta).collect()
+    store.into_iter().map(|(_, _, _, meta)| meta).collect()
 }
 
-/// Insert `meta` under `name`, keeping only the lowest-tier (highest
-/// precedence) entry when a name collides across tiers. Ties (same tier)
-/// keep the first one encountered.
-fn upsert_by_precedence<T>(store: &mut Vec<(String, u8, T)>, name: String, tier: u8, meta: T) {
+/// Insert `meta` under `name`, keeping only the highest-precedence
+/// (lowest-tier) entry when a name collides across tiers — that case is
+/// expected shadowing (project over user) and is silent.
+///
+/// When two candidates collide on the *same* tier (e.g. both
+/// `skills/foo.md` and `skills/foo/SKILL.md` resolve to name `foo`, or two
+/// files declare the same `name:` frontmatter), the outcome would otherwise
+/// depend on directory walk order. Walk order is already made deterministic
+/// by sorting each `read_dir` batch (see `walk_bounded`), and here we apply
+/// an explicit, deterministic tie-break on top of that: the
+/// lexicographically-first path wins. The loser is dropped with a
+/// collectable warning so the collision isn't silent.
+fn upsert_by_precedence<T>(
+    store: &mut Vec<(String, u8, PathBuf, T)>,
+    name: String,
+    tier: u8,
+    path: PathBuf,
+    meta: T,
+    warnings: &mut Vec<String>,
+    kind_label: &str,
+) {
     if let Some(existing) = store
         .iter_mut()
-        .find(|(existing_name, _, _)| *existing_name == name)
+        .find(|(existing_name, _, _, _)| *existing_name == name)
     {
-        if tier < existing.1 {
-            existing.1 = tier;
-            existing.2 = meta;
+        match tier.cmp(&existing.1) {
+            std::cmp::Ordering::Less => {
+                existing.1 = tier;
+                existing.2 = path;
+                existing.3 = meta;
+            }
+            std::cmp::Ordering::Equal => {
+                let new_wins = path < existing.2;
+                let kept_path = if new_wins { &path } else { &existing.2 };
+                warnings.push(format!(
+                    "{kind_label} name '{name}' is defined in both {} and {} at the same precedence tier; keeping {} (lexicographically first)",
+                    existing.2.display(),
+                    path.display(),
+                    kept_path.display()
+                ));
+                if new_wins {
+                    existing.1 = tier;
+                    existing.2 = path;
+                    existing.3 = meta;
+                }
+            }
+            std::cmp::Ordering::Greater => {}
         }
         return;
     }
-    store.push((name, tier, meta));
+    store.push((name, tier, path, meta));
 }
 
 #[cfg(test)]

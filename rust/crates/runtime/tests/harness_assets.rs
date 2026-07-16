@@ -132,6 +132,57 @@ fn malformed_frontmatter_is_skipped_with_warning() {
 }
 
 #[test]
+fn same_tier_name_collision_is_deterministic_with_warning() {
+    let _guard = env_lock();
+    let temp = tempfile::tempdir().expect("tempdir");
+    let cwd = temp.path();
+
+    // Both resolve to skill name "foo" and both live under the same
+    // precedence tier (the project `.claw/skills` root) — a genuine
+    // same-tier collision, not project-vs-user shadowing.
+    write_md(
+        &cwd.join(".claw/skills/foo.md"),
+        "---\nname: foo\ndescription: flat form\n---\nBody.\n",
+    );
+    write_md(
+        &cwd.join(".claw/skills/foo/SKILL.md"),
+        "---\nname: foo\ndescription: dir form\n---\nBody.\n",
+    );
+
+    // Run discovery twice: the winner must be the same both times
+    // (deterministic), not dependent on filesystem/readdir enumeration
+    // order.
+    let first = discover(cwd);
+    let second = discover(cwd);
+
+    assert_eq!(first.skills.len(), 1, "only one 'foo' should survive");
+    assert_eq!(second.skills.len(), 1);
+    assert_eq!(
+        first.skills[0].path, second.skills[0].path,
+        "winner must be deterministic across repeated discovery runs"
+    );
+
+    // Lexicographically, ".claw/skills/foo/SKILL.md" sorts before
+    // ".claw/skills/foo.md" (the "foo" directory component is a strict
+    // prefix of, and therefore less than, "foo.md").
+    assert_eq!(
+        first.skills[0].path,
+        cwd.join(".claw/skills/foo/SKILL.md"),
+        "lexicographically-first path should win the tie-break"
+    );
+    assert_eq!(first.skills[0].description, "dir form");
+
+    assert!(
+        first
+            .warnings
+            .iter()
+            .any(|w| w.contains("foo") && w.to_lowercase().contains("same precedence tier")),
+        "same-tier collision should produce a collectable warning: {:?}",
+        first.warnings
+    );
+}
+
+#[test]
 fn role_parsing_handles_gate_default_and_unknown() {
     let _guard = env_lock();
     let temp = tempfile::tempdir().expect("tempdir");
