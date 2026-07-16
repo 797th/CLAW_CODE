@@ -241,6 +241,11 @@ pub struct RuntimeHookConfig {
     pre_tool_use: Vec<RuntimeHookCommand>,
     post_tool_use: Vec<RuntimeHookCommand>,
     post_tool_use_failure: Vec<RuntimeHookCommand>,
+    session_start: Vec<RuntimeHookCommand>,
+    session_end: Vec<RuntimeHookCommand>,
+    user_prompt_submit: Vec<RuntimeHookCommand>,
+    stop: Vec<RuntimeHookCommand>,
+    pre_compact: Vec<RuntimeHookCommand>,
     invalid_hooks: Vec<RuntimeInvalidHookConfig>,
 }
 
@@ -1303,6 +1308,11 @@ impl RuntimeHookConfig {
             pre_tool_use,
             post_tool_use,
             post_tool_use_failure,
+            session_start: Vec::new(),
+            session_end: Vec::new(),
+            user_prompt_submit: Vec::new(),
+            stop: Vec::new(),
+            pre_compact: Vec::new(),
             invalid_hooks: Vec::new(),
         }
     }
@@ -1328,6 +1338,56 @@ impl RuntimeHookConfig {
     }
 
     #[must_use]
+    pub fn session_start(&self) -> Vec<String> {
+        hook_commands(&self.session_start)
+    }
+
+    #[must_use]
+    pub fn session_start_entries(&self) -> &[RuntimeHookCommand] {
+        &self.session_start
+    }
+
+    #[must_use]
+    pub fn session_end(&self) -> Vec<String> {
+        hook_commands(&self.session_end)
+    }
+
+    #[must_use]
+    pub fn session_end_entries(&self) -> &[RuntimeHookCommand] {
+        &self.session_end
+    }
+
+    #[must_use]
+    pub fn user_prompt_submit(&self) -> Vec<String> {
+        hook_commands(&self.user_prompt_submit)
+    }
+
+    #[must_use]
+    pub fn user_prompt_submit_entries(&self) -> &[RuntimeHookCommand] {
+        &self.user_prompt_submit
+    }
+
+    #[must_use]
+    pub fn stop(&self) -> Vec<String> {
+        hook_commands(&self.stop)
+    }
+
+    #[must_use]
+    pub fn stop_entries(&self) -> &[RuntimeHookCommand] {
+        &self.stop
+    }
+
+    #[must_use]
+    pub fn pre_compact(&self) -> Vec<String> {
+        hook_commands(&self.pre_compact)
+    }
+
+    #[must_use]
+    pub fn pre_compact_entries(&self) -> &[RuntimeHookCommand] {
+        &self.pre_compact
+    }
+
+    #[must_use]
     pub fn merged(&self, other: &Self) -> Self {
         let mut merged = self.clone();
         merged.extend(other);
@@ -1341,6 +1401,14 @@ impl RuntimeHookConfig {
             &mut self.post_tool_use_failure,
             other.post_tool_use_failure_entries(),
         );
+        extend_unique_hook_commands(&mut self.session_start, other.session_start_entries());
+        extend_unique_hook_commands(&mut self.session_end, other.session_end_entries());
+        extend_unique_hook_commands(
+            &mut self.user_prompt_submit,
+            other.user_prompt_submit_entries(),
+        );
+        extend_unique_hook_commands(&mut self.stop, other.stop_entries());
+        extend_unique_hook_commands(&mut self.pre_compact, other.pre_compact_entries());
         self.invalid_hooks
             .extend(other.invalid_hooks.iter().cloned());
     }
@@ -1826,6 +1894,45 @@ fn parse_hooks_object_partial(
             config.post_tool_use_failure.push(command);
         },
     );
+    parse_hook_event_partial(
+        &mut config,
+        hooks,
+        "SessionStart",
+        context,
+        |config, command| {
+            config.session_start.push(command);
+        },
+    );
+    parse_hook_event_partial(
+        &mut config,
+        hooks,
+        "SessionEnd",
+        context,
+        |config, command| {
+            config.session_end.push(command);
+        },
+    );
+    parse_hook_event_partial(
+        &mut config,
+        hooks,
+        "UserPromptSubmit",
+        context,
+        |config, command| {
+            config.user_prompt_submit.push(command);
+        },
+    );
+    parse_hook_event_partial(&mut config, hooks, "Stop", context, |config, command| {
+        config.stop.push(command);
+    });
+    parse_hook_event_partial(
+        &mut config,
+        hooks,
+        "PreCompact",
+        context,
+        |config, command| {
+            config.pre_compact.push(command);
+        },
+    );
     for event in hooks.keys().filter(|event| !is_supported_hook_event(event)) {
         config.push_invalid_hook(RuntimeInvalidHookConfig {
             event: event.clone(),
@@ -1840,7 +1947,17 @@ fn parse_hooks_object_partial(
 }
 
 fn is_supported_hook_event(event: &str) -> bool {
-    matches!(event, "PreToolUse" | "PostToolUse" | "PostToolUseFailure")
+    matches!(
+        event,
+        "PreToolUse"
+            | "PostToolUse"
+            | "PostToolUseFailure"
+            | "SessionStart"
+            | "SessionEnd"
+            | "UserPromptSubmit"
+            | "Stop"
+            | "PreCompact"
+    )
 }
 
 fn parse_hook_event_partial(
@@ -2777,6 +2894,32 @@ mod tests {
         assert_eq!(loaded.permission_rules().ask(), &["Edit".to_string()]);
         assert!(loaded.mcp().get("home").is_some());
         assert!(loaded.mcp().get("project").is_some());
+
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn parses_lifecycle_hook_events_and_defaults_empty() {
+        let root = temp_dir();
+        let cwd = root.join("project");
+        let home = root.join("home").join(".claw");
+        fs::create_dir_all(&home).expect("home config dir");
+        fs::create_dir_all(&cwd).expect("project dir");
+        fs::write(
+            home.join("settings.json"),
+            r#"{"hooks":{"SessionStart":["echo hi"]}}"#,
+        )
+        .expect("write settings");
+
+        let loaded = ConfigLoader::new(&cwd, &home)
+            .load()
+            .expect("config should load");
+
+        assert_eq!(loaded.hooks().session_start(), vec!["echo hi".to_string()]);
+        assert!(loaded.hooks().session_end().is_empty());
+        assert!(loaded.hooks().user_prompt_submit().is_empty());
+        assert!(loaded.hooks().stop().is_empty());
+        assert!(loaded.hooks().pre_compact().is_empty());
 
         fs::remove_dir_all(root).expect("cleanup temp dir");
     }
@@ -3813,8 +3956,14 @@ mod tests {
 
     #[test]
     fn unknown_hook_events_recorded_with_correct_kind_441() {
-        // ROADMAP #441 finding (a): unknown event names like Stop/Notification
+        // ROADMAP #441 finding (a): unknown event names like Notification
         // should not reject entire hooks config; they are recorded as invalid.
+        //
+        // Note: `Stop` was promoted to a supported lifecycle event by the
+        // agentic-workflow harness (see hooks.rs `HookEvent::Stop`), so this
+        // test now exercises a still-unsupported event name (`Notification`)
+        // for the "unknown event" path, plus a malformed-but-known-event
+        // path (`Stop` given a non-array value) to keep both branches covered.
         let root = temp_dir();
         let cwd = root.join("project");
         let home = root.join("home").join(".claw");
@@ -3832,9 +3981,6 @@ mod tests {
 
         // Valid PreToolUse hook should load
         assert_eq!(loaded.hooks().pre_tool_use(), &["valid-cmd".to_string()]);
-        // Stop and Notification are unknown events; each gets one invalid entry
-        // Notification:[{}] also has an empty-object entry issue but since we
-        // don't parse unknown events, only the unknown-event invalid is recorded
         let invalid = loaded.hooks().invalid_hooks();
         assert!(
             invalid.len() >= 2,
@@ -3842,13 +3988,15 @@ mod tests {
             invalid.len()
         );
 
+        // `Stop` is now a known lifecycle event, so a non-array value is a
+        // malformed-config error rather than an unknown-event error.
         let stop = invalid
             .iter()
             .find(|h| h.event == "Stop")
             .expect("Stop invalid hook");
-        assert_eq!(stop.kind, "unknown_hook_event");
+        assert_eq!(stop.kind, "invalid_hooks_config");
         assert_eq!(stop.index, None);
-        assert!(stop.reason.contains("unknown hook event Stop"));
+        assert!(stop.reason.contains("field Stop must be an array"));
 
         let notif = invalid
             .iter()

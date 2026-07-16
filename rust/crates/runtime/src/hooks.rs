@@ -23,6 +23,11 @@ pub enum HookEvent {
     PreToolUse,
     PostToolUse,
     PostToolUseFailure,
+    SessionStart,
+    SessionEnd,
+    UserPromptSubmit,
+    Stop,
+    PreCompact,
 }
 
 impl HookEvent {
@@ -32,6 +37,11 @@ impl HookEvent {
             Self::PreToolUse => "PreToolUse",
             Self::PostToolUse => "PostToolUse",
             Self::PostToolUseFailure => "PostToolUseFailure",
+            Self::SessionStart => "SessionStart",
+            Self::SessionEnd => "SessionEnd",
+            Self::UserPromptSubmit => "UserPromptSubmit",
+            Self::Stop => "Stop",
+            Self::PreCompact => "PreCompact",
         }
     }
 }
@@ -840,6 +850,15 @@ mod tests {
         fn on_event(&mut self, event: &HookProgressEvent) {
             self.events.push(event.clone());
         }
+    }
+
+    #[test]
+    fn lifecycle_hook_events_have_canonical_names() {
+        assert_eq!(HookEvent::SessionStart.as_str(), "SessionStart");
+        assert_eq!(HookEvent::SessionEnd.as_str(), "SessionEnd");
+        assert_eq!(HookEvent::UserPromptSubmit.as_str(), "UserPromptSubmit");
+        assert_eq!(HookEvent::Stop.as_str(), "Stop");
+        assert_eq!(HookEvent::PreCompact.as_str(), "PreCompact");
     }
 
     #[test]
