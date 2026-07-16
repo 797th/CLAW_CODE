@@ -68,6 +68,7 @@ pub(crate) fn detect_lane_completion(
         rebase_required: false,
         stale_cleanup_required: false,
         approval_token: None,
+        workflow_phase: None,
     })
 }
 
@@ -188,6 +189,7 @@ mod tests {
             rebase_required: false,
             stale_cleanup_required: false,
             approval_token: None,
+            workflow_phase: None,
         };
 
         let actions = evaluate_completed_lane(&context);

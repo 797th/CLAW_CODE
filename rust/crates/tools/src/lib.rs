@@ -4406,32 +4406,11 @@ fn skill_frontmatter_name_matches(path: &std::path::Path, requested: &str) -> bo
 }
 
 fn parse_skill_name(contents: &str) -> Option<String> {
-    parse_skill_frontmatter_value(contents, "name")
-}
-
-fn parse_skill_frontmatter_value(contents: &str, key: &str) -> Option<String> {
-    let mut lines = contents.lines();
-    if lines.next().map(str::trim) != Some("---") {
-        return None;
-    }
-
-    for line in lines {
-        let trimmed = line.trim();
-        if trimmed == "---" {
-            break;
-        }
-        if let Some(value) = trimmed.strip_prefix(&format!("{key}:")) {
-            let value = value
-                .trim()
-                .trim_matches(|ch| matches!(ch, '"' | '\''))
-                .trim();
-            if !value.is_empty() {
-                return Some(value.to_string());
-            }
-        }
-    }
-
-    None
+    // Delegates to runtime's canonical frontmatter parser (see
+    // `runtime::harness_assets`) rather than keeping a second
+    // implementation here — `tools` already depends on `runtime`, so there
+    // is no dependency-cycle obstacle to sharing this logic.
+    runtime::harness_assets::parse_frontmatter_value(contents, "name")
 }
 
 const DEFAULT_AGENT_MODEL: &str = "claude-opus-4-6";

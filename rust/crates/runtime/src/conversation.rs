@@ -5,9 +5,10 @@ use serde_json::{Map, Value};
 use telemetry::SessionTracer;
 
 use crate::compact::{
-    compact_session, estimate_session_tokens, CompactionConfig, CompactionResult,
+    compact_session, compact_session_to_target, estimate_session_tokens, CompactionConfig,
+    CompactionResult,
 };
-use crate::config::RuntimeFeatureConfig;
+use crate::config::{RuntimeFeatureConfig, WorkflowGateMode};
 use crate::hooks::{
     HookAbortSignal, HookDecision, HookEvent, HookProgressReporter, HookRunResult, HookRunner,
 };
@@ -16,9 +17,12 @@ use crate::permissions::{
 };
 use crate::session::{ContentBlock, ConversationMessage, Session};
 use crate::usage::{TokenUsage, UsageTracker};
+use crate::workflow_gates::{evaluate_pre_tool_use_gate, evaluate_stop_gate, GateCheckEvent};
 
 const DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD: u32 = 100_000;
 const AUTO_COMPACTION_THRESHOLD_ENV_VAR: &str = "CLAUDE_CODE_AUTO_COMPACT_INPUT_TOKENS";
+const AUTO_COMPACTION_TARGET_THRESHOLD_NUMERATOR: usize = 3;
+const AUTO_COMPACTION_TARGET_THRESHOLD_DENOMINATOR: usize = 4;
 
 /// Fully assembled request payload sent to the upstream model client.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -126,6 +130,11 @@ pub struct TurnSummary {
     /// the consecutive-block cap and was forcibly allowed to stop). Callers
     /// should surface these to the user rather than silently dropping them.
     pub lifecycle_warnings: Vec<String>,
+    /// Workflow gate decisions (Task 9) recorded during this turn — both
+    /// enforced blocks and advisory warnings. Empty unless `workflow_gates`
+    /// is enabled and a workflow is active. Callers may persist these as
+    /// `gate_check` NDJSON audit events.
+    pub gate_events: Vec<GateCheckEvent>,
 }
 
 /// Details about automatic session compaction applied during a turn.
@@ -148,6 +157,7 @@ pub struct ConversationRuntime<C, T> {
     hook_abort_signal: HookAbortSignal,
     hook_progress_reporter: Option<Box<dyn HookProgressReporter>>,
     session_tracer: Option<SessionTracer>,
+    workflow_gate_mode: WorkflowGateMode,
 }
 
 impl<C, T> ConversationRuntime<C, T>
@@ -197,6 +207,7 @@ where
             hook_abort_signal: HookAbortSignal::default(),
             hook_progress_reporter: None,
             session_tracer: None,
+            workflow_gate_mode: feature_config.workflow_gates(),
         }
     }
 
@@ -360,6 +371,8 @@ where
 
         let mut lifecycle_warnings = Vec::new();
         let mut lifecycle_context_parts = Vec::new();
+        let mut gate_events: Vec<GateCheckEvent> = Vec::new();
+        let workflow_gate_mode = self.workflow_gate_mode;
 
         // `SessionStart` fires once per session: an empty message list is
         // this runtime's proxy for "this is the first turn of the session"
@@ -414,7 +427,7 @@ where
         let mut tool_results = Vec::new();
         let mut prompt_cache_events = Vec::new();
         let mut iterations = 0;
-        let mut auto_compaction = None;
+        let mut auto_compaction: Option<AutoCompactionEvent> = None;
         let mut consecutive_stop_blocks = 0;
         const MAX_CONSECUTIVE_STOP_BLOCKS: u32 = 3;
 
@@ -426,6 +439,20 @@ where
                 );
                 self.record_turn_failed(iterations, &error);
                 return Err(error);
+            }
+
+            // Compact before constructing the next provider request. The old
+            // implementation waited for cumulative usage after a response;
+            // cumulative input is not the current context size and can only
+            // detect the problem after an oversized request has already been
+            // sent.
+            if let Some(compaction) = self.maybe_auto_compact() {
+                auto_compaction = Some(AutoCompactionEvent {
+                    removed_message_count: auto_compaction
+                        .as_ref()
+                        .map_or(0_usize, |event| event.removed_message_count)
+                        .saturating_add(compaction.removed_message_count),
+                });
             }
 
             let request = ApiRequest {
@@ -472,12 +499,6 @@ where
                 .map_err(|error| RuntimeError::new(error.to_string()))?;
             assistant_messages.push(assistant_message);
 
-            // Run auto-compaction check before next API call, including on the terminal
-            // (no-tool) iteration, to prevent unbounded session growth (#3106).
-            if let Some(compaction) = self.maybe_auto_compact() {
-                auto_compaction = Some(compaction);
-            }
-
             if pending_tool_uses.is_empty() {
                 let stop_outcome = self
                     .hook_runner
@@ -485,13 +506,41 @@ where
                 if let Some(warning) = stop_outcome.warning {
                     lifecycle_warnings.push(warning);
                 }
-                if let HookDecision::Block { reason } = stop_outcome.decision {
+
+                // Task 9: QAS Stop gate. In `Enforced` mode a Verify phase
+                // with no `test_run` evidence blocks the stop (reusing the
+                // same re-prompt machinery + 3-strike cap as the Stop hook);
+                // in `Advisory` mode it surfaces a warning without blocking.
+                let gate_outcome =
+                    evaluate_stop_gate(workflow_gate_mode, self.session.workflow.as_ref());
+                let mut gate_block_reason = None;
+                if let Some(outcome) = gate_outcome {
+                    // Dedupe: the capped Stop re-prompt loop re-evaluates this
+                    // gate every iteration and would otherwise record N
+                    // byte-identical `gate_check` events per turn. Suppress a
+                    // consecutive duplicate so the audit trail carries one
+                    // record per distinct decision (the forced-stop-after-cap
+                    // is separately recorded in `lifecycle_warnings`).
+                    if gate_events.last() != Some(&outcome.event) {
+                        gate_events.push(outcome.event.clone());
+                    }
+                    if outcome.blocking {
+                        gate_block_reason = Some(outcome.reason);
+                    } else {
+                        lifecycle_warnings.push(format!("[workflow gate] {}", outcome.reason));
+                    }
+                }
+
+                let block_reason = match &stop_outcome.decision {
+                    HookDecision::Block { reason } => Some(reason.clone()),
+                    HookDecision::Allow => gate_block_reason.clone(),
+                };
+
+                if let Some(reason) = block_reason {
                     if consecutive_stop_blocks < MAX_CONSECUTIVE_STOP_BLOCKS {
                         consecutive_stop_blocks += 1;
                         self.session
-                            .push_user_text(format!(
-                                "[Stop hook] You may not stop yet: {reason}"
-                            ))
+                            .push_user_text(format!("[Stop hook] You may not stop yet: {reason}"))
                             .map_err(|error| RuntimeError::new(error.to_string()))?;
                         continue;
                     }
@@ -505,6 +554,29 @@ where
 
             for (tool_use_id, tool_name, input) in pending_tool_uses {
                 let pre_hook_result = self.run_pre_tool_use_hook(&tool_name, &input);
+
+                // Task 9: stop-the-line PreToolUse gate, evaluated at the same
+                // seam the hook PreToolUse decision merges into the permission
+                // pipeline. `Enforced` denies the tool (short-circuiting like a
+                // hook Block); `Advisory` lets it run but injects the reason as
+                // additional context the model sees in the tool result.
+                let gate_outcome = evaluate_pre_tool_use_gate(
+                    workflow_gate_mode,
+                    self.session.workflow.as_ref(),
+                    &tool_name,
+                );
+                let mut gate_denial: Option<String> = None;
+                let mut gate_advisory: Option<String> = None;
+                if let Some(outcome) = gate_outcome {
+                    gate_events.push(outcome.event);
+                    if outcome.blocking {
+                        gate_denial = Some(outcome.reason);
+                    } else {
+                        lifecycle_warnings.push(format!("[workflow gate] {}", outcome.reason));
+                        gate_advisory = Some(outcome.reason);
+                    }
+                }
+
                 let effective_input = pre_hook_result
                     .updated_input()
                     .map_or_else(|| input.clone(), ToOwned::to_owned);
@@ -513,7 +585,9 @@ where
                     pre_hook_result.permission_reason().map(ToOwned::to_owned),
                 );
 
-                let permission_outcome = if pre_hook_result.is_cancelled() {
+                let permission_outcome = if let Some(reason) = gate_denial.clone() {
+                    PermissionOutcome::Deny { reason }
+                } else if pre_hook_result.is_cancelled() {
                     PermissionOutcome::Deny {
                         reason: format_hook_message(
                             &pre_hook_result,
@@ -587,6 +661,9 @@ where
                                 || post_hook_result.is_failed()
                                 || post_hook_result.is_cancelled(),
                         );
+                        if let Some(advisory) = &gate_advisory {
+                            output = format!("{output}\n\n[workflow gate] {advisory}");
+                        }
 
                         ConversationMessage::tool_result(tool_use_id, tool_name, output, is_error)
                     }
@@ -613,6 +690,7 @@ where
             usage: self.usage_tracker.cumulative_usage(),
             auto_compaction,
             lifecycle_warnings,
+            gate_events,
         };
         self.record_turn_completed(&summary);
 
@@ -626,6 +704,16 @@ where
 
     #[must_use]
     pub fn estimated_tokens(&self) -> usize {
+        estimate_session_tokens(&self.session)
+            + self
+                .system_prompt
+                .iter()
+                .map(|prompt| prompt.len().div_ceil(4))
+                .sum::<usize>()
+    }
+
+    #[must_use]
+    pub fn estimated_session_tokens(&self) -> usize {
         estimate_session_tokens(&self.session)
     }
 
@@ -666,18 +754,19 @@ where
     }
 
     fn maybe_auto_compact(&mut self) -> Option<AutoCompactionEvent> {
-        if self.usage_tracker.cumulative_usage().input_tokens
-            < self.auto_compaction_input_tokens_threshold
-        {
+        let threshold = self.auto_compaction_input_tokens_threshold as usize;
+        let current_estimated_tokens = self.estimated_tokens();
+        if current_estimated_tokens < threshold {
             return None;
         }
 
-        let result = compact_session(
+        let target_estimated_tokens =
+            auto_compaction_target_estimate(current_estimated_tokens, 0, threshold);
+
+        let result = compact_session_to_target(
             &self.session,
-            CompactionConfig {
-                max_estimated_tokens: 0,
-                ..CompactionConfig::default()
-            },
+            CompactionConfig::default().preserve_recent_messages,
+            target_estimated_tokens,
         );
 
         if result.removed_message_count == 0 {
@@ -796,6 +885,16 @@ where
         attributes.insert("error".to_string(), Value::String(error.to_string()));
         session_tracer.record("turn_failed", attributes);
     }
+}
+
+fn auto_compaction_target_estimate(
+    _current_estimated_tokens: usize,
+    _observed_input_tokens: usize,
+    threshold: usize,
+) -> usize {
+    let target_input_tokens = threshold.saturating_mul(AUTO_COMPACTION_TARGET_THRESHOLD_NUMERATOR)
+        / AUTO_COMPACTION_TARGET_THRESHOLD_DENOMINATOR;
+    target_input_tokens.max(1)
 }
 
 /// Reads the automatic compaction threshold from the environment.
@@ -954,9 +1053,10 @@ impl ToolExecutor for StaticToolExecutor {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_assistant_message, parse_auto_compaction_threshold, ApiClient, ApiRequest,
-        AssistantEvent, AutoCompactionEvent, ConversationRuntime, PromptCacheEvent, RuntimeError,
-        StaticToolExecutor, ToolExecutor, DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD,
+        auto_compaction_target_estimate, build_assistant_message, parse_auto_compaction_threshold,
+        ApiClient, ApiRequest, AssistantEvent, AutoCompactionEvent, ConversationRuntime,
+        PromptCacheEvent, RuntimeError, StaticToolExecutor, ToolExecutor,
+        DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD,
     };
     use crate::compact::CompactionConfig;
     use crate::config::{RuntimeFeatureConfig, RuntimeHookCommand, RuntimeHookConfig};
@@ -1635,7 +1735,7 @@ mod tests {
     }
 
     #[test]
-    fn auto_compacts_when_cumulative_input_threshold_is_crossed() {
+    fn auto_compacts_before_an_oversized_request() {
         struct SimpleApi;
         impl ApiClient for SimpleApi {
             fn stream(
@@ -1657,13 +1757,13 @@ mod tests {
 
         let mut session = Session::new();
         session.messages = vec![
-            crate::session::ConversationMessage::user_text("one"),
+            crate::session::ConversationMessage::user_text("one ".repeat(30_000)),
             crate::session::ConversationMessage::assistant(vec![ContentBlock::Text {
-                text: "two".to_string(),
+                text: "two ".repeat(30_000),
             }]),
-            crate::session::ConversationMessage::user_text("three"),
+            crate::session::ConversationMessage::user_text("three ".repeat(30_000)),
             crate::session::ConversationMessage::assistant(vec![ContentBlock::Text {
-                text: "four".to_string(),
+                text: "four ".repeat(30_000),
             }]),
         ];
 
@@ -1680,13 +1780,22 @@ mod tests {
             .run_turn("trigger", None)
             .expect("turn should succeed");
 
-        assert_eq!(
+        assert!(matches!(
             summary.auto_compaction,
             Some(AutoCompactionEvent {
-                removed_message_count: 2,
-            })
-        );
+                removed_message_count,
+            }) if removed_message_count > 0
+        ));
         assert_eq!(runtime.session().messages[0].role, MessageRole::System);
+    }
+
+    #[test]
+    fn auto_compaction_target_estimate_leaves_headroom_below_threshold() {
+        assert_eq!(
+            auto_compaction_target_estimate(40, 120_000, 100_000),
+            75_000
+        );
+        assert_eq!(auto_compaction_target_estimate(5, 0, 100_000), 75_000);
     }
 
     #[test]
@@ -1993,7 +2102,10 @@ mod tests {
         }
 
         impl ApiClient for AlwaysRespondsApiClient {
-            fn stream(&mut self, _request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+            fn stream(
+                &mut self,
+                _request: ApiRequest,
+            ) -> Result<Vec<AssistantEvent>, RuntimeError> {
                 self.call_count += 1;
                 // No tool calls, ever: every response looks like a natural
                 // stopping point, forcing the `Stop` hook to fire on every
@@ -2045,10 +2157,12 @@ mod tests {
             .iter()
             .filter(|message| {
                 message.role == MessageRole::User
-                    && message.blocks.iter().any(|block| matches!(
-                        block,
-                        ContentBlock::Text { text } if text.contains("verification incomplete")
-                    ))
+                    && message.blocks.iter().any(|block| {
+                        matches!(
+                            block,
+                            ContentBlock::Text { text } if text.contains("verification incomplete")
+                        )
+                    })
             })
             .count();
         assert_eq!(reprompt_count, 3);

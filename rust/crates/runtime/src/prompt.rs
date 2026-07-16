@@ -3,9 +3,11 @@ use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use crate::config::{ConfigError, ConfigLoader, RulesImportConfig, RuntimeConfig};
+use crate::config::{ConfigError, ConfigLoader, RulesImportConfig, RuntimeConfig, WorkflowGateMode};
 use crate::dreamer::DreamerError;
 use crate::git_context::GitContext;
+use crate::harness_assets::SkillMeta;
+use crate::workflow::WorkflowPhase;
 use crate::MemoryManager;
 
 /// Errors raised while assembling the final system prompt.
@@ -53,6 +55,12 @@ pub const FRONTIER_MODEL_NAME: &str = "Claude Opus 4.6";
 const MAX_INSTRUCTION_FILE_CHARS: usize = 4_000;
 const MAX_TOTAL_INSTRUCTION_CHARS: usize = 12_000;
 const MAX_GIT_DIFF_CHARS: usize = 50_000;
+/// Maximum number of skills listed in the rendered skill index section.
+const MAX_SKILL_INDEX_ENTRIES: usize = 50;
+/// Maximum size (bytes) of the rendered skill index section before truncation.
+const MAX_SKILL_INDEX_BYTES: usize = 4_096;
+const SKILL_INDEX_TRUNCATION_NOTE: &str =
+    "_Additional skills omitted — run /skills for full list._";
 
 /// Always-on caveman communication rules adapted from Julius Brussee's
 /// `caveman` skill. Keeping this in the shared prompt builder makes the
@@ -213,6 +221,8 @@ pub struct SystemPromptBuilder {
     project_context: Option<ProjectContext>,
     config: Option<RuntimeConfig>,
     memory_prompt: Option<String>,
+    skills: Vec<SkillMeta>,
+    workflow_status: Option<String>,
 }
 
 impl SystemPromptBuilder {
@@ -260,6 +270,25 @@ impl SystemPromptBuilder {
     }
 
     #[must_use]
+    pub fn with_skills(mut self, skills: Vec<SkillMeta>) -> Self {
+        self.skills = skills;
+        self
+    }
+
+    /// Attach the one-line workflow phase banner (Task 9). Only rendered when
+    /// a workflow is active (`phase != Idle`) and gates are not `Off`, so the
+    /// model can self-route based on the active gate mode.
+    #[must_use]
+    pub fn with_workflow_status(
+        mut self,
+        phase: WorkflowPhase,
+        mode: WorkflowGateMode,
+    ) -> Self {
+        self.workflow_status = render_workflow_status(phase, mode);
+        self
+    }
+
+    #[must_use]
     pub fn append_section(mut self, section: impl Into<String>) -> Self {
         self.append_sections.push(section.into());
         self
@@ -284,6 +313,12 @@ impl SystemPromptBuilder {
             if !project_context.instruction_files.is_empty() {
                 sections.push(render_instruction_files(&project_context.instruction_files));
             }
+        }
+        if let Some(skill_index) = render_skill_index(&self.skills) {
+            sections.push(skill_index);
+        }
+        if let Some(workflow_status) = &self.workflow_status {
+            sections.push(workflow_status.clone());
         }
         if let Some(memory_prompt) = &self.memory_prompt {
             sections.push(memory_prompt.clone());
@@ -708,14 +743,83 @@ pub fn load_system_prompt_with_context(
         discover_with_git_and_rules_import(&cwd, current_date.into(), config.rules_import())?;
     let memory_prompt =
         MemoryManager::new(cwd.clone(), config.memory().clone()).load_memory_prompt()?;
+    let skills = crate::harness_assets::discover(&cwd).skills;
     let sections = SystemPromptBuilder::new()
         .with_os(os_name, os_version)
         .with_model_family(model_family)
         .with_project_context(project_context.clone())
         .with_memory_prompt(memory_prompt)
         .with_runtime_config(config)
+        .with_skills(skills)
         .build();
     Ok((sections, project_context))
+}
+
+/// Renders the "# Available skills" system-prompt section from discovered
+/// harness skills, telling the model what it can invoke via the `Skill`
+/// tool. Returns `None` for an empty slice so sessions with no discovered
+/// skills see zero prompt change (no section is spliced in at all).
+///
+/// Caps at `MAX_SKILL_INDEX_ENTRIES` skills and `MAX_SKILL_INDEX_BYTES`
+/// total rendered size; either limit being hit appends a truncation note
+/// pointing at `/skills` for the full list.
+#[must_use]
+pub fn render_skill_index(skills: &[SkillMeta]) -> Option<String> {
+    if skills.is_empty() {
+        return None;
+    }
+
+    let mut lines = vec![
+        "# Available skills".to_string(),
+        "Invoke with the Skill tool before acting when a task matches:".to_string(),
+    ];
+
+    let header_len: usize = lines.iter().map(|line| line.len() + 1).sum();
+    let mut budget = MAX_SKILL_INDEX_BYTES.saturating_sub(header_len);
+    let note_len = SKILL_INDEX_TRUNCATION_NOTE.len() + 1;
+    let mut truncated = skills.len() > MAX_SKILL_INDEX_ENTRIES;
+
+    for skill in skills.iter().take(MAX_SKILL_INDEX_ENTRIES) {
+        let entry = format!("- {}: {}", skill.name, skill.description);
+        let entry_len = entry.len() + 1;
+        // Reserve room for the truncation note in case we need to stop early.
+        if entry_len + note_len > budget {
+            truncated = true;
+            break;
+        }
+        budget -= entry_len;
+        lines.push(entry);
+    }
+
+    if truncated {
+        lines.push(SKILL_INDEX_TRUNCATION_NOTE.to_string());
+    }
+
+    Some(lines.join("\n"))
+}
+
+/// Renders the one-line workflow phase banner (Task 9). Returns `None` when a
+/// workflow is not active (`Idle`) or gates are `Off`, so those sessions see
+/// no prompt change.
+#[must_use]
+pub fn render_workflow_status(phase: WorkflowPhase, mode: WorkflowGateMode) -> Option<String> {
+    let gates = match mode {
+        WorkflowGateMode::Off => return None,
+        WorkflowGateMode::Advisory => "advisory",
+        WorkflowGateMode::Enforced => "enforced",
+    };
+    if phase == WorkflowPhase::Idle {
+        return None;
+    }
+    let phase_label = match phase {
+        WorkflowPhase::Idle => "idle",
+        WorkflowPhase::Spec => "spec",
+        WorkflowPhase::Implement => "implement",
+        WorkflowPhase::Verify => "verify",
+        WorkflowPhase::Review => "review",
+        WorkflowPhase::Done => "done",
+    };
+    Some(format!("Workflow phase: {phase_label} — gates: {gates}"))
 }
 
 fn render_config_section(config: &RuntimeConfig) -> String {
@@ -795,11 +899,14 @@ fn get_actions_section() -> String {
 mod tests {
     use super::{
         collapse_blank_lines, display_context_path, normalize_instruction_content,
-        render_instruction_content, render_instruction_files, truncate_diff,
-        truncate_instruction_content, ContextFile, ModelFamilyIdentity, ProjectContext,
-        SystemPromptBuilder, MAX_GIT_DIFF_CHARS, SYSTEM_PROMPT_DYNAMIC_BOUNDARY,
+        render_instruction_content, render_instruction_files, render_skill_index,
+        render_workflow_status, truncate_diff, truncate_instruction_content, ContextFile,
+        ModelFamilyIdentity, ProjectContext, SystemPromptBuilder, MAX_GIT_DIFF_CHARS,
+        MAX_SKILL_INDEX_BYTES, SKILL_INDEX_TRUNCATION_NOTE, SYSTEM_PROMPT_DYNAMIC_BOUNDARY,
     };
-    use crate::config::ConfigLoader;
+    use crate::config::{ConfigLoader, WorkflowGateMode};
+    use crate::workflow::WorkflowPhase;
+    use crate::harness_assets::SkillMeta;
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -1546,5 +1653,121 @@ mod tests {
         let body = &result[..result.len() - marker.len()];
         assert!(body.len() <= MAX_GIT_DIFF_CHARS);
         assert!(body.is_char_boundary(body.len()));
+    }
+
+    #[test]
+    fn workflow_status_banner_renders_only_when_active_and_gated() {
+        // Off mode: no banner regardless of phase.
+        assert!(render_workflow_status(WorkflowPhase::Implement, WorkflowGateMode::Off).is_none());
+        // Idle phase: no banner even when gated.
+        assert!(render_workflow_status(WorkflowPhase::Idle, WorkflowGateMode::Enforced).is_none());
+        // Active + enforced.
+        assert_eq!(
+            render_workflow_status(WorkflowPhase::Implement, WorkflowGateMode::Enforced).as_deref(),
+            Some("Workflow phase: implement — gates: enforced")
+        );
+        // Active + advisory.
+        assert_eq!(
+            render_workflow_status(WorkflowPhase::Verify, WorkflowGateMode::Advisory).as_deref(),
+            Some("Workflow phase: verify — gates: advisory")
+        );
+    }
+
+    #[test]
+    fn build_splices_workflow_banner_after_skill_index() {
+        let sections = SystemPromptBuilder::new()
+            .with_skills(vec![skill("deploy-sop", "How to deploy")])
+            .with_workflow_status(WorkflowPhase::Spec, WorkflowGateMode::Enforced)
+            .build();
+        let banner_idx = sections
+            .iter()
+            .position(|section| section.contains("Workflow phase: spec — gates: enforced"))
+            .expect("banner section present");
+        let skills_idx = sections
+            .iter()
+            .position(|section| section.starts_with("# Available skills"))
+            .expect("skill index section present");
+        assert!(
+            banner_idx > skills_idx,
+            "banner must render after the skill index (skills={skills_idx}, banner={banner_idx})"
+        );
+    }
+
+    fn skill(name: &str, description: &str) -> SkillMeta {
+        SkillMeta {
+            name: name.to_string(),
+            description: description.to_string(),
+            path: PathBuf::from(format!("/tmp/.claw/skills/{name}.md")),
+        }
+    }
+
+    #[test]
+    fn render_skill_index_lists_names_descriptions_and_invocation_instruction() {
+        let skills = vec![
+            skill("deploy-sop", "How to deploy this project safely"),
+            skill("testing-patterns", "Project test conventions and fixtures"),
+        ];
+
+        let rendered = render_skill_index(&skills).expect("skill index should render");
+
+        assert!(rendered.contains("# Available skills"));
+        assert!(rendered.contains("Invoke with the Skill tool before acting when a task matches:"));
+        assert!(rendered.contains("- deploy-sop: How to deploy this project safely"));
+        assert!(rendered.contains("- testing-patterns: Project test conventions and fixtures"));
+    }
+
+    #[test]
+    fn render_skill_index_returns_none_for_no_skills() {
+        assert_eq!(render_skill_index(&[]), None);
+    }
+
+    #[test]
+    fn render_skill_index_caps_at_fifty_entries_with_truncation_note() {
+        let skills: Vec<SkillMeta> = (0..51)
+            .map(|i| skill(&format!("skill-{i:02}"), "short description"))
+            .collect();
+
+        let rendered = render_skill_index(&skills).expect("skill index should render");
+        let entry_count = rendered
+            .lines()
+            .filter(|line| line.starts_with("- skill-"))
+            .count();
+
+        assert_eq!(entry_count, 50);
+        assert!(rendered.contains("run /skills for full list"));
+        assert!(!rendered.contains("skill-50:"));
+    }
+
+    #[test]
+    fn render_skill_index_truncates_when_total_size_exceeds_budget() {
+        let skills: Vec<SkillMeta> = (0..40)
+            .map(|i| skill(&format!("skill-{i:02}"), &"x".repeat(200)))
+            .collect();
+
+        let rendered = render_skill_index(&skills).expect("skill index should render");
+
+        assert!(rendered.len() <= MAX_SKILL_INDEX_BYTES + SKILL_INDEX_TRUNCATION_NOTE.len() + 1);
+        assert!(rendered.contains("run /skills for full list"));
+        let entry_count = rendered
+            .lines()
+            .filter(|line| line.starts_with("- skill-"))
+            .count();
+        assert!(entry_count < 40);
+    }
+
+    #[test]
+    fn build_omits_skill_section_when_no_skills_discovered() {
+        let project_context = ProjectContext {
+            cwd: PathBuf::from("/tmp/project"),
+            current_date: "2026-03-31".to_string(),
+            ..ProjectContext::default()
+        };
+
+        let prompt = SystemPromptBuilder::new()
+            .with_os("linux", "6.8")
+            .with_project_context(project_context)
+            .render();
+
+        assert!(!prompt.contains("# Available skills"));
     }
 }

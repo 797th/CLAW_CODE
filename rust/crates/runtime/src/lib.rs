@@ -18,6 +18,7 @@ mod file_ops;
 pub mod g004_conformance;
 mod git_context;
 pub mod green_contract;
+pub mod harness_assets;
 mod hooks;
 mod json;
 mod lane_events;
@@ -54,6 +55,8 @@ mod trust_resolver;
 mod turn_service;
 mod usage;
 pub mod worker_boot;
+pub mod workflow;
+pub mod workflow_gates;
 
 pub use approval_tokens::{
     ApprovalDelegationHop, ApprovalScope, ApprovalTokenAudit, ApprovalTokenError,
@@ -63,8 +66,9 @@ pub use bash::{execute_bash, BashCommandInput, BashCommandOutput};
 pub use bootstrap::{BootstrapPhase, BootstrapPlan};
 pub use branch_lock::{detect_branch_lock_collisions, BranchLockCollision, BranchLockIntent};
 pub use compact::{
-    compact_session, estimate_session_tokens, format_compact_summary,
+    compact_session, compact_session_to_target, estimate_session_tokens, format_compact_summary,
     get_compact_continuation_message, should_compact, CompactionConfig, CompactionResult,
+    DEFAULT_COMPACTION_KEEP_RECENT_TOKENS,
 };
 pub use config::{
     ConfigEntry, ConfigError, ConfigFileReport, ConfigFileStatus, ConfigInspection, ConfigLoader,
@@ -73,7 +77,7 @@ pub use config::{
     McpServerConfig, McpStdioServerConfig, McpTransport, McpWebSocketServerConfig, MemoryConfig,
     OAuthConfig, ProviderFallbackConfig, ResolvedPermissionMode, RuntimeConfig,
     RuntimeFeatureConfig, RuntimeHookConfig, RuntimeInvalidHookConfig, RuntimePermissionRuleConfig,
-    RuntimePluginConfig, RuntimeProviderConfig, ScopedMcpServerConfig,
+    RuntimePluginConfig, RuntimeProviderConfig, ScopedMcpServerConfig, WorkflowGateMode,
     load_user_model_aliases, load_user_model_aliases_in_home, remove_user_model_alias,
     remove_user_model_alias_in_home, save_user_model_alias, save_user_model_alias_in_home,
     save_user_provider_settings, suppress_config_warnings_for_json_mode, CLAW_SETTINGS_SCHEMA_NAME,
@@ -155,10 +159,10 @@ pub use policy_engine::{
     PolicyEvaluation, PolicyRule, ReconcileReason, ReviewStatus,
 };
 pub use prompt::{
-    load_system_prompt, load_system_prompt_with_context, prepend_bullets, ContextFile,
-    ModelFamilyIdentity, ProjectContext,
-    PromptBuildError, SystemPromptBuilder, CAVEMAN_SYSTEM_PROMPT, FRONTIER_MODEL_NAME,
-    SUPERPOWERS_SYSTEM_PROMPT, SYSTEM_PROMPT_DYNAMIC_BOUNDARY,
+    load_system_prompt, load_system_prompt_with_context, prepend_bullets, render_workflow_status,
+    ContextFile, ModelFamilyIdentity, ProjectContext, PromptBuildError, SystemPromptBuilder,
+    CAVEMAN_SYSTEM_PROMPT, FRONTIER_MODEL_NAME, SUPERPOWERS_SYSTEM_PROMPT,
+    SYSTEM_PROMPT_DYNAMIC_BOUNDARY,
 };
 pub use recovery_recipes::{
     attempt_recovery, recipe_for, EscalationPolicy, FailureScenario, RecoveryAttemptState,
@@ -184,8 +188,8 @@ pub use sandbox::{
     SandboxRequest, SandboxStatus,
 };
 pub use session::{
-    ContentBlock, ConversationMessage, MessageRole, Session, SessionCompaction, SessionError,
-    SessionFork, SessionHeartbeat, SessionLiveness, SessionPromptEntry,
+    CompactionDetails, ContentBlock, ConversationMessage, MessageRole, Session, SessionCompaction,
+    SessionError, SessionFork, SessionHeartbeat, SessionLiveness, SessionPromptEntry,
 };
 pub use sse::{IncrementalSseParser, SseEvent};
 pub use stale_base::{
@@ -209,6 +213,12 @@ pub use usage::{
 pub use worker_boot::{
     Worker, WorkerEvent, WorkerEventKind, WorkerEventPayload, WorkerFailure, WorkerFailureKind,
     WorkerPromptTarget, WorkerReadySnapshot, WorkerRegistry, WorkerStatus, WorkerTrustResolution,
+};
+pub use workflow::{GateCheck, GateEvidence, WorkflowPhase, WorkflowState};
+pub use workflow_gates::{
+    evaluate_pre_tool_use_gate, evaluate_stop_gate, is_file_writing_tool, GateCheckEvent,
+    GateDecision, GateOutcome, GATE_CHECK_EVENT, GATE_CHECK_SCHEMA, QAS_GATE_REASON,
+    STOP_THE_LINE_REASON,
 };
 
 #[cfg(test)]

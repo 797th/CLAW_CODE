@@ -17,6 +17,7 @@
 mod init;
 mod input;
 mod mao;
+mod picker;
 mod render;
 mod setup_wizard;
 
@@ -66,6 +67,7 @@ use runtime::{
     RuntimeError, RuntimeInvalidHookConfig, Session, TokenUsage, ToolError, ToolExecutor,
     TurnSummary, UsageTracker,
 };
+use runtime::{GateCheck, GateEvidence, WorkflowState};
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
 use tools::{
@@ -267,14 +269,14 @@ fn env_model_for_runtime() -> Option<EnvModel> {
         "ANTHROPIC_MODEL",
         "ANTHROPIC_DEFAULT_MODEL",
     ]
-        .into_iter()
-        .find_map(|name| {
-            env::var(name)
-                .ok()
-                .map(|value| value.trim().to_string())
-                .filter(|value| !value.is_empty())
-                .map(|value| EnvModel { name, value })
-        })
+    .into_iter()
+    .find_map(|name| {
+        env::var(name)
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .map(|value| EnvModel { name, value })
+    })
 }
 
 fn max_tokens_for_model(model: &str) -> u32 {
@@ -1068,8 +1070,7 @@ fn credentials_present_for_model(model: &str) -> bool {
         ProviderKind::Xai => api::has_api_key("XAI_API_KEY"),
         ProviderKind::NvidiaNim => api::has_api_key("NVIDIA_API_KEY"),
         ProviderKind::OpenAi => {
-            let credential_env = if api::configured_provider_kind() == Some(ProviderKind::OpenAi)
-            {
+            let credential_env = if api::configured_provider_kind() == Some(ProviderKind::OpenAi) {
                 "OPENAI_API_KEY"
             } else {
                 let canonical = api::resolve_model_alias(model).to_ascii_lowercase();
@@ -1116,9 +1117,7 @@ fn prompt_for_provider_setup(preferred_model: &str) -> io::Result<ProviderSetup>
     println!();
     println!("No API credentials were detected for the selected model.");
     println!("Choose a connection type:");
-    println!(
-        "  1) OpenAI-compatible (recommended) — custom URL plus API key"
-    );
+    println!("  1) OpenAI-compatible (recommended) — custom URL plus API key");
     println!("  2) Anthropic-compatible — custom URL plus API key");
 
     let protocol = loop {
@@ -1282,8 +1281,7 @@ fn setup_default_model(protocol: EndpointProtocol, preferred_model: &str) -> Str
             .unwrap_or(preferred_model),
     };
     if normalized.is_empty()
-        || (protocol == EndpointProtocol::OpenAiCompatible
-            && normalized.starts_with("claude"))
+        || (protocol == EndpointProtocol::OpenAiCompatible && normalized.starts_with("claude"))
         || (protocol == EndpointProtocol::AnthropicCompatible
             && (normalized.starts_with("gpt-") || normalized.starts_with("gpt_")))
     {
@@ -1296,10 +1294,9 @@ fn setup_default_model(protocol: EndpointProtocol, preferred_model: &str) -> Str
 fn normalize_setup_model(protocol: EndpointProtocol, value: &str) -> String {
     let value = value.trim();
     match protocol {
-        EndpointProtocol::OpenAiCompatible => value
-            .strip_prefix("openai/")
-            .unwrap_or(value)
-            .to_string(),
+        EndpointProtocol::OpenAiCompatible => {
+            value.strip_prefix("openai/").unwrap_or(value).to_string()
+        }
         EndpointProtocol::AnthropicCompatible => value
             .strip_prefix("anthropic/")
             .unwrap_or(value)
@@ -1658,16 +1655,21 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             manager_model,
             worker_model,
             output_format,
-        } => match mao::run_orchestrate(&manager_model, &worker_model, &prompt) {
-            Ok(result) => match output_format {
-                CliOutputFormat::Json => println!("{}", result.render_json()),
-                CliOutputFormat::Text => println!("{}", result.render_text()),
-            },
-            Err(e) => {
-                eprintln!("orchestration error: {e}");
-                std::process::exit(1);
+        } => {
+            let assets =
+                runtime::harness_assets::discover(&env::current_dir().unwrap_or_default());
+            let personas = mao::load_personas(&assets);
+            match mao::run_orchestrate(&manager_model, &worker_model, &prompt, personas) {
+                Ok(result) => match output_format {
+                    CliOutputFormat::Json => println!("{}", result.render_json()),
+                    CliOutputFormat::Text => println!("{}", result.render_text()),
+                },
+                Err(e) => {
+                    eprintln!("orchestration error: {e}");
+                    std::process::exit(1);
+                }
             }
-        },
+        }
         CliAction::HelpTopic {
             topic,
             output_format,
@@ -2095,7 +2097,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
             "--permission-mode" => {
                 let value = args
                     .get(index + 1)
-                    .ok_or_else(|| "missing_flag_value: missing value for --permission-mode.\nUsage: --permission-mode read-only|workspace-write|danger-full-access".to_string())?;
+                    .ok_or_else(|| "missing_flag_value: missing value for --permission-mode.\nUsage: --permission-mode prompt|read-only|workspace-write|danger-full-access".to_string())?;
                 // #468: track duplicate --permission-mode flags
                 if permission_mode_override.is_some() {
                     push_duplicate_flag("--permission-mode (overwriting previous value)");
@@ -3096,6 +3098,16 @@ fn try_resolve_bare_skill_prompt(cwd: &Path, trimmed: &str) -> Option<String> {
     }
 }
 
+fn repl_command_model_prompt(command: &SlashCommand) -> Option<String> {
+    match command {
+        SlashCommand::Skills { args } => match classify_skills_slash_command(args.as_deref()) {
+            SkillSlashDispatch::Invoke(prompt) => Some(prompt),
+            SkillSlashDispatch::Local => None,
+        },
+        _ => None,
+    }
+}
+
 fn join_optional_args(args: &[String]) -> Option<String> {
     let joined = args.join(" ");
     let trimmed = joined.trim();
@@ -3577,7 +3589,7 @@ fn parse_permission_mode_arg(value: &str) -> Result<PermissionMode, String> {
     normalize_permission_mode(value)
         .ok_or_else(|| {
             format!(
-                "invalid_permission_mode: unsupported permission mode '{value}'.\nUsage: --permission-mode read-only|workspace-write|danger-full-access"
+                "invalid_permission_mode: unsupported permission mode '{value}'.\nUsage: --permission-mode prompt|read-only|workspace-write|danger-full-access"
             )
         })
         .map(permission_mode_from_label)
@@ -3585,6 +3597,7 @@ fn parse_permission_mode_arg(value: &str) -> Result<PermissionMode, String> {
 
 fn permission_mode_from_label(mode: &str) -> PermissionMode {
     match mode {
+        "prompt" | "ask" => PermissionMode::Prompt,
         "read-only" => PermissionMode::ReadOnly,
         "workspace-write" => PermissionMode::WorkspaceWrite,
         "danger-full-access" => PermissionMode::DangerFullAccess,
@@ -3816,26 +3829,11 @@ fn style_ui(text: &str, color: Color, bold: bool) -> String {
     }
 }
 
-fn repl_permission_label(permission_mode: PermissionMode) -> &'static str {
-    match permission_mode {
-        PermissionMode::DangerFullAccess => "full access",
-        PermissionMode::WorkspaceWrite => "workspace write",
-        PermissionMode::ReadOnly => "read-only",
-        PermissionMode::Prompt => "ask before tools",
-        PermissionMode::Allow => "allow",
-    }
-}
-
 fn format_repl_prompt(_model: &str, _permission_mode: PermissionMode) -> String {
-    let muted = Color::Rgb {
-        r: 148,
-        g: 163,
-        b: 184,
-    };
-    format!("{} ", style_ui("╭─", muted, false))
+    input::styled_input_chip()
 }
 
-fn format_repl_footer(model: &str, permission_mode: PermissionMode) -> String {
+fn format_repl_footer(model: &str, permission_mode: PermissionMode, usage: TokenUsage) -> String {
     let accent = Color::Rgb {
         r: 129,
         g: 140,
@@ -3846,13 +3844,46 @@ fn format_repl_footer(model: &str, permission_mode: PermissionMode) -> String {
         g: 163,
         b: 184,
     };
+    let pricing = pricing_for_model(model).unwrap_or_else(ModelPricing::default_sonnet_tier);
+    let cost = format_usd(
+        usage
+            .estimate_cost_usd_with_pricing(pricing)
+            .total_cost_usd(),
+    );
     format!(
-        "{} {} {} {}",
-        style_ui("╰─", muted, false),
+        "{} {} {} {} {} {} {}",
+        style_ui("•", muted, false),
         style_ui(model, accent, false),
         style_ui("·", muted, false),
-        style_ui(repl_permission_label(permission_mode), muted, false),
+        style_ui(&format!("{} tok", usage.total_tokens()), muted, false),
+        style_ui("·", muted, false),
+        style_ui(&cost, muted, false),
+        input::styled_permission_segment(permission_mode.as_str()),
     )
+}
+
+const SUPERPOWERS_CHECKLIST: &[&str] = &[
+    "understand request and constraints",
+    "make a focused implementation plan",
+    "work incrementally with verification",
+    "review the result before handoff",
+];
+
+fn is_superpowers_invocation(prompt: &str) -> bool {
+    prompt
+        .trim()
+        .trim_start_matches('$')
+        .split_whitespace()
+        .next()
+        == Some("superpowers")
+}
+
+fn print_superpowers_checklist() {
+    println!();
+    println!("• Superpowers workflow");
+    for item in SUPERPOWERS_CHECKLIST {
+        println!("  ☐ {item}");
+    }
 }
 
 fn filter_tool_specs(
@@ -6936,6 +6967,13 @@ fn format_auto_compaction_notice(removed: usize) -> String {
     format!("[auto-compacted: removed {removed} messages]")
 }
 
+fn overflow_compaction_target(estimated_tokens: usize, reduction_percent: usize) -> usize {
+    estimated_tokens
+        .saturating_mul(reduction_percent)
+        .saturating_div(100)
+        .max(1)
+}
+
 fn parse_git_status_metadata(status: Option<&str>) -> (Option<PathBuf>, Option<String>) {
     parse_git_status_metadata_for(
         &env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
@@ -7213,13 +7251,23 @@ fn run_resume_command(
     };
 
     match command {
-        SlashCommand::Help => Ok(ResumeCommandOutcome {
-            session: session.clone(),
-            message: Some(render_repl_help()),
-            json: Some(
-                serde_json::json!({ "kind": "help", "action": "help", "status": "ok", "message": render_repl_help() }),
-            ),
-        }),
+        SlashCommand::Help => {
+            // One-shot (non-interactive `--resume ... /help`) invocation:
+            // always discover fresh, there's no dispatch snapshot to stay
+            // consistent with here.
+            let (custom_commands, _warnings) = commands::resolve_custom_commands(
+                runtime::harness_assets::discover(&env::current_dir().unwrap_or_default())
+                    .commands,
+            );
+            let help_text = render_repl_help(&custom_commands);
+            Ok(ResumeCommandOutcome {
+                session: session.clone(),
+                json: Some(
+                    serde_json::json!({ "kind": "help", "action": "help", "status": "ok", "message": help_text.clone() }),
+                ),
+                message: Some(help_text),
+            })
+        }
         SlashCommand::Compact => {
             let result = runtime::trident::trident_compact_session(
                 session,
@@ -7679,7 +7727,9 @@ fn run_resume_command(
         | SlashCommand::OutputStyle { .. }
         | SlashCommand::AddDir { .. }
         | SlashCommand::Team { .. }
-        | SlashCommand::Setup => Err("unsupported resumed slash command".into()),
+        | SlashCommand::Setup
+        | SlashCommand::Custom { .. }
+        | SlashCommand::Workflow { .. } => Err("unsupported resumed slash command".into()),
     }
 }
 
@@ -7827,9 +7877,17 @@ fn run_repl(
 
     loop {
         editor.set_prompt(format_repl_prompt(&cli.model, cli.permission_mode));
-        editor.set_footer(format_repl_footer(&cli.model, cli.permission_mode));
+        editor.set_permission_mode(cli.permission_mode.as_str());
+        editor.set_footer(cli.repl_footer());
         editor.set_completions(cli.repl_completion_candidates().unwrap_or_default());
-        match editor.read_line()? {
+        let read_outcome = editor.read_line()?;
+        let requested_permission_mode = editor.permission_mode();
+        if requested_permission_mode != cli.permission_mode.as_str() {
+            cli.set_permissions(Some(requested_permission_mode))?;
+            cli.persist_session()?;
+        }
+
+        match read_outcome {
             input::ReadOutcome::Submit(input) => {
                 let trimmed = input.trim().to_string();
                 if trimmed.is_empty() {
@@ -7840,9 +7898,40 @@ fn run_repl(
                     cli.persist_session()?;
                     break;
                 }
-                match SlashCommand::parse(&trimmed) {
+                // Re-discover `.claw/commands/*.md` fresh for every slash
+                // command (rather than once at boot): a bounded, shallow
+                // directory walk, cheap enough to redo per input, and it
+                // keeps dispatch and `/help` from disagreeing about which
+                // custom commands exist mid-session (a file added after
+                // boot would otherwise show in `/help` but fail to parse).
+                // Built-in commands always win name conflicts; a
+                // conflicting custom command is dropped and its warning
+                // surfaced here instead of failing dispatch.
+                let custom_commands = if trimmed.starts_with('/') {
+                    let (kept, warnings) = commands::resolve_custom_commands(
+                        runtime::harness_assets::discover(
+                            &env::current_dir().unwrap_or_default(),
+                        )
+                        .commands,
+                    );
+                    for warning in &warnings {
+                        eprintln!("{warning}");
+                    }
+                    kept
+                } else {
+                    Vec::new()
+                };
+                match SlashCommand::parse_with_commands(&trimmed, &custom_commands) {
                     Ok(Some(command)) => {
-                        if cli.handle_repl_command(command)? {
+                        if let Some(prompt) = repl_command_model_prompt(&command) {
+                            editor.push_history(input);
+                            cli.record_prompt_history(&trimmed);
+                            editor.begin_working()?;
+                            if is_superpowers_invocation(&prompt) {
+                                print_superpowers_checklist();
+                            }
+                            cli.run_turn(&prompt)?;
+                        } else if cli.handle_repl_command(command, &custom_commands)? {
                             cli.persist_session()?;
                         }
                         continue;
@@ -7860,11 +7949,16 @@ fn run_repl(
                 if let Some(prompt) = try_resolve_bare_skill_prompt(&cwd, &trimmed) {
                     editor.push_history(input);
                     cli.record_prompt_history(&trimmed);
+                    editor.begin_working()?;
+                    if is_superpowers_invocation(&prompt) {
+                        print_superpowers_checklist();
+                    }
                     cli.run_turn(&prompt)?;
                     continue;
                 }
                 editor.push_history(input);
                 cli.record_prompt_history(&trimmed);
+                editor.begin_working()?;
                 cli.run_turn(&trimmed)?;
             }
             input::ReadOutcome::Cancel => {}
@@ -8551,8 +8645,8 @@ impl LiveCli {
             b: 184,
         };
         let brand = style_ui("Claw Code", accent, true);
-        let top = style_ui("╭─", accent, false);
-        let bottom = style_ui("╰─", muted, false);
+        let top = style_ui("•", accent, false);
+        let bottom = style_ui("•", muted, false);
         let help = style_ui("/help", accent, false);
         let status = style_ui("/status", accent, false);
         let resume = style_ui("/resume latest", accent, false);
@@ -8561,12 +8655,20 @@ impl LiveCli {
         format!(
             "{top} {brand}\n\
 {bottom} {help} commands · {status} context · {resume} restore\n\
-   {tab} completes commands, models, sessions, and paths · {shift_enter} newline",
+   {tab} completes commands, models, sessions, and paths · Shift+Tab permission mode · {shift_enter} newline",
         )
     }
 
     fn disconnected_startup_banner(&self) -> String {
         format!("{}\n{NEEDS_LOGIN_HINT}", self.startup_banner())
+    }
+
+    fn repl_footer(&self) -> String {
+        format_repl_footer(
+            &self.model,
+            self.permission_mode,
+            self.runtime.usage().cumulative_usage(),
+        )
     }
 
     fn repl_completion_candidates(&self) -> Result<Vec<String>, Box<dyn std::error::Error>> {
@@ -8580,16 +8682,31 @@ impl LiveCli {
         ))
     }
 
+    /// Task 9: the one-line workflow phase banner appended to the system
+    /// prompt when a workflow is active and gates are not `Off`. Loads the
+    /// gate mode from config; returns `None` on any config error (banner is
+    /// best-effort and must never fail a turn).
+    fn workflow_status_banner(&self) -> Option<String> {
+        let phase = self.runtime.session().workflow.as_ref()?.phase;
+        let cwd = env::current_dir().ok()?;
+        let config = ConfigLoader::default_for(&cwd).load().ok()?;
+        runtime::render_workflow_status(phase, config.workflow_gates())
+    }
+
     fn prepare_turn_runtime(
         &self,
         emit_output: bool,
     ) -> Result<(BuiltRuntime, HookAbortMonitor), Box<dyn std::error::Error>> {
         let hook_abort_signal = runtime::HookAbortSignal::new();
+        let mut system_prompt = self.system_prompt.clone();
+        if let Some(banner) = self.workflow_status_banner() {
+            system_prompt.push(banner);
+        }
         let runtime = build_runtime(
             self.runtime.session().clone(),
             &self.session.id,
             self.model.clone(),
-            self.system_prompt.clone(),
+            system_prompt,
             true,
             emit_output,
             self.allowed_tools.clone(),
@@ -8781,6 +8898,7 @@ impl LiveCli {
                     );
                 }
                 print_lifecycle_warnings(&summary);
+                print_gate_audit(&summary);
                 self.persist_session()?;
                 self.append_turn_log(input, &summary);
                 self.maybe_auto_dream_after_success();
@@ -8788,11 +8906,6 @@ impl LiveCli {
             }
             Err(error) => {
                 runtime.shutdown_plugins()?;
-                activity.fail(
-                    "Request failed",
-                    renderer.color_theme(),
-                    &mut stdout,
-                )?;
 
                 // ============================================================================
                 // Auto-compact retry on context window errors
@@ -8837,60 +8950,80 @@ impl LiveCli {
                     || error_str.contains("error decoding response body");
 
                 if is_context_window || is_no_content {
+                    // Keep automatic recovery out of the interactive transcript. The
+                    // activity row is replaced by the eventual response (or one final
+                    // failure), rather than exposing each internal retry round.
+                    activity.clear(&mut stdout)?;
+
                     // If the error tells us the server's actual context window, adapt our
                     // auto-compaction threshold so future auto-compact-trigger checks are accurate.
                     if let Some(window) = extract_context_window_tokens_from_error(&error_str) {
-                        // Set threshold at 70% of the reported window to leave headroom.
-                        let threshold: u32 = (window as f64 * 0.7).round() as u32;
-                        println!(
-                            "  Server context window: {} tokens — setting auto-compaction threshold to {}",
-                            window, threshold
-                        );
+                        // Trigger before the provider's hard limit. Keeping a
+                        // 25% reserve absorbs the system prompt, tool schemas,
+                        // and the next assistant response.
+                        let threshold: u32 = (window as f64 * 0.75).round() as u32;
+                        if !clean_interactive_output {
+                            println!(
+                                "  Server context window: {} tokens — setting auto-compaction threshold to {}",
+                                window, threshold
+                            );
+                        }
                         runtime.set_auto_compaction_input_tokens_threshold(threshold);
                     }
 
-                    // A single compaction pass may not free enough context space.
-                    // Progressive retry: each round preserves fewer recent messages (4→2→1→0),
-                    // trading conversation continuity for a smaller payload until it fits.
-                    // Max 4 rounds before giving up and surfacing the error to the user.
+                    // A single compaction pass may not free enough context
+                    // space. Progressive retry reduces the target budget while
+                    // the compactor still protects recent turns by token
+                    // budget. Max 4 rounds prevents a retry loop.
                     let max_compact_rounds = 4;
-                    let preserve_schedule = [4, 2, 1, 0];
+                    let target_schedule = [60usize, 45, 30, 20];
+                    let preferred_preserve_recent_messages =
+                        CompactionConfig::default().preserve_recent_messages;
 
                     for round in 0..max_compact_rounds {
-                        let preserve = preserve_schedule[round];
-                        println!(
-                            "  Auto-compacting session (round {}/{}, preserving {} recent messages)...",
-                            round + 1,
-                            max_compact_rounds,
-                            preserve
+                        let target_estimated_tokens = overflow_compaction_target(
+                            runtime.estimated_tokens(),
+                            target_schedule[round],
                         );
+                        if !clean_interactive_output {
+                            println!(
+                                "  Auto-compacting session (round {}/{}, target ~{} estimated tokens)...",
+                                round + 1,
+                                max_compact_rounds,
+                                target_estimated_tokens
+                            );
+                        }
 
-                        // Run Trident pipeline then summary-based compaction
-                        let result = runtime::trident::trident_compact_session(
+                        // Run Trident pipeline then compact until the reduced
+                        // session estimate fits the round's target budget.
+                        let result = runtime::trident::trident_compact_session_to_target(
                             runtime.session(),
-                            CompactionConfig {
-                                preserve_recent_messages: preserve,
-                                max_estimated_tokens: 0,
-                            },
+                            preferred_preserve_recent_messages,
+                            target_estimated_tokens,
                             &runtime::trident::TridentConfig::default(),
                         );
                         let removed = result.removed_message_count;
 
-                        if removed == 0 && round > 0 {
-                            // No more messages to compact — further rounds won't help
+                        let changed = removed > 0
+                            || result.compacted_session.messages != runtime.session().messages;
+                        if !changed {
+                            // No more messages or oversized tool payloads to
+                            // compact — further rounds cannot change the request.
                             println!("  No further compaction possible.");
                             break;
                         }
 
                         if removed > 0 {
-                            println!(
-                                "{}",
-                                format_compact_report(
-                                    removed,
-                                    result.compacted_session.messages.len(),
-                                    false
-                                )
-                            );
+                            if !clean_interactive_output {
+                                println!(
+                                    "{}",
+                                    format_compact_report(
+                                        removed,
+                                        result.compacted_session.messages.len(),
+                                        false
+                                    )
+                                );
+                            }
                         }
 
                         // Without this, prepare_turn_runtime() reads from self.runtime.session()
@@ -8934,6 +9067,7 @@ impl LiveCli {
                                     );
                                 }
                                 print_lifecycle_warnings(&summary);
+                                print_gate_audit(&summary);
                                 self.persist_session()?;
                                 return Ok(());
                             }
@@ -8959,7 +9093,7 @@ impl LiveCli {
                                     if let Some(window) =
                                         extract_context_window_tokens_from_error(&retry_str)
                                     {
-                                        let threshold: u32 = (window as f64 * 0.7).round() as u32;
+                                        let threshold: u32 = (window as f64 * 0.75).round() as u32;
                                         new_runtime
                                             .set_auto_compaction_input_tokens_threshold(threshold);
                                     }
@@ -8973,6 +9107,11 @@ impl LiveCli {
                                 }
 
                                 // Not a context window error, or out of rounds
+                                activity.fail(
+                                    "Request failed",
+                                    renderer.color_theme(),
+                                    &mut stdout,
+                                )?;
                                 return Err(Box::new(retry_error));
                             }
                         }
@@ -8980,6 +9119,7 @@ impl LiveCli {
                 }
 
                 // If not a context window error, return original error
+                activity.fail("Request failed", renderer.color_theme(), &mut stdout)?;
                 Err(Box::new(error))
             }
         }
@@ -9006,6 +9146,7 @@ impl LiveCli {
         hook_abort_monitor.stop();
         let summary = result?;
         print_lifecycle_warnings(&summary);
+        print_gate_audit(&summary);
         self.replace_runtime(runtime)?;
         self.persist_session()?;
         let final_text = final_assistant_text(&summary);
@@ -9028,6 +9169,7 @@ impl LiveCli {
                 "message": final_assistant_text(&summary),
                 "compact": true,
                 "model": self.model,
+                "gate_events": collect_gate_events(&summary),
                 "usage": {
                     "input_tokens": summary.usage.input_tokens,
                     "output_tokens": summary.usage.output_tokens,
@@ -9060,6 +9202,7 @@ impl LiveCli {
                 })),
                 "tool_uses": collect_tool_uses(&summary),
                 "tool_results": collect_tool_results(&summary),
+                "gate_events": collect_gate_events(&summary),
                 "prompt_cache_events": collect_prompt_cache_events(&summary),
                 "usage": {
                     "input_tokens": summary.usage.input_tokens,
@@ -9082,10 +9225,11 @@ impl LiveCli {
     fn handle_repl_command(
         &mut self,
         command: SlashCommand,
+        custom_commands: &[runtime::harness_assets::CommandMeta],
     ) -> Result<bool, Box<dyn std::error::Error>> {
         Ok(match command {
             SlashCommand::Help => {
-                println!("{}", render_repl_help());
+                println!("{}", render_repl_help(custom_commands));
                 false
             }
             SlashCommand::Status => {
@@ -9128,7 +9272,8 @@ impl LiveCli {
                 self.compact()?;
                 false
             }
-            SlashCommand::Model { model } => self.set_model(model)?,
+            SlashCommand::Model { model: Some(model) } => self.set_model(Some(model))?,
+            SlashCommand::Model { model: None } => self.choose_model_interactively()?,
             SlashCommand::ModelAdd { alias, model } => self.add_model(alias, model)?,
             SlashCommand::ModelRemove { alias } => self.remove_model(alias)?,
             SlashCommand::Permissions { mode } => self.set_permissions(mode)?,
@@ -9182,6 +9327,7 @@ impl LiveCli {
             SlashCommand::Plugins { action, target } => {
                 self.handle_plugins_command(action.as_deref(), target.as_deref())?
             }
+            SlashCommand::Workflow { action } => self.handle_workflow_command(action.as_deref())?,
             SlashCommand::Agents { args } => {
                 if let Err(error) = Self::print_agents(args.as_deref(), CliOutputFormat::Text) {
                     eprintln!("{error}");
@@ -9190,7 +9336,12 @@ impl LiveCli {
             }
             SlashCommand::Skills { args } => {
                 match classify_skills_slash_command(args.as_deref()) {
-                    SkillSlashDispatch::Invoke(prompt) => self.run_turn(&prompt)?,
+                    SkillSlashDispatch::Invoke(prompt) => {
+                        if is_superpowers_invocation(&prompt) {
+                            print_superpowers_checklist();
+                        }
+                        self.run_turn(&prompt)?;
+                    }
                     SkillSlashDispatch::Local => {
                         if let Err(error) =
                             Self::print_skills(args.as_deref(), CliOutputFormat::Text)
@@ -9278,6 +9429,10 @@ impl LiveCli {
             }
             SlashCommand::Unknown(name) => {
                 eprintln!("{}", format_unknown_slash_command(&name));
+                false
+            }
+            SlashCommand::Custom { body, .. } => {
+                self.run_turn(&body)?;
                 false
             }
         })
@@ -9370,6 +9525,50 @@ impl LiveCli {
             "{}",
             format_sandbox_report(&resolve_sandbox_status(runtime_config.sandbox(), &cwd))
         );
+    }
+
+    fn choose_model_interactively(&mut self) -> Result<bool, Box<dyn std::error::Error>> {
+        const ALIASES: [&str; 4] = ["opus", "sonnet", "haiku", "gpt-oss"];
+
+        let mut items: Vec<picker::PickerItem> = ALIASES
+            .iter()
+            .map(|alias| picker::PickerItem::new(*alias, resolve_model_alias_with_config(alias)))
+            .collect();
+        items.push(picker::PickerItem::new("custom…", "type a provider/model"));
+
+        let initial = ALIASES
+            .iter()
+            .position(|alias| resolve_model_alias_with_config(alias) == self.model)
+            .unwrap_or(0);
+
+        println!();
+        match picker::select_from_list("Select model", &items, initial)? {
+            picker::PickerOutcome::Cancelled => {
+                println!("Model unchanged.");
+                Ok(false)
+            }
+            picker::PickerOutcome::Selected(index) if index < ALIASES.len() => {
+                self.set_model(Some(ALIASES[index].to_string()))
+            }
+            // The "custom…" row, or a non-interactive session (piped stdin):
+            // fall back to a typed provider/model prompt.
+            picker::PickerOutcome::Selected(_) | picker::PickerOutcome::NotInteractive => {
+                println!("Model selection");
+                println!("  Current          {}", self.model);
+                println!("  Aliases          opus · sonnet · haiku · gpt-oss");
+                print!("  Provider/model   ");
+                io::stdout().flush()?;
+
+                let mut input = String::new();
+                io::stdin().read_line(&mut input)?;
+                let model = input.trim();
+                if model.is_empty() {
+                    println!("Model unchanged.");
+                    return Ok(false);
+                }
+                self.set_model(Some(model.to_string()))
+            }
+        }
     }
 
     fn set_model(&mut self, model: Option<String>) -> Result<bool, Box<dyn std::error::Error>> {
@@ -9508,7 +9707,7 @@ impl LiveCli {
 
         let normalized = normalize_permission_mode(&mode).ok_or_else(|| {
             format!(
-                "invalid_flag_value: unsupported permission mode '{mode}'.\nUsage: --permission-mode read-only|workspace-write|danger-full-access"
+                "invalid_flag_value: unsupported permission mode '{mode}'.\nUsage: --permission-mode prompt|read-only|workspace-write|danger-full-access"
             )
         })?;
 
@@ -10072,6 +10271,102 @@ impl LiveCli {
         Ok(false)
     }
 
+    /// Dispatch `/workflow [status|start <task-ref>|advance|gate <kind> <detail...>]`.
+    /// Task 8: pure command-layer plumbing for the SAW-style workflow gate
+    /// (`runtime::workflow::WorkflowState`, Task 7). No enforcement of
+    /// `workflow_gates` config mode happens here yet -- that's Task 9; this
+    /// only lets the model/user inspect and drive the state machine.
+    fn handle_workflow_command(
+        &mut self,
+        action: Option<&str>,
+    ) -> Result<bool, Box<dyn std::error::Error>> {
+        let mut tokens = action.unwrap_or_default().split_whitespace();
+        let subcommand = tokens.next();
+
+        match subcommand {
+            Some("status") => {
+                let workflow = self.runtime.session().workflow.clone().unwrap_or_default();
+                println!("{}", render_workflow_status(&workflow));
+                Ok(false)
+            }
+            Some("start") => {
+                let Some(task_ref) = tokens.next() else {
+                    println!("Usage: /workflow start <task-ref>");
+                    return Ok(false);
+                };
+                let workflow = self
+                    .runtime
+                    .session_mut()
+                    .workflow
+                    .get_or_insert_with(WorkflowState::default);
+                workflow.start(task_ref);
+                let phase = workflow.phase;
+                self.persist_session()?;
+                println!("Workflow started\n  Task             {task_ref}\n  Phase            {phase:?}");
+                Ok(false)
+            }
+            Some("advance") => {
+                let already_existed = self.runtime.session().workflow.is_some();
+                let workflow = self
+                    .runtime
+                    .session_mut()
+                    .workflow
+                    .get_or_insert_with(WorkflowState::default);
+                let result = workflow.try_advance();
+                let phase = workflow.phase;
+                // Skip the write when nothing changed: a pre-existing
+                // workflow that stayed Blocked mutated no persisted state.
+                // (A brand-new default WorkflowState is still worth
+                // persisting so /workflow status reflects Idle immediately.)
+                let state_unchanged =
+                    already_existed && matches!(result, GateCheck::Blocked { .. });
+                if !state_unchanged {
+                    self.persist_session()?;
+                }
+                match result {
+                    GateCheck::Pass => println!("Workflow advanced\n  Phase            {phase:?}"),
+                    GateCheck::Blocked { reason } => {
+                        println!("Workflow blocked\n  Phase            {phase:?}\n  Reason           {reason}");
+                    }
+                }
+                Ok(false)
+            }
+            Some("gate") => {
+                let Some(kind) = tokens.next() else {
+                    println!("Usage: /workflow gate <kind> <detail>");
+                    return Ok(false);
+                };
+                let detail = tokens.collect::<Vec<_>>().join(" ");
+                if detail.trim().is_empty() {
+                    println!("Usage: /workflow gate <kind> <detail>");
+                    return Ok(false);
+                }
+                let workflow = self
+                    .runtime
+                    .session_mut()
+                    .workflow
+                    .get_or_insert_with(WorkflowState::default);
+                let gate = workflow.phase;
+                workflow.record_evidence(GateEvidence {
+                    gate,
+                    kind: kind.to_string(),
+                    detail: detail.clone(),
+                });
+                self.persist_session()?;
+                println!(
+                    "Evidence recorded\n  Gate             {gate:?}\n  Kind             {kind}\n  Detail           {detail}"
+                );
+                Ok(false)
+            }
+            _ => {
+                println!(
+                    "Usage: /workflow [status|start <task-ref>|advance|gate <kind> <detail>]"
+                );
+                Ok(false)
+            }
+        }
+    }
+
     fn reload_runtime_features(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         let runtime = build_runtime(
             self.runtime.session().clone(),
@@ -10522,6 +10817,39 @@ fn render_session_list(active_session_id: &str) -> Result<String, Box<dyn std::e
     Ok(lines.join("\n"))
 }
 
+/// Render `/workflow status`: phase, task ref, acceptance criteria, and
+/// recorded gate evidence for a `WorkflowState` (Task 8).
+fn render_workflow_status(workflow: &WorkflowState) -> String {
+    let mut lines = vec![
+        "Workflow".to_string(),
+        format!("  Phase            {:?}", workflow.phase),
+        format!(
+            "  Task             {}",
+            workflow.task_ref.as_deref().unwrap_or("<none>")
+        ),
+    ];
+    if workflow.acceptance_criteria.is_empty() {
+        lines.push("  Acceptance       <none recorded>".to_string());
+    } else {
+        lines.push("  Acceptance".to_string());
+        for ac in &workflow.acceptance_criteria {
+            lines.push(format!("    - {ac}"));
+        }
+    }
+    if workflow.evidence.is_empty() {
+        lines.push("  Evidence         <none recorded>".to_string());
+    } else {
+        lines.push("  Evidence".to_string());
+        for evidence in &workflow.evidence {
+            lines.push(format!(
+                "    - gate={:?} kind={} detail={}",
+                evidence.gate, evidence.kind, evidence.detail
+            ));
+        }
+    }
+    lines.join("\n")
+}
+
 /// #449: credentials-free session list that works without API keys.
 /// `claw session list --output-format json` should work in CI/offline.
 fn run_session_list(output_format: CliOutputFormat) -> Result<(), Box<dyn std::error::Error>> {
@@ -10589,14 +10917,25 @@ fn session_clear_backup_path(session_path: &Path) -> PathBuf {
     session_path.with_file_name(format!("{file_name}.before-clear-{timestamp}.bak"))
 }
 
-fn render_repl_help() -> String {
-    [
+/// Render the REPL's `/help` text. `custom_commands` is the caller's
+/// already-resolved `.claw/commands/*.md` registry (see
+/// `commands::resolve_custom_commands`) — this function only formats it, it
+/// never discovers on its own, so callers control freshness. This keeps the
+/// REPL's dispatch (`SlashCommand::parse_with_commands`) and `/help` output
+/// consistent: both are handed the exact same snapshot for a given input
+/// (see `run_repl`), rather than `/help` silently re-discovering a possibly
+/// different registry than the one dispatch is using.
+fn render_repl_help(custom_commands: &[runtime::harness_assets::CommandMeta]) -> String {
+    let project_commands_help = commands::render_project_commands_help(custom_commands);
+
+    let mut sections = vec![
         "REPL".to_string(),
         "  /exit                Quit the REPL".to_string(),
         "  /quit                Quit the REPL".to_string(),
         "  Up/Down              Navigate prompt history".to_string(),
         "  Ctrl-R               Reverse-search prompt history".to_string(),
         "  Tab                  Complete commands, modes, and recent sessions".to_string(),
+        "  Shift+Tab            Cycle ask, workspace, and bypass permissions".to_string(),
         "  Ctrl-C               Clear input (or exit on empty prompt)".to_string(),
         "  Shift+Enter/Ctrl+J   Insert a newline".to_string(),
         "  Auto-save            .claw/sessions/<workspace-fingerprint>/<session-id>.jsonl"
@@ -10606,8 +10945,13 @@ fn render_repl_help() -> String {
         "  Show prompt history  /history [count]".to_string(),
         String::new(),
         render_slash_command_help_filtered(STUB_COMMANDS),
-    ]
-    .join(
+    ];
+    if !project_commands_help.is_empty() {
+        sections.push(String::new());
+        sections.push(project_commands_help);
+    }
+
+    sections.join(
         "
 ",
     )
@@ -12245,6 +12589,7 @@ fn init_json_value(report: &crate::init::InitReport, message: &str) -> serde_jso
 
 fn normalize_permission_mode(mode: &str) -> Option<&'static str> {
     match mode.trim() {
+        "prompt" | "ask" => Some("prompt"),
         "default" | "plan" | "read-only" => Some("read-only"),
         "acceptEdits" | "auto" | "workspace-write" => Some("workspace-write"),
         "dontAsk" | "bypassPermissions" | "dangerFullAccess" | "danger-full-access" => {
@@ -14340,6 +14685,47 @@ fn collect_tool_results(summary: &runtime::TurnSummary) -> Vec<serde_json::Value
         .collect()
 }
 
+/// Task 9 audit sink (JSON modes): serializes each `gate_check` decision to its
+/// canonical wire form (schema `claw.gate_check.v1`; see `runtime::GateCheckEvent`).
+/// `GateCheckEvent` derives `Serialize`, so this is a straight projection.
+fn collect_gate_events(summary: &runtime::TurnSummary) -> Vec<serde_json::Value> {
+    summary
+        .gate_events
+        .iter()
+        .map(|event| serde_json::to_value(event).unwrap_or_else(|_| json!({})))
+        .collect()
+}
+
+/// Task 9 audit sink (text/interactive modes): emits a concise one-line stderr
+/// notice for each BLOCKED gate decision. Advisory decisions already reach the
+/// user through `lifecycle_warnings`, so they are intentionally not duplicated
+/// here. The `gate_check:` prefix keeps these distinguishable from lifecycle
+/// `warning:` lines. No verbose/debug flag exists in this CLI, so blocked
+/// audit lines always print (blocks are rare and operationally significant).
+fn print_gate_audit(summary: &runtime::TurnSummary) {
+    for line in gate_audit_lines(summary) {
+        eprintln!("{line}");
+    }
+}
+
+/// Builds the concise audit lines for BLOCKED gate decisions (see
+/// [`print_gate_audit`]). Advisory decisions are intentionally excluded — they
+/// already reach the user through `lifecycle_warnings`.
+fn gate_audit_lines(summary: &runtime::TurnSummary) -> Vec<String> {
+    summary
+        .gate_events
+        .iter()
+        .filter(|event| event.decision == runtime::GateDecision::Block)
+        .map(|event| {
+            let phase = serde_json::to_value(event.phase)
+                .ok()
+                .and_then(|value| value.as_str().map(String::from))
+                .unwrap_or_else(|| format!("{:?}", event.phase));
+            format!("gate_check: {} block ({phase})", event.rule)
+        })
+        .collect()
+}
+
 fn collect_prompt_cache_events(summary: &runtime::TurnSummary) -> Vec<serde_json::Value> {
     summary
         .prompt_cache_events
@@ -15544,35 +15930,35 @@ fn print_help(output_format: CliOutputFormat) -> Result<(), Box<dyn std::error::
 mod tests {
     use super::{
         acp_status_json, build_runtime_plugin_state_with_loader, build_runtime_with_plugin_state,
-        classify_error_kind, classify_session_lifecycle_from_panes, collect_session_prompt_history,
+        classify_error_kind, classify_session_lifecycle_from_panes, collect_gate_events,
+        collect_session_prompt_history, gate_audit_lines,
         create_managed_session_handle, describe_tool_progress, filter_tool_specs,
         format_bughunter_report, format_commit_preflight_report, format_commit_skipped_report,
         format_compact_report, format_connected_line, format_cost_report, format_history_timestamp,
         format_internal_prompt_progress_line, format_issue_report, format_model_report,
         format_model_switch_report, format_permissions_report, format_permissions_switch_report,
-        format_pr_report, format_resume_report, format_status_report, format_tool_call_start,
-        format_tool_result, format_ultraplan_report, format_unknown_slash_command,
-        format_unknown_slash_command_message, format_user_visible_api_error,
-        merge_prompt_with_stdin, normalize_permission_mode, parse_args, parse_export_args,
-        parse_git_status_branch, parse_git_status_metadata_for, parse_git_workspace_summary,
-        parse_history_count, permission_policy, print_help_to, push_output_block,
-        render_config_report, render_diff_report, render_diff_report_for, render_help_topic,
-        render_help_topic_json, render_memory_report, render_prompt_history_report,
-        render_repl_help, render_repl_response, render_resume_usage, render_session_list,
-        render_session_markdown, format_repl_footer, format_repl_prompt, resolve_model_alias,
-        resolve_model_alias_with_config, resolve_repl_model,
-        resolve_session_reference, response_to_events, resume_supported_slash_commands,
-        run_resume_command, short_tool_id, slash_command_completion_candidates_with_sessions,
+        format_pr_report, format_repl_footer, format_repl_prompt, format_resume_report,
+        format_status_report, format_tool_call_start, format_tool_result, format_ultraplan_report,
+        format_unknown_slash_command, format_unknown_slash_command_message,
+        format_user_visible_api_error, merge_prompt_with_stdin, normalize_permission_mode,
+        parse_args, parse_export_args, parse_git_status_branch, parse_git_status_metadata_for,
+        parse_git_workspace_summary, parse_history_count, permission_policy,
+        persist_provider_setup, print_help_to, push_output_block, render_config_report,
+        render_diff_report, render_diff_report_for, render_help_topic, render_help_topic_json,
+        render_memory_report, render_prompt_history_report, render_repl_help, render_repl_response,
+        render_resume_usage, render_session_list, render_session_markdown, resolve_model_alias,
+        resolve_model_alias_with_config, resolve_repl_model, resolve_session_reference,
+        response_to_events, resume_supported_slash_commands, run_resume_command,
+        setup_default_model, short_tool_id, slash_command_completion_candidates_with_sessions,
         split_error_hint, status_context, status_json_value, summarize_tool_payload_for_markdown,
         try_resolve_bare_skill_prompt, validate_endpoint_url, validate_no_args,
-        write_mcp_server_fixture, EndpointProtocol, ProviderSetup, CliAction, CliOutputFormat,
-        CliToolExecutor, GitWorkspaceSummary, InternalPromptProgressEvent,
-        InternalPromptProgressState, LiveCli, LocalHelpTopic, PromptHistoryEntry,
-        SessionLifecycleKind, SessionLifecycleSummary, SlashCommand, StatusUsage, TmuxPaneSnapshot,
-        DEFAULT_ANTHROPIC_COMPAT_BASE_URL, DEFAULT_ANTHROPIC_COMPAT_MODEL,
-        DEFAULT_MODEL, DEFAULT_OPENAI_COMPAT_BASE_URL, DEFAULT_OPENAI_COMPAT_MODEL,
-        GitOperation, LATEST_SESSION_REFERENCE, PermissionModeProvenance, persist_provider_setup,
-        setup_default_model, STUB_COMMANDS,
+        write_mcp_server_fixture, CliAction, CliOutputFormat, CliToolExecutor, EndpointProtocol,
+        GitOperation, GitWorkspaceSummary, InternalPromptProgressEvent,
+        InternalPromptProgressState, LiveCli, LocalHelpTopic, PermissionModeProvenance,
+        PromptHistoryEntry, ProviderSetup, SessionLifecycleKind, SessionLifecycleSummary,
+        SlashCommand, StatusUsage, TmuxPaneSnapshot, DEFAULT_ANTHROPIC_COMPAT_BASE_URL,
+        DEFAULT_ANTHROPIC_COMPAT_MODEL, DEFAULT_MODEL, DEFAULT_OPENAI_COMPAT_BASE_URL,
+        DEFAULT_OPENAI_COMPAT_MODEL, LATEST_SESSION_REFERENCE, STUB_COMMANDS,
     };
     use api::{ApiError, MessageResponse, OutputContentBlock, Usage};
     use plugins::{
@@ -15592,6 +15978,64 @@ mod tests {
     use std::thread;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
     use tools::GlobalToolRegistry;
+
+    fn gate_event(
+        rule: &str,
+        decision: runtime::GateDecision,
+        phase: runtime::WorkflowPhase,
+    ) -> runtime::GateCheckEvent {
+        runtime::GateCheckEvent {
+            schema: runtime::GATE_CHECK_SCHEMA.to_string(),
+            event: runtime::GATE_CHECK_EVENT.to_string(),
+            phase,
+            rule: rule.to_string(),
+            decision,
+            reason: "reason".to_string(),
+        }
+    }
+
+    fn summary_with_gate_events(events: Vec<runtime::GateCheckEvent>) -> runtime::TurnSummary {
+        runtime::TurnSummary {
+            assistant_messages: Vec::new(),
+            tool_results: Vec::new(),
+            prompt_cache_events: Vec::new(),
+            iterations: 1,
+            usage: runtime::TokenUsage::default(),
+            auto_compaction: None,
+            lifecycle_warnings: Vec::new(),
+            gate_events: events,
+        }
+    }
+
+    /// Task 9 sink: JSON modes serialize gate events (schema-tagged), and the
+    /// text-mode audit emits a one-line notice for BLOCKED decisions only.
+    #[test]
+    fn gate_events_reach_json_and_text_sinks() {
+        let summary = summary_with_gate_events(vec![
+            gate_event(
+                "stop-the-line-spec",
+                runtime::GateDecision::Block,
+                runtime::WorkflowPhase::Spec,
+            ),
+            gate_event(
+                "stop-the-line-spec",
+                runtime::GateDecision::Advisory,
+                runtime::WorkflowPhase::Spec,
+            ),
+        ]);
+
+        // JSON sink: both events serialized, schema-tagged.
+        let json = collect_gate_events(&summary);
+        assert_eq!(json.len(), 2);
+        assert_eq!(json[0]["schema"], "claw.gate_check.v1");
+        assert_eq!(json[0]["event"], "gate_check");
+        assert_eq!(json[0]["decision"], "block");
+        assert_eq!(json[1]["decision"], "advisory");
+
+        // Text sink: only the BLOCKED decision produces an audit line.
+        let lines = gate_audit_lines(&summary);
+        assert_eq!(lines, vec!["gate_check: stop-the-line-spec block (spec)".to_string()]);
+    }
 
     fn registry_with_plugin_tool() -> GlobalToolRegistry {
         GlobalToolRegistry::with_plugin_tools(vec![PluginTool::new(
@@ -16132,7 +16576,7 @@ mod tests {
                 model: DEFAULT_MODEL.to_string(),
                 output_format: CliOutputFormat::Text,
                 allowed_tools: None,
-                permission_mode: PermissionMode::WorkspaceWrite,
+                permission_mode: PermissionMode::DangerFullAccess,
                 compact: false,
                 base_commit: None,
                 reasoning_effort: None,
@@ -16223,7 +16667,7 @@ mod tests {
                 model: "claude-opus-4-6".to_string(),
                 output_format: CliOutputFormat::Json,
                 allowed_tools: None,
-                permission_mode: PermissionMode::WorkspaceWrite,
+                permission_mode: PermissionMode::DangerFullAccess,
                 compact: false,
                 base_commit: None,
                 reasoning_effort: None,
@@ -16245,7 +16689,7 @@ mod tests {
                 model: DEFAULT_MODEL.to_string(),
                 output_format: CliOutputFormat::Text,
                 allowed_tools: None,
-                permission_mode: PermissionMode::WorkspaceWrite,
+                permission_mode: PermissionMode::DangerFullAccess,
                 compact: false,
                 base_commit: None,
                 reasoning_effort: None,
@@ -16261,7 +16705,7 @@ mod tests {
                 model: DEFAULT_MODEL.to_string(),
                 output_format: CliOutputFormat::Text,
                 allowed_tools: None,
-                permission_mode: PermissionMode::WorkspaceWrite,
+                permission_mode: PermissionMode::DangerFullAccess,
                 compact: false,
                 base_commit: None,
                 reasoning_effort: None,
@@ -16277,7 +16721,7 @@ mod tests {
                 model: DEFAULT_MODEL.to_string(),
                 output_format: CliOutputFormat::Text,
                 allowed_tools: None,
-                permission_mode: PermissionMode::WorkspaceWrite,
+                permission_mode: PermissionMode::DangerFullAccess,
                 compact: false,
                 base_commit: None,
                 reasoning_effort: None,
@@ -16315,7 +16759,7 @@ mod tests {
                 model: DEFAULT_MODEL.to_string(),
                 output_format: CliOutputFormat::Text,
                 allowed_tools: None,
-                permission_mode: PermissionMode::WorkspaceWrite,
+                permission_mode: PermissionMode::DangerFullAccess,
                 compact: true,
                 base_commit: None,
                 reasoning_effort: None,
@@ -16330,7 +16774,7 @@ mod tests {
                 model: DEFAULT_MODEL.to_string(),
                 output_format: CliOutputFormat::Text,
                 allowed_tools: None,
-                permission_mode: PermissionMode::WorkspaceWrite,
+                permission_mode: PermissionMode::DangerFullAccess,
                 compact: true,
                 base_commit: None,
                 reasoning_effort: None,
@@ -16373,7 +16817,7 @@ mod tests {
                 model: "claude-opus-4-6".to_string(),
                 output_format: CliOutputFormat::Text,
                 allowed_tools: None,
-                permission_mode: PermissionMode::WorkspaceWrite,
+                permission_mode: PermissionMode::DangerFullAccess,
                 compact: false,
                 base_commit: None,
                 reasoning_effort: None,
@@ -16582,7 +17026,7 @@ mod tests {
                         .map(str::to_string)
                         .collect()
                 ),
-                permission_mode: PermissionMode::WorkspaceWrite,
+                permission_mode: PermissionMode::DangerFullAccess,
                 base_commit: None,
                 reasoning_effort: None,
                 allow_broad_cwd: false,
@@ -16949,10 +17393,7 @@ mod tests {
                 model_flag_raw,
                 ..
             } => {
-                assert_eq!(
-                    model, "claude-sonnet-4-6",
-                    "sonnet alias should resolve"
-                );
+                assert_eq!(model, "claude-sonnet-4-6", "sonnet alias should resolve");
                 assert_eq!(
                     model_flag_raw.as_deref(),
                     Some("sonnet"),
@@ -18518,7 +18959,7 @@ mod tests {
                 model: DEFAULT_MODEL.to_string(),
                 output_format: CliOutputFormat::Text,
                 allowed_tools: None,
-                permission_mode: PermissionMode::WorkspaceWrite,
+                permission_mode: PermissionMode::DangerFullAccess,
                 compact: false,
                 base_commit: None,
                 reasoning_effort: None,
@@ -18547,7 +18988,7 @@ mod tests {
                 model: DEFAULT_MODEL.to_string(),
                 output_format: CliOutputFormat::Text,
                 allowed_tools: None,
-                permission_mode: PermissionMode::WorkspaceWrite,
+                permission_mode: PermissionMode::DangerFullAccess,
                 compact: false,
                 base_commit: None,
                 reasoning_effort: None,
@@ -18762,7 +19203,7 @@ mod tests {
 
     #[test]
     fn repl_help_includes_shared_commands_and_exit() {
-        let help = render_repl_help();
+        let help = render_repl_help(&[]);
         assert!(help.contains("REPL"));
         assert!(help.contains("/help"));
         assert!(help.contains("Complete commands, modes, and recent sessions"));
@@ -18836,6 +19277,95 @@ mod tests {
 
         assert!(banner.contains("Tab"));
         assert!(banner.contains("completes commands, models, sessions, and paths"));
+        assert!(banner.contains("Shift+Tab permission mode"));
+        assert!(!banner.contains("╭─"));
+        assert!(!banner.contains("╰─"));
+
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+        std::env::remove_var("ANTHROPIC_API_KEY");
+    }
+
+    #[test]
+    fn workflow_command_start_advance_gate_status_mutate_and_persist_session() {
+        // Task 8: /workflow start/advance/gate/status against a real LiveCli,
+        // asserting the session-owned WorkflowState is mutated and persisted
+        // to disk (not just held in memory) after each subcommand.
+        let _guard = env_lock();
+        std::env::set_var("ANTHROPIC_API_KEY", "test-dummy-key-for-workflow-test");
+        let root = temp_dir();
+        fs::create_dir_all(&root).expect("root dir");
+
+        with_current_dir(&root, || {
+            let mut cli = LiveCli::new(
+                "anthropic/claude-sonnet-4-6".to_string(),
+                true,
+                None,
+                PermissionMode::DangerFullAccess,
+            )
+            .expect("cli should initialize");
+
+            // bare /workflow status before start: Idle, no task, no evidence.
+            cli.handle_workflow_command(Some("status"))
+                .expect("status should not error");
+            assert!(cli.runtime.session().workflow.is_none());
+
+            // /workflow start TASK-8
+            cli.handle_workflow_command(Some("start TASK-8"))
+                .expect("start should not error");
+            let workflow = cli
+                .runtime
+                .session()
+                .workflow
+                .clone()
+                .expect("start should create workflow state");
+            assert_eq!(workflow.phase, runtime::WorkflowPhase::Spec);
+            assert_eq!(workflow.task_ref.as_deref(), Some("TASK-8"));
+
+            // Persisted to disk, not just in memory.
+            let reloaded = Session::load_from_path(&cli.session.path)
+                .expect("session should load from disk after start");
+            assert_eq!(
+                reloaded.workflow.expect("persisted workflow").task_ref,
+                Some("TASK-8".to_string())
+            );
+
+            // /workflow advance is blocked without acceptance criteria.
+            cli.handle_workflow_command(Some("advance"))
+                .expect("advance should not error");
+            assert_eq!(
+                cli.runtime.session().workflow.as_ref().unwrap().phase,
+                runtime::WorkflowPhase::Spec,
+                "advance without acceptance criteria must not move past Spec"
+            );
+
+            // /workflow gate records evidence against the current (Spec) gate.
+            cli.handle_workflow_command(Some("gate test_run cargo test passed"))
+                .expect("gate should not error");
+            let workflow = cli.runtime.session().workflow.clone().unwrap();
+            assert_eq!(workflow.evidence.len(), 1);
+            assert_eq!(workflow.evidence[0].kind, "test_run");
+            assert_eq!(workflow.evidence[0].detail, "cargo test passed");
+            assert_eq!(workflow.evidence[0].gate, runtime::WorkflowPhase::Spec);
+
+            // Unknown/bare subcommands don't panic or mutate state.
+            cli.handle_workflow_command(None)
+                .expect("bare /workflow should render usage, not error");
+            cli.handle_workflow_command(Some("frobnicate"))
+                .expect("unknown subcommand should render usage, not error");
+            assert_eq!(cli.runtime.session().workflow.clone().unwrap(), workflow);
+
+            // /workflow gate <kind> with no detail must print usage and
+            // record no evidence -- a whitespace-only detail is otherwise
+            // silently ignored by Task 7's Verify->Review gate, so accepting
+            // it here would create useless evidence records.
+            cli.handle_workflow_command(Some("gate test_run"))
+                .expect("gate without detail should render usage, not error");
+            assert_eq!(
+                cli.runtime.session().workflow.clone().unwrap(),
+                workflow,
+                "gate with missing detail must not record evidence"
+            );
+        });
 
         fs::remove_dir_all(root).expect("cleanup temp dir");
         std::env::remove_var("ANTHROPIC_API_KEY");
@@ -18844,15 +19374,45 @@ mod tests {
     #[test]
     fn repl_prompt_places_input_before_static_model_footer() {
         let prompt = format_repl_prompt("custom-model", PermissionMode::DangerFullAccess);
-        let footer = format_repl_footer("custom-model", PermissionMode::DangerFullAccess);
+        let footer = format_repl_footer(
+            "custom-model",
+            PermissionMode::DangerFullAccess,
+            runtime::TokenUsage {
+                input_tokens: 10,
+                output_tokens: 5,
+                ..Default::default()
+            },
+        );
 
-        assert!(prompt.contains("╭─"));
+        // The input prompt is now a shaded chip (chevron), not a bare dot.
+        assert!(prompt.contains('›'));
         assert!(!prompt.contains("custom-model"));
         assert!(!prompt.contains('\n'));
         assert!(footer.contains("custom-model"));
-        assert!(footer.contains("full access"));
-        assert!(footer.contains("╰─"));
+        assert!(footer.contains("15 tok"));
+        assert!(footer.contains("$"));
+        assert!(footer.contains("bypass"));
+        assert!(footer.contains('•'));
         assert!(!footer.contains('\n'));
+    }
+
+    #[test]
+    fn repl_footer_counters_and_plan_mode_label() {
+        // Live token + dollar counters climb with cumulative usage and the
+        // plan posture (read-only) renders its own label in the footer.
+        let footer = format_repl_footer(
+            "custom-model",
+            PermissionMode::ReadOnly,
+            runtime::TokenUsage {
+                input_tokens: 1000,
+                output_tokens: 500,
+                ..Default::default()
+            },
+        );
+        assert!(footer.contains("1500 tok"));
+        assert!(footer.contains("$"));
+        assert!(footer.contains("plan"));
+        assert!(!footer.contains("read-only"));
     }
 
     #[test]
@@ -18894,7 +19454,10 @@ mod tests {
             .expect("cli should initialize");
             assert!(cli.is_connected(), "seeded env should look connected");
             cli.run_logout().expect("logout should succeed");
-            assert!(!cli.is_connected(), "logout should rebuild disconnected runtime");
+            assert!(
+                !cli.is_connected(),
+                "logout should rebuild disconnected runtime"
+            );
             cli.disconnected_startup_banner()
         });
 
@@ -19863,6 +20426,8 @@ UU conflicted.rs",
 
     #[test]
     fn normalizes_supported_permission_modes() {
+        assert_eq!(normalize_permission_mode("prompt"), Some("prompt"));
+        assert_eq!(normalize_permission_mode("ask"), Some("prompt"));
         assert_eq!(normalize_permission_mode("read-only"), Some("read-only"));
         assert_eq!(
             normalize_permission_mode("workspace-write"),
@@ -20250,9 +20815,10 @@ UU conflicted.rs",
     }
     #[test]
     fn repl_help_mentions_history_completion_and_multiline() {
-        let help = render_repl_help();
+        let help = render_repl_help(&[]);
         assert!(help.contains("Up/Down"));
         assert!(help.contains("Tab"));
+        assert!(help.contains("Shift+Tab"));
         assert!(help.contains("Shift+Enter/Ctrl+J"));
         assert!(help.contains("Ctrl-R"));
         assert!(help.contains("Reverse-search prompt history"));
@@ -21363,10 +21929,7 @@ mod alias_resolution_tests {
     #[test]
     fn test_alias_resolution_builtin() {
         // Built-in aliases should resolve to their full IDs
-        assert_eq!(
-            resolve_model_alias_with_config("opus"),
-            "claude-opus-4-6"
-        );
+        assert_eq!(resolve_model_alias_with_config("opus"), "claude-opus-4-6");
         assert_eq!(
             resolve_model_alias_with_config("sonnet"),
             "claude-sonnet-4-6"
