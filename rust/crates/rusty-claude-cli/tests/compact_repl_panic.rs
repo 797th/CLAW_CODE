@@ -46,11 +46,11 @@ fn compact_slash_command_in_repl_does_not_start_nested_tokio_runtime() {
         "stdout should contain compact report output ({stdout:?})"
     );
     assert!(
-        plain_stdout.contains("• \n• openai/gpt-oss-120b"),
+        plain_stdout.contains("> \n• openai/gpt-oss-120b"),
         "stdout should contain the modern model/input bullets ({stdout:?})"
     );
     let input_rail = plain_stdout
-        .rfind("• \n• openai/gpt-oss-120b")
+        .rfind("> \n• openai/gpt-oss-120b")
         .expect("stdout should contain the input rail");
     let model_rail = plain_stdout
         .rfind("• openai/gpt-oss-120b")
