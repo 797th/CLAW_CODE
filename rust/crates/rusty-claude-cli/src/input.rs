@@ -122,6 +122,7 @@ pub struct LineEditor {
     prompt: String,
     footer: String,
     footer_active: bool,
+    working_active: bool,
     editor: Editor<SlashCommandHelper, DefaultHistory>,
 }
 
@@ -143,6 +144,7 @@ impl LineEditor {
             prompt: prompt.into(),
             footer: String::new(),
             footer_active: false,
+            working_active: false,
             editor,
         }
     }
@@ -216,12 +218,44 @@ impl LineEditor {
             write!(stdout, "\r\x1b[2K")?;
             stdout.flush()?;
             self.footer_active = false;
+            self.working_active = false;
             return Ok(());
         }
 
         write!(stdout, "\x1b[r\x1b[{rows};1H\x1b[2K\x1b[{rows};1H")?;
         stdout.flush()?;
         self.footer_active = false;
+        self.working_active = false;
+        Ok(())
+    }
+
+    /// Reserve a line above the composer for the live activity indicator.
+    /// The transcript scrolls above that line; the composer and model footer
+    /// stay pinned at the bottom of the terminal.
+    pub fn begin_working(&mut self) -> io::Result<()> {
+        if self.footer.is_empty() || !self.footer_active || self.working_active {
+            return Ok(());
+        }
+
+        let rows = terminal::size().map(|(_, rows)| rows).unwrap_or_default();
+        if rows < 4 {
+            return Ok(());
+        }
+
+        let working_row = rows - 2;
+        let input_row = rows - 1;
+        let mut stdout = io::stdout();
+
+        // The submitted input currently occupies the bottom scroll row. Move
+        // it into the transcript before reserving a fresh activity row.
+        write!(stdout, "\x1b[1;{working_row}r\x1b[{working_row};1H\r\n")?;
+        write!(
+            stdout,
+            "\x1b[{input_row};1H\x1b[2K{}\x1b[{rows};1H\x1b[2K{}\x1b[{working_row};1H\x1b[2K",
+            self.prompt, self.footer
+        )?;
+        stdout.flush()?;
+        self.working_active = true;
         Ok(())
     }
 
@@ -246,6 +280,7 @@ impl LineEditor {
 
         let rows = terminal::size().map(|(_, rows)| rows).unwrap_or_default();
         if rows < 3 {
+            self.working_active = false;
             return self.prepare_relative_footer();
         }
 
@@ -256,7 +291,10 @@ impl LineEditor {
             "\x1b[1;{input_row}r\x1b[{rows};1H\x1b[2K{}\x1b[{input_row};1H\x1b[2K",
             self.footer
         )?;
-        stdout.flush().map(|()| self.footer_active = true)
+        stdout.flush().map(|()| {
+            self.footer_active = true;
+            self.working_active = false;
+        })
     }
 
     fn prepare_relative_footer(&mut self) -> io::Result<()> {
@@ -265,6 +303,7 @@ impl LineEditor {
         write!(stdout, "{}\x1b[1A\x1b[1G", self.footer)?;
         stdout.flush()?;
         self.footer_active = true;
+        self.working_active = false;
         Ok(())
     }
 

@@ -7733,11 +7733,13 @@ fn run_repl(
                 if let Some(prompt) = try_resolve_bare_skill_prompt(&cwd, &trimmed) {
                     editor.push_history(input);
                     cli.record_prompt_history(&trimmed);
+                    editor.begin_working()?;
                     cli.run_turn(&prompt)?;
                     continue;
                 }
                 editor.push_history(input);
                 cli.record_prompt_history(&trimmed);
+                editor.begin_working()?;
                 cli.run_turn(&trimmed)?;
             }
             input::ReadOutcome::Cancel => {}
