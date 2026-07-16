@@ -5,7 +5,8 @@ use serde_json::{Map, Value};
 use telemetry::SessionTracer;
 
 use crate::compact::{
-    compact_session, estimate_session_tokens, CompactionConfig, CompactionResult,
+    compact_session, compact_session_to_target, estimate_session_tokens, CompactionConfig,
+    CompactionResult,
 };
 use crate::config::RuntimeFeatureConfig;
 use crate::hooks::{
@@ -19,6 +20,8 @@ use crate::usage::{TokenUsage, UsageTracker};
 
 const DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD: u32 = 100_000;
 const AUTO_COMPACTION_THRESHOLD_ENV_VAR: &str = "CLAUDE_CODE_AUTO_COMPACT_INPUT_TOKENS";
+const AUTO_COMPACTION_TARGET_THRESHOLD_NUMERATOR: usize = 3;
+const AUTO_COMPACTION_TARGET_THRESHOLD_DENOMINATOR: usize = 4;
 
 /// Fully assembled request payload sent to the upstream model client.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -666,18 +669,23 @@ where
     }
 
     fn maybe_auto_compact(&mut self) -> Option<AutoCompactionEvent> {
-        if self.usage_tracker.cumulative_usage().input_tokens
-            < self.auto_compaction_input_tokens_threshold
-        {
+        let observed_input_tokens = self.usage_tracker.cumulative_usage().input_tokens as usize;
+        let threshold = self.auto_compaction_input_tokens_threshold as usize;
+        if observed_input_tokens < threshold {
             return None;
         }
 
-        let result = compact_session(
+        let current_estimated_tokens = estimate_session_tokens(&self.session);
+        let target_estimated_tokens = auto_compaction_target_estimate(
+            current_estimated_tokens,
+            observed_input_tokens,
+            threshold,
+        );
+
+        let result = compact_session_to_target(
             &self.session,
-            CompactionConfig {
-                max_estimated_tokens: 0,
-                ..CompactionConfig::default()
-            },
+            CompactionConfig::default().preserve_recent_messages,
+            target_estimated_tokens,
         );
 
         if result.removed_message_count == 0 {
@@ -796,6 +804,24 @@ where
         attributes.insert("error".to_string(), Value::String(error.to_string()));
         session_tracer.record("turn_failed", attributes);
     }
+}
+
+fn auto_compaction_target_estimate(
+    current_estimated_tokens: usize,
+    observed_input_tokens: usize,
+    threshold: usize,
+) -> usize {
+    let target_input_tokens = threshold
+        .saturating_mul(AUTO_COMPACTION_TARGET_THRESHOLD_NUMERATOR)
+        / AUTO_COMPACTION_TARGET_THRESHOLD_DENOMINATOR;
+    if observed_input_tokens == 0 || current_estimated_tokens == 0 {
+        return target_input_tokens.max(1);
+    }
+
+    current_estimated_tokens
+        .saturating_mul(target_input_tokens.max(1))
+        .saturating_div(observed_input_tokens)
+        .max(1)
 }
 
 /// Reads the automatic compaction threshold from the environment.
@@ -954,8 +980,9 @@ impl ToolExecutor for StaticToolExecutor {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_assistant_message, parse_auto_compaction_threshold, ApiClient, ApiRequest,
-        AssistantEvent, AutoCompactionEvent, ConversationRuntime, PromptCacheEvent, RuntimeError,
+        auto_compaction_target_estimate, build_assistant_message,
+        parse_auto_compaction_threshold, ApiClient, ApiRequest, AssistantEvent,
+        AutoCompactionEvent, ConversationRuntime, PromptCacheEvent, RuntimeError,
         StaticToolExecutor, ToolExecutor, DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD,
     };
     use crate::compact::CompactionConfig;
@@ -1680,13 +1707,19 @@ mod tests {
             .run_turn("trigger", None)
             .expect("turn should succeed");
 
-        assert_eq!(
+        assert!(matches!(
             summary.auto_compaction,
             Some(AutoCompactionEvent {
-                removed_message_count: 2,
-            })
-        );
+                removed_message_count,
+            }) if removed_message_count > 0
+        ));
         assert_eq!(runtime.session().messages[0].role, MessageRole::System);
+    }
+
+    #[test]
+    fn auto_compaction_target_estimate_scales_down_with_observed_usage() {
+        assert_eq!(auto_compaction_target_estimate(40, 120_000, 100_000), 25);
+        assert_eq!(auto_compaction_target_estimate(5, 0, 100_000), 75_000);
     }
 
     #[test]

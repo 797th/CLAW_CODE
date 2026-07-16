@@ -30,6 +30,15 @@ pub struct CompactionResult {
     pub removed_message_count: usize,
 }
 
+fn unchanged_compaction_result(session: &Session) -> CompactionResult {
+    CompactionResult {
+        summary: String::new(),
+        formatted_summary: String::new(),
+        compacted_session: session.clone(),
+        removed_message_count: 0,
+    }
+}
+
 /// Roughly estimates the token footprint of the current session transcript.
 #[must_use]
 pub fn estimate_session_tokens(session: &Session) -> usize {
@@ -95,12 +104,7 @@ pub fn get_compact_continuation_message(
 #[must_use]
 pub fn compact_session(session: &Session, config: CompactionConfig) -> CompactionResult {
     if !should_compact(session, config) {
-        return CompactionResult {
-            summary: String::new(),
-            formatted_summary: String::new(),
-            compacted_session: session.clone(),
-            removed_message_count: 0,
-        };
+        return unchanged_compaction_result(session);
     }
 
     let existing_summary = session
@@ -188,6 +192,56 @@ pub fn compact_session(session: &Session, config: CompactionConfig) -> Compactio
         compacted_session,
         removed_message_count: removed.len(),
     }
+}
+
+/// Compacts a session until its estimated token footprint falls below a target.
+///
+/// The helper starts from the preferred recent-message retention count and then
+/// progressively relaxes that retention until the compacted session estimate
+/// fits inside `target_estimated_tokens` or no further compaction is possible.
+#[must_use]
+pub fn compact_session_to_target(
+    session: &Session,
+    preferred_preserve_recent_messages: usize,
+    target_estimated_tokens: usize,
+) -> CompactionResult {
+    if estimate_session_tokens(session) <= target_estimated_tokens {
+        return unchanged_compaction_result(session);
+    }
+
+    let compactable_len = session.messages.len() - compacted_summary_prefix_len(session);
+    if compactable_len <= 1 {
+        return unchanged_compaction_result(session);
+    }
+
+    let max_preserve = preferred_preserve_recent_messages.min(compactable_len - 1);
+    let mut best_result: Option<CompactionResult> = None;
+    let mut best_estimate = usize::MAX;
+
+    for preserve_recent_messages in (0..=max_preserve).rev() {
+        let candidate = compact_session(
+            session,
+            CompactionConfig {
+                preserve_recent_messages,
+                max_estimated_tokens: 0,
+            },
+        );
+        if candidate.removed_message_count == 0 {
+            continue;
+        }
+
+        let candidate_estimate = estimate_session_tokens(&candidate.compacted_session);
+        if candidate_estimate < best_estimate {
+            best_estimate = candidate_estimate;
+            best_result = Some(candidate.clone());
+        }
+
+        if candidate_estimate <= target_estimated_tokens {
+            return candidate;
+        }
+    }
+
+    best_result.unwrap_or_else(|| unchanged_compaction_result(session))
 }
 
 fn compacted_summary_prefix_len(session: &Session) -> usize {
@@ -573,8 +627,9 @@ fn extract_summary_timeline(summary: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        collect_key_files, compact_session, format_compact_summary,
-        get_compact_continuation_message, infer_pending_work, should_compact, CompactionConfig,
+        collect_key_files, compact_session, compact_session_to_target, estimate_session_tokens,
+        format_compact_summary, get_compact_continuation_message, infer_pending_work,
+        should_compact, CompactionConfig,
     };
     use crate::session::{ContentBlock, ConversationMessage, MessageRole, Session};
 
@@ -757,6 +812,51 @@ mod tests {
         )]);
         assert!(files.contains(&"rust/crates/runtime/src/compact.rs".to_string()));
         assert!(files.contains(&"rust/crates/rusty-claude-cli/src/main.rs".to_string()));
+    }
+
+    #[test]
+    fn compacts_to_requested_token_target_when_possible() {
+        let mut session = Session::new();
+        session.messages = vec![
+            ConversationMessage::user_text("alpha ".repeat(140)),
+            ConversationMessage::assistant(vec![ContentBlock::Text {
+                text: "beta ".repeat(140),
+            }]),
+            ConversationMessage::user_text("gamma ".repeat(140)),
+            ConversationMessage::assistant(vec![ContentBlock::Text {
+                text: "delta ".repeat(140),
+            }]),
+            ConversationMessage::user_text("epsilon ".repeat(140)),
+            ConversationMessage::assistant(vec![ContentBlock::Text {
+                text: "zeta ".repeat(140),
+            }]),
+        ];
+
+        let target = estimate_session_tokens(&session) / 2;
+        let result = compact_session_to_target(&session, 4, target);
+
+        assert!(result.removed_message_count > 0);
+        assert!(estimate_session_tokens(&result.compacted_session) <= target);
+    }
+
+    #[test]
+    fn keeps_best_effort_result_when_target_is_too_small() {
+        let mut session = Session::new();
+        session.messages = vec![
+            ConversationMessage::user_text("alpha ".repeat(120)),
+            ConversationMessage::assistant(vec![ContentBlock::Text {
+                text: "beta ".repeat(120),
+            }]),
+            ConversationMessage::user_text("gamma ".repeat(120)),
+            ConversationMessage::assistant(vec![ContentBlock::Text {
+                text: "delta ".repeat(120),
+            }]),
+        ];
+
+        let result = compact_session_to_target(&session, 3, 1);
+
+        assert!(result.removed_message_count > 0);
+        assert_eq!(result.compacted_session.messages[0].role, MessageRole::System);
     }
 
     /// Regression: compaction must not split an assistant(ToolUse) /

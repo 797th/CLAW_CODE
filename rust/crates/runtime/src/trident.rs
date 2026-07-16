@@ -1,4 +1,6 @@
-use crate::compact::{compact_session, CompactionConfig, CompactionResult};
+use crate::compact::{
+    compact_session, compact_session_to_target, CompactionConfig, CompactionResult,
+};
 use crate::session::{ContentBlock, ConversationMessage, MessageRole, Session};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -100,13 +102,10 @@ pub struct TridentResult {
     pub stats: TridentStats,
 }
 
-/// Run the full Trident compaction pipeline on a session, then apply
-/// the standard summary-based compaction.
-pub fn trident_compact_session(
+fn run_trident_pipeline(
     session: &Session,
-    compaction_config: CompactionConfig,
     trident_config: &TridentConfig,
-) -> CompactionResult {
+) -> (Session, TridentStats) {
     let original_count = session.messages.len();
     let original_tokens: usize = session.messages.iter().map(estimate_message_tokens).sum();
 
@@ -150,7 +149,41 @@ pub fn trident_compact_session(
     let mut trident_session = session.clone();
     trident_session.messages = messages;
 
+    (trident_session, stats)
+}
+
+/// Run the full Trident compaction pipeline on a session, then apply
+/// the standard summary-based compaction.
+pub fn trident_compact_session(
+    session: &Session,
+    compaction_config: CompactionConfig,
+    trident_config: &TridentConfig,
+) -> CompactionResult {
+    let (trident_session, stats) = run_trident_pipeline(session, trident_config);
+
     let result = compact_session(&trident_session, compaction_config);
+
+    if stats.superseded_count > 0 || stats.collapsed_chains > 0 || stats.clusters_found > 0 {
+        eprintln!("{}", stats.format_report());
+    }
+
+    result
+}
+
+/// Run the Trident pipeline, then compact until the session fits a target token estimate.
+pub fn trident_compact_session_to_target(
+    session: &Session,
+    preferred_preserve_recent_messages: usize,
+    target_estimated_tokens: usize,
+    trident_config: &TridentConfig,
+) -> CompactionResult {
+    let (trident_session, stats) = run_trident_pipeline(session, trident_config);
+
+    let result = compact_session_to_target(
+        &trident_session,
+        preferred_preserve_recent_messages,
+        target_estimated_tokens,
+    );
 
     if stats.superseded_count > 0 || stats.collapsed_chains > 0 || stats.clusters_found > 0 {
         eprintln!("{}", stats.format_report());
@@ -677,7 +710,7 @@ fn truncate_text(text: &str, max_chars: usize) -> String {
 mod tests {
     use super::*;
     use crate::compact::CompactionConfig;
-    use crate::session::{ContentBlock, ConversationMessage, MessageRole, Session};
+    use crate::session::{ContentBlock, ConversationMessage, Session};
 
     #[test]
     fn stage1_removes_obsolete_file_reads() {

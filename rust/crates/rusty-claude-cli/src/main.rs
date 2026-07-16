@@ -6892,6 +6892,13 @@ fn format_auto_compaction_notice(removed: usize) -> String {
     format!("[auto-compacted: removed {removed} messages]")
 }
 
+fn overflow_compaction_target(estimated_tokens: usize, reduction_percent: usize) -> usize {
+    estimated_tokens
+        .saturating_mul(reduction_percent)
+        .saturating_div(100)
+        .max(1)
+}
+
 fn parse_git_status_metadata(status: Option<&str>) -> (Option<PathBuf>, Option<String>) {
     parse_git_status_metadata_for(
         &env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
@@ -8808,24 +8815,28 @@ impl LiveCli {
                     // trading conversation continuity for a smaller payload until it fits.
                     // Max 4 rounds before giving up and surfacing the error to the user.
                     let max_compact_rounds = 4;
-                    let preserve_schedule = [4, 2, 1, 0];
+                    let target_schedule = [70usize, 55, 40, 25];
+                    let preferred_preserve_recent_messages = CompactionConfig::default()
+                        .preserve_recent_messages;
 
                     for round in 0..max_compact_rounds {
-                        let preserve = preserve_schedule[round];
+                        let target_estimated_tokens = overflow_compaction_target(
+                            runtime.estimated_tokens(),
+                            target_schedule[round],
+                        );
                         println!(
-                            "  Auto-compacting session (round {}/{}, preserving {} recent messages)...",
+                            "  Auto-compacting session (round {}/{}, target ~{} estimated tokens)...",
                             round + 1,
                             max_compact_rounds,
-                            preserve
+                            target_estimated_tokens
                         );
 
-                        // Run Trident pipeline then summary-based compaction
-                        let result = runtime::trident::trident_compact_session(
+                        // Run Trident pipeline then compact until the reduced
+                        // session estimate fits the round's target budget.
+                        let result = runtime::trident::trident_compact_session_to_target(
                             runtime.session(),
-                            CompactionConfig {
-                                preserve_recent_messages: preserve,
-                                max_estimated_tokens: 0,
-                            },
+                            preferred_preserve_recent_messages,
+                            target_estimated_tokens,
                             &runtime::trident::TridentConfig::default(),
                         );
                         let removed = result.removed_message_count;
