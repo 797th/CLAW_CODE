@@ -89,8 +89,8 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
     SlashCommandSpec {
         name: "model",
         aliases: &[],
-        summary: "Show or switch the active model",
-        argument_hint: Some("[model]"),
+        summary: "Show, switch, add, or remove a model",
+        argument_hint: Some("[model | add | remove <alias>]"),
         resume_supported: false,
     },
     SlashCommandSpec {
@@ -1084,6 +1084,17 @@ pub enum SlashCommand {
     Model {
         model: Option<String>,
     },
+    /// Register (or prompt for) a named model alias persisted to user config.
+    /// When both fields are `None` the REPL opens an interactive prompt; when
+    /// both are supplied it runs headless.
+    ModelAdd {
+        alias: Option<String>,
+        model: Option<String>,
+    },
+    /// Remove a named model alias from user config.
+    ModelRemove {
+        alias: Option<String>,
+    },
     Permissions {
         mode: Option<String>,
     },
@@ -1267,6 +1278,8 @@ impl SlashCommand {
             Self::DebugToolCall { .. } => "/debug-tool-call",
             Self::Resume { .. } => "/resume",
             Self::Model { .. } => "/model",
+            Self::ModelAdd { .. } => "/model",
+            Self::ModelRemove { .. } => "/model",
             Self::Permissions { .. } => "/permissions",
             Self::Session { .. } => "/session",
             Self::Plugins { .. } => "/plugins",
@@ -1370,9 +1383,7 @@ pub fn validate_slash_command_input(
             validate_no_args(command, &args)?;
             SlashCommand::DebugToolCall
         }
-        "model" => SlashCommand::Model {
-            model: optional_single_arg(command, &args, "[model]")?,
-        },
+        "model" => parse_model_command(&args)?,
         "permissions" => SlashCommand::Permissions {
             mode: parse_permissions_mode(&args)?,
         },
@@ -1560,6 +1571,57 @@ fn require_remainder(
     argument_hint: &str,
 ) -> Result<String, SlashCommandParseError> {
     remainder.ok_or_else(|| usage_error(command, argument_hint))
+}
+
+/// Dispatch `/model` into switch/add/remove. The reserved subcommands
+/// (`add`, `remove`, `list`) are only recognized when they are the first
+/// argument; everything else is treated as a model id to switch to. Reserved
+/// subcommand arms are listed before the generic single-token switch arm so
+/// they are reachable.
+fn parse_model_command(args: &[&str]) -> Result<SlashCommand, SlashCommandParseError> {
+    match args {
+        // /model list       → show current model (alias for the bare command)
+        ["list"] => Ok(SlashCommand::Model { model: None }),
+        // /model add                         → interactive prompt
+        // /model add <alias>                 → prompt only for the model
+        // /model add <alias> <model>         → headless registration
+        ["add"] => Ok(SlashCommand::ModelAdd {
+            alias: None,
+            model: None,
+        }),
+        ["add", alias] => Ok(SlashCommand::ModelAdd {
+            alias: Some((*alias).to_string()),
+            model: None,
+        }),
+        ["add", alias, model] => Ok(SlashCommand::ModelAdd {
+            alias: Some((*alias).to_string()),
+            model: Some((*model).to_string()),
+        }),
+        ["add", ..] => Err(command_error(
+            "Usage: /model add [alias] [provider/model]. Provide at most an alias and a model.",
+            "model",
+            "/model add [alias] [provider/model]",
+        )),
+        // /model remove            → interactive prompt for the alias
+        // /model remove <alias>    → headless removal
+        ["remove"] => Ok(SlashCommand::ModelRemove { alias: None }),
+        ["remove", alias] => Ok(SlashCommand::ModelRemove {
+            alias: Some((*alias).to_string()),
+        }),
+        ["remove", ..] => Err(command_error(
+            "Usage: /model remove <alias>. Remove takes a single alias name.",
+            "model",
+            "/model remove <alias>",
+        )),
+        // /model            → show current model
+        // /model <name>     → switch active model (any single non-reserved token)
+        [] | [_] => Ok(SlashCommand::Model {
+            model: optional_single_arg("model", args, "[model | add | remove <alias>]")?,
+        }),
+        // Model ids never contain whitespace (see validate_model_syntax), so a
+        // multi-token argument is malformed.
+        _ => Err(usage_error("model", "[model | add | remove <alias>]")),
+    }
 }
 
 fn parse_permissions_mode(args: &[&str]) -> Result<Option<String>, SlashCommandParseError> {
@@ -5371,6 +5433,8 @@ pub fn handle_slash_command(
         | SlashCommand::DebugToolCall
         | SlashCommand::Sandbox
         | SlashCommand::Model { .. }
+        | SlashCommand::ModelAdd { .. }
+        | SlashCommand::ModelRemove { .. }
         | SlashCommand::Permissions { .. }
         | SlashCommand::Clear { .. }
         | SlashCommand::Cost
@@ -5654,6 +5718,50 @@ mod tests {
             SlashCommand::parse("/model"),
             Ok(Some(SlashCommand::Model { model: None }))
         );
+        // /model add and /model remove subcommands
+        assert_eq!(
+            SlashCommand::parse("/model add"),
+            Ok(Some(SlashCommand::ModelAdd {
+                alias: None,
+                model: None,
+            }))
+        );
+        assert_eq!(
+            SlashCommand::parse("/model add mini"),
+            Ok(Some(SlashCommand::ModelAdd {
+                alias: Some("mini".to_string()),
+                model: None,
+            }))
+        );
+        assert_eq!(
+            SlashCommand::parse("/model add mini openai/gpt-4.1-mini"),
+            Ok(Some(SlashCommand::ModelAdd {
+                alias: Some("mini".to_string()),
+                model: Some("openai/gpt-4.1-mini".to_string()),
+            }))
+        );
+        assert_eq!(
+            SlashCommand::parse("/model remove"),
+            Ok(Some(SlashCommand::ModelRemove { alias: None }))
+        );
+        assert_eq!(
+            SlashCommand::parse("/model remove mini"),
+            Ok(Some(SlashCommand::ModelRemove {
+                alias: Some("mini".to_string()),
+            }))
+        );
+        // /model list behaves like the bare listing command
+        assert_eq!(
+            SlashCommand::parse("/model list"),
+            Ok(Some(SlashCommand::Model { model: None }))
+        );
+        // A single non-reserved token still switches the active model
+        assert_eq!(
+            SlashCommand::parse("/model opus"),
+            Ok(Some(SlashCommand::Model {
+                model: Some("opus".to_string()),
+            }))
+        );
         assert_eq!(
             SlashCommand::parse("/permissions read-only"),
             Ok(Some(SlashCommand::Permissions {
@@ -5815,6 +5923,22 @@ mod tests {
 
         // then
         assert!(error.contains("Usage: /history [count]"));
+    }
+
+    #[test]
+    fn rejects_model_add_with_too_many_arguments() {
+        assert!(
+            parse_error_message("/model add mini openai/gpt-4.1-mini extra")
+                .contains("Usage: /model add [alias] [provider/model]")
+        );
+    }
+
+    #[test]
+    fn rejects_model_remove_with_too_many_arguments() {
+        assert!(
+            parse_error_message("/model remove mini extra")
+                .contains("Usage: /model remove <alias>")
+        );
     }
 
     #[test]
@@ -6027,7 +6151,7 @@ mod tests {
         assert!(help.contains("/ultraplan [task]"));
         assert!(help.contains("/teleport <symbol-or-path>"));
         assert!(help.contains("/debug-tool-call"));
-        assert!(help.contains("/model [model]"));
+        assert!(help.contains("/model [model | add | remove <alias>]"));
         assert!(help.contains("/permissions [read-only|workspace-write|danger-full-access]"));
         assert!(help.contains("/clear [--confirm]"));
         assert!(help.contains("/cost"));

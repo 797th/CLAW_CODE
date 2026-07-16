@@ -5690,6 +5690,97 @@ fn models_json_and_model_help_json_are_local_807() {
     );
 }
 
+// `/model add` persists a named alias to the user config and is reachable
+// headlessly via --resume (no interactive prompt when both args are supplied).
+#[test]
+fn model_add_persists_alias_via_resume() {
+    let root = unique_temp_dir("model-add-resume");
+    fs::create_dir_all(&root).expect("temp dir should exist");
+    // Isolate the config home so the test never touches real ~/.claw.
+    let config_home = root.join("claw-home");
+    fs::create_dir_all(&config_home).expect("config home should exist");
+
+    let session_path = write_session_fixture(&root, "model-add-resume", Some("hi"));
+
+    let output = run_claw(
+        &root,
+        &[
+            "--resume",
+            session_path.to_str().expect("utf8 session path"),
+            "--output-format",
+            "json",
+            "/model",
+            "add",
+            "mini",
+            "openai/gpt-4.1-mini",
+        ],
+        &[("CLAW_CONFIG_HOME", config_home.to_str().expect("utf8 home"))],
+    );
+    assert!(
+        output.status.success(),
+        "/model add should succeed via --resume\nstdout:\n{}\n\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let parsed: Value = serde_json::from_str(stdout.trim()).unwrap_or_else(|_| {
+        panic!(
+            "/model add must emit JSON; stdout:\n{stdout}\n\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        )
+    });
+    assert_eq!(parsed["kind"], "models", "/model add kind: {parsed}");
+    assert_eq!(parsed["action"], "add", "/model add action: {parsed}");
+    assert_eq!(parsed["status"], "ok", "/model add status: {parsed}");
+    assert_eq!(parsed["alias"], "mini", "/model add alias: {parsed}");
+
+    // The alias must actually be written to the isolated config file.
+    let settings =
+        fs::read_to_string(config_home.join("settings.json")).expect("settings should be written");
+    let settings_json: Value =
+        serde_json::from_str(&settings).expect("settings should be valid json");
+    assert_eq!(
+        settings_json["aliases"]["mini"],
+        "openai/gpt-4.1-mini",
+        "alias should persist: {settings_json}"
+    );
+
+    // A follow-up `/model remove mini` should drop it.
+    let remove_output = run_claw(
+        &root,
+        &[
+            "--resume",
+            session_path.to_str().expect("utf8 session path"),
+            "--output-format",
+            "json",
+            "/model",
+            "remove",
+            "mini",
+        ],
+        &[("CLAW_CONFIG_HOME", config_home.to_str().expect("utf8 home"))],
+    );
+    assert!(
+        remove_output.status.success(),
+        "/model remove should succeed via --resume\nstdout:\n{}\n\nstderr:\n{}",
+        String::from_utf8_lossy(&remove_output.stdout),
+        String::from_utf8_lossy(&remove_output.stderr),
+    );
+    let remove_stdout = String::from_utf8_lossy(&remove_output.stdout);
+    let remove_json: Value = serde_json::from_str(remove_stdout.trim())
+        .expect("/model remove must emit JSON");
+    assert_eq!(remove_json["action"], "remove", "/model remove action: {remove_json}");
+    assert_eq!(remove_json["removed"], true, "/model remove removed: {remove_json}");
+
+    let after =
+        fs::read_to_string(config_home.join("settings.json")).expect("settings should still exist");
+    let after_json: Value = serde_json::from_str(&after).expect("valid json after remove");
+    assert!(
+        after_json["aliases"].get("mini").is_none(),
+        "alias should be gone: {after_json}"
+    );
+}
+
 // #808: settings JSON/help surfaces must stay bounded and local.
 #[test]
 fn settings_json_and_help_json_are_local_808() {

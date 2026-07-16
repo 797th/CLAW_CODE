@@ -74,6 +74,8 @@ pub use config::{
     OAuthConfig, ProviderFallbackConfig, ResolvedPermissionMode, RuntimeConfig,
     RuntimeFeatureConfig, RuntimeHookConfig, RuntimeInvalidHookConfig, RuntimePermissionRuleConfig,
     RuntimePluginConfig, RuntimeProviderConfig, ScopedMcpServerConfig,
+    load_user_model_aliases, load_user_model_aliases_in_home, remove_user_model_alias,
+    remove_user_model_alias_in_home, save_user_model_alias, save_user_model_alias_in_home,
     save_user_provider_settings, suppress_config_warnings_for_json_mode, CLAW_SETTINGS_SCHEMA_NAME,
 };
 pub use config_validate::{

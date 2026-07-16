@@ -3692,6 +3692,100 @@ fn config_model_for_current_dir() -> Option<String> {
     loader.load().ok()?.model().map(ToOwned::to_owned)
 }
 
+/// Reserved alias names that map to built-in models and must not be overwritten
+/// by user-added aliases. Mirrors the arms of [`resolve_model_alias`].
+fn reserved_model_alias(alias: &str) -> bool {
+    let lower = alias.to_ascii_lowercase();
+    matches!(
+        lower.as_str(),
+        "opus" | "sonnet" | "haiku" | "gpt-oss" | "gptoss" | "gpt-oss-120b" | "gpt-oss-20b"
+    ) || matches!(
+        alias,
+        "add" | "remove" | "list" // reserved /model subcommands
+    )
+}
+
+/// Register a model alias without any prompting. Shared by the resume/one-shot
+/// path and the REPL `/model add` handler when both arguments are supplied.
+/// Returns `(text_message, json_payload)`.
+fn apply_headless_model_add(
+    alias: Option<&str>,
+    model: Option<&str>,
+) -> Result<(String, serde_json::Value), Box<dyn std::error::Error>> {
+    let (Some(alias), Some(model)) = (alias, model) else {
+        return Err(
+            "model add needs both an alias and a model in non-interactive mode.\n\
+             Usage: /model add <alias> <provider/model>  (or run /model add in the REPL)"
+                .into(),
+        );
+    };
+    let alias = alias.trim();
+    let model = model.trim();
+    if alias.is_empty() {
+        return Err("alias cannot be empty.".into());
+    }
+    if reserved_model_alias(alias) {
+        return Err(format!(
+            "'{alias}' is a reserved model name; choose a different alias."
+        )
+        .into());
+    }
+    // Validate the target syntax (provider/model or a configured alias).
+    if let Err(message) = validate_model_syntax(model) {
+        return Err(message.into());
+    }
+    let resolved = resolve_model_alias_with_config(model);
+    let path = runtime::save_user_model_alias(alias, &resolved)
+        .map_err(|e| format!("failed to save model alias: {e}"))?;
+
+    let message = format!(
+        "Model alias added\n  Alias            {alias}\n  Resolves to      {resolved}\n  Saved to         {}",
+        path.display()
+    );
+    let json = serde_json::json!({
+        "kind": "models",
+        "action": "add",
+        "status": "ok",
+        "alias": alias,
+        "model": resolved,
+        "path": path.to_string_lossy(),
+    });
+    Ok((message, json))
+}
+
+/// Remove a model alias without any prompting. Shared by the resume/one-shot
+/// path and the REPL `/model remove` handler when the alias is supplied.
+fn apply_headless_model_remove(
+    alias: Option<&str>,
+) -> Result<(String, serde_json::Value), Box<dyn std::error::Error>> {
+    let Some(alias) = alias else {
+        return Err(
+            "model remove needs an alias in non-interactive mode.\n\
+             Usage: /model remove <alias>  (or run /model remove in the REPL)"
+                .into(),
+        );
+    };
+    let alias = alias.trim();
+    if alias.is_empty() {
+        return Err("alias cannot be empty.".into());
+    }
+    let removed = runtime::remove_user_model_alias(alias)
+        .map_err(|e| format!("failed to remove model alias: {e}"))?;
+    let message = if removed {
+        format!("Model alias removed\n  Alias            {alias}")
+    } else {
+        format!("Model alias not found\n  Alias            {alias}")
+    };
+    let json = serde_json::json!({
+        "kind": "models",
+        "action": "remove",
+        "status": if removed { "ok" } else { "not_found" },
+        "alias": alias,
+        "removed": removed,
+    });
+    Ok((message, json))
+}
+
 fn resolve_repl_model(cli_model: String) -> Result<String, String> {
     Ok(ModelProvenance::from_env_or_config_or_default(&cli_model)?.resolved)
 }
@@ -7486,12 +7580,23 @@ fn run_resume_command(
             let resolved_config_model = configured_model
                 .as_deref()
                 .map(resolve_model_alias_with_config);
+            let configured_aliases = runtime::load_user_model_aliases().unwrap_or_default();
+            let aliases_text = if configured_aliases.is_empty() {
+                "<none>".to_string()
+            } else {
+                configured_aliases
+                    .iter()
+                    .map(|(alias, target)| format!("{alias} → {target}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
             Ok(ResumeCommandOutcome {
                 session: session.clone(),
                 message: Some(format!(
-                    "Models\n  Default          {}\n  Config model     {}",
+                    "Models\n  Default          {}\n  Config model     {}\n  Aliases          {}\n\nUsage\n  Inspect current model with /model\n  Switch models with /model <name>\n  Add a model with /model add [alias] [provider/model]\n  Remove with /model remove <alias>",
                     DEFAULT_MODEL,
-                    configured_model.as_deref().unwrap_or("<unset>")
+                    configured_model.as_deref().unwrap_or("<unset>"),
+                    aliases_text,
                 )),
                 json: Some(serde_json::json!({
                     "kind": "models",
@@ -7500,9 +7605,31 @@ fn run_resume_command(
                     "default_model": DEFAULT_MODEL,
                     "configured_model": configured_model,
                     "resolved_model": resolved_config_model,
+                    "configured_aliases": serde_json::Value::Object(
+                        configured_aliases
+                            .into_iter()
+                            .map(|(k, v)| (k, serde_json::Value::String(v)))
+                            .collect(),
+                    ),
                     "requested_model": model,
                 })),
             })
+        }
+        SlashCommand::ModelAdd { alias, model } => {
+            apply_headless_model_add(alias.as_deref(), model.as_deref())
+                .map(|(message, json)| ResumeCommandOutcome {
+                    session: session.clone(),
+                    message: Some(message),
+                    json: Some(json),
+                })
+        }
+        SlashCommand::ModelRemove { alias } => {
+            apply_headless_model_remove(alias.as_deref())
+                .map(|(message, json)| ResumeCommandOutcome {
+                    session: session.clone(),
+                    message: Some(message),
+                    json: Some(json),
+                })
         }
         SlashCommand::Bughunter { .. }
         | SlashCommand::Commit { .. }
@@ -9002,6 +9129,8 @@ impl LiveCli {
                 false
             }
             SlashCommand::Model { model } => self.set_model(model)?,
+            SlashCommand::ModelAdd { alias, model } => self.add_model(alias, model)?,
+            SlashCommand::ModelRemove { alias } => self.remove_model(alias)?,
             SlashCommand::Permissions { mode } => self.set_permissions(mode)?,
             SlashCommand::Clear { confirm } => self.clear_session(confirm)?,
             SlashCommand::Cost => {
@@ -9291,6 +9420,78 @@ impl LiveCli {
             format_model_switch_report(&previous, &model, message_count)
         );
         Ok(true)
+    }
+
+    /// `/model add [alias] [provider/model]`. When both args are present it
+    /// runs headless via [`apply_headless_model_add`]; otherwise it prompts
+    /// interactively (REPL only). Persists the alias to user config so the new
+    /// model is immediately usable via `/model <alias>`. Does not switch the
+    /// active model.
+    fn add_model(
+        &mut self,
+        alias: Option<String>,
+        model: Option<String>,
+    ) -> Result<bool, Box<dyn std::error::Error>> {
+        // Headless fast path: both arguments supplied.
+        if let (Some(alias), Some(model)) = (alias.as_deref(), model.as_deref()) {
+            match apply_headless_model_add(Some(alias), Some(model)) {
+                Ok((message, _json)) => println!("{message}"),
+                Err(error) => println!("{error}"),
+            }
+            return Ok(false);
+        }
+
+        println!("Add a model alias — a short name that resolves to a provider/model.");
+        println!("  Examples: openai/gpt-4.1-mini, anthropic/claude-opus-4-6, qwen/qwen-plus");
+
+        let alias = match alias {
+            Some(alias) => alias,
+            None => {
+                let raw = prompt_text("Alias (e.g. mini)", None)?;
+                if reserved_model_alias(&raw) {
+                    println!("'{raw}' is a reserved model name; choose a different alias.");
+                    return Ok(false);
+                }
+                raw
+            }
+        };
+        let model = match model {
+            Some(model) => model,
+            None => prompt_text("Model (provider/model)", None)?,
+        };
+
+        match apply_headless_model_add(Some(&alias), Some(&model)) {
+            Ok((message, _json)) => println!("{message}"),
+            Err(error) => println!("{error}"),
+        }
+        Ok(false)
+    }
+
+    /// `/model remove [alias]`. Headless when the alias is supplied, otherwise
+    /// prompts interactively (REPL only).
+    fn remove_model(
+        &mut self,
+        alias: Option<String>,
+    ) -> Result<bool, Box<dyn std::error::Error>> {
+        let alias = match alias {
+            Some(alias) => alias,
+            None => {
+                let existing = runtime::load_user_model_aliases().unwrap_or_default();
+                if existing.is_empty() {
+                    println!("No user-defined model aliases to remove.");
+                    return Ok(false);
+                }
+                let names: Vec<&str> = existing.keys().map(String::as_str).collect();
+                println!("Existing aliases: {}", names.join(", "));
+                prompt_text("Alias to remove", None)?
+            }
+        };
+
+        match apply_headless_model_remove(Some(&alias)) {
+            Ok((message, _json)) => println!("{message}"),
+            Err(error) => println!("{error}"),
+        }
+        Ok(false)
     }
 
     fn set_permissions(
@@ -18567,7 +18768,7 @@ mod tests {
         assert!(help.contains("Complete commands, modes, and recent sessions"));
         assert!(help.contains("/status"));
         assert!(help.contains("/sandbox"));
-        assert!(help.contains("/model [model]"));
+        assert!(help.contains("/model [model | add | remove <alias>]"));
         assert!(help.contains("/permissions [read-only|workspace-write|danger-full-access]"));
         assert!(help.contains("/clear [--confirm]"));
         assert!(help.contains("/cost"));
