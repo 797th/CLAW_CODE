@@ -1,9 +1,12 @@
 use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::BTreeSet;
+use std::env;
 use std::fs;
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::{Arc, Mutex};
 
 use crossterm::style::{style, Color, Stylize};
 use crossterm::terminal;
@@ -14,7 +17,8 @@ use rustyline::hint::Hinter;
 use rustyline::history::DefaultHistory;
 use rustyline::validate::Validator;
 use rustyline::{
-    Cmd, CompletionType, Config, Context, EditMode, Editor, Helper, KeyCode, KeyEvent, Modifiers,
+    Cmd, CompletionType, ConditionalEventHandler, Config, Context, EditMode, Editor, Event,
+    EventContext, EventHandler, Helper, KeyCode, KeyEvent, Modifiers, RepeatCount,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -22,6 +26,131 @@ pub enum ReadOutcome {
     Submit(String),
     Cancel,
     Exit,
+}
+
+const PERMISSION_MODE_CYCLE: [&str; 3] = [
+    "prompt",
+    "workspace-write",
+    "danger-full-access",
+];
+const PERMISSION_MODE_DISPLAY: [&str; 3] = ["ask", "workspace", "bypass"];
+const FOOTER_PERMISSION_LABELS: [&str; 8] = [
+    "ask before tools",
+    "workspace write",
+    "full access",
+    "read-only",
+    "allow",
+    "ask",
+    "workspace",
+    "bypass",
+];
+
+fn permission_mode_index(mode: &str) -> u8 {
+    match mode.trim() {
+        "workspace-write" | "workspace" => 1,
+        "danger-full-access" | "bypass" | "full access" => 2,
+        _ => 0,
+    }
+}
+
+fn permission_mode_for_index(index: u8) -> &'static str {
+    PERMISSION_MODE_CYCLE[usize::from(index) % PERMISSION_MODE_CYCLE.len()]
+}
+
+fn permission_display_for_index(index: u8) -> &'static str {
+    PERMISSION_MODE_DISPLAY[usize::from(index) % PERMISSION_MODE_DISPLAY.len()]
+}
+
+fn replace_footer_permission_label(footer: &mut String, replacement: &str) {
+    if let Some(label) = FOOTER_PERMISSION_LABELS
+        .iter()
+        .find(|label| footer.contains(**label))
+    {
+        *footer = footer.replacen(label, replacement, 1);
+    }
+}
+
+fn redraw_footer_line(footer: &str) {
+    let rows = terminal::size().map(|(_, rows)| rows).unwrap_or_default();
+    if rows < 3 {
+        return;
+    }
+
+    let mut stdout = io::stdout();
+    // Save the cursor while rustyline owns the editable input row, redraw the
+    // pinned footer, then restore the cursor so the current line stays intact.
+    let _ = write!(
+        stdout,
+        "\x1b7\x1b[{rows};1H\x1b[2K{footer}\x1b8"
+    );
+    let _ = stdout.flush();
+}
+
+struct PermissionToggleState {
+    mode: AtomicU8,
+    footer: Mutex<String>,
+}
+
+impl PermissionToggleState {
+    fn new() -> Self {
+        Self {
+            mode: AtomicU8::new(permission_mode_index("prompt")),
+            footer: Mutex::new(String::new()),
+        }
+    }
+
+    fn set_mode(&self, mode: &str) {
+        self.mode
+            .store(permission_mode_index(mode), Ordering::Relaxed);
+    }
+
+    fn current_mode(&self) -> &'static str {
+        permission_mode_for_index(self.mode.load(Ordering::Relaxed))
+    }
+
+    fn set_footer(&self, footer: String) {
+        if let Ok(mut shared_footer) = self.footer.lock() {
+            *shared_footer = footer;
+        }
+    }
+
+    fn cycle(&self) {
+        let next = (self.mode.load(Ordering::Relaxed).wrapping_add(1))
+            % u8::try_from(PERMISSION_MODE_CYCLE.len()).unwrap_or(1);
+        self.mode.store(next, Ordering::Relaxed);
+
+        let footer = self
+            .footer
+            .lock()
+            .ok()
+            .map(|mut footer| {
+                replace_footer_permission_label(&mut footer, permission_display_for_index(next));
+                footer.clone()
+            });
+        if let Some(footer) = footer {
+            if let Ok(mut shared_footer) = self.footer.lock() {
+                *shared_footer = footer.clone();
+            }
+            redraw_footer_line(&footer);
+        }
+    }
+}
+
+struct PermissionToggleHandler {
+    state: Arc<PermissionToggleState>,
+}
+
+impl ConditionalEventHandler for PermissionToggleHandler {
+    fn handle(
+        &self,
+        _event: &Event,
+        _repeat_count: RepeatCount,
+        _positive: bool,
+        _context: &EventContext,
+    ) -> Option<Cmd> {
+        self.state.cycle();
+        Some(Cmd::Repaint)
+    }
 }
 
 struct SlashCommandHelper {
@@ -103,6 +232,27 @@ impl Highlighter for SlashCommandHelper {
         self.set_current_line(line);
         false
     }
+
+    fn highlight_prompt<'b, 's: 'b, 'p: 'b>(
+        &'s self,
+        prompt: &'p str,
+        _default: bool,
+    ) -> Cow<'b, str> {
+        if !self.current_line().starts_with('/') {
+            return Cow::Borrowed(prompt);
+        }
+
+        if env::var_os("NO_COLOR").is_some() {
+            return Cow::Owned("• ".to_string());
+        }
+
+        let accent = Color::Rgb {
+            r: 129,
+            g: 140,
+            b: 248,
+        };
+        Cow::Owned(format!("{} ", style("•").with(accent)))
+    }
 }
 
 impl Validator for SlashCommandHelper {}
@@ -121,6 +271,7 @@ fn highlight_slash_command(line: &str) -> String {
 pub struct LineEditor {
     prompt: String,
     footer: String,
+    footer_state: Arc<PermissionToggleState>,
     footer_active: bool,
     working_active: bool,
     editor: Editor<SlashCommandHelper, DefaultHistory>,
@@ -139,10 +290,24 @@ impl LineEditor {
         editor.set_helper(Some(SlashCommandHelper::new(completions)));
         editor.bind_sequence(KeyEvent(KeyCode::Char('J'), Modifiers::CTRL), Cmd::Newline);
         editor.bind_sequence(KeyEvent(KeyCode::Enter, Modifiers::SHIFT), Cmd::Newline);
+        let footer_state = Arc::new(PermissionToggleState::new());
+        editor.bind_sequence(
+            KeyEvent(KeyCode::BackTab, Modifiers::NONE),
+            EventHandler::Conditional(Box::new(PermissionToggleHandler {
+                state: Arc::clone(&footer_state),
+            })),
+        );
+        editor.bind_sequence(
+            KeyEvent(KeyCode::Tab, Modifiers::SHIFT),
+            EventHandler::Conditional(Box::new(PermissionToggleHandler {
+                state: Arc::clone(&footer_state),
+            })),
+        );
 
         Self {
             prompt: prompt.into(),
             footer: String::new(),
+            footer_state,
             footer_active: false,
             working_active: false,
             editor,
@@ -169,7 +334,25 @@ impl LineEditor {
     }
 
     pub fn set_footer(&mut self, footer: impl Into<String>) {
-        self.footer = footer.into();
+        let footer = footer.into();
+        self.footer.clone_from(&footer);
+        self.footer_state.set_footer(footer);
+    }
+
+    pub fn set_permission_mode(&mut self, mode: &str) {
+        self.footer_state.set_mode(mode);
+        self.sync_footer();
+    }
+
+    pub fn permission_mode(&mut self) -> String {
+        self.sync_footer();
+        self.footer_state.current_mode().to_string()
+    }
+
+    fn sync_footer(&mut self) {
+        if let Ok(footer) = self.footer_state.footer.lock() {
+            self.footer.clone_from(&footer);
+        }
     }
 
     pub fn read_line(&mut self) -> io::Result<ReadOutcome> {
@@ -485,8 +668,8 @@ fn normalize_completions(completions: Vec<String>) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        highlight_slash_command, path_completion_candidates, slash_command_prefix, LineEditor,
-        SlashCommandHelper,
+        highlight_slash_command, path_completion_candidates, permission_mode_for_index,
+        permission_mode_index, slash_command_prefix, LineEditor, SlashCommandHelper,
     };
     use std::fs;
     use std::path::PathBuf;
@@ -581,6 +764,17 @@ mod tests {
 
         assert!(highlighted.contains("\u{1b}[38;5;12m/login\u{1b}[39m"));
         assert!(highlighted.ends_with(" later"));
+    }
+
+    #[test]
+    fn shift_tab_permission_cycle_matches_repl_labels() {
+        assert_eq!(permission_mode_index("ask"), 0);
+        assert_eq!(permission_mode_index("workspace"), 1);
+        assert_eq!(permission_mode_index("bypass"), 2);
+        assert_eq!(permission_mode_for_index(0), "prompt");
+        assert_eq!(permission_mode_for_index(1), "workspace-write");
+        assert_eq!(permission_mode_for_index(2), "danger-full-access");
+        assert_eq!(permission_mode_for_index(3), "prompt");
     }
 
     #[test]

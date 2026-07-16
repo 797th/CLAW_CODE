@@ -26,11 +26,13 @@ fn repl_keeps_working_indicator_above_composer_and_model_footer() {
     let working_region = terminal_output.find("\x1b[1;22r").unwrap_or_else(|| {
         panic!("working state should set the transcript scroll region: {terminal_output:?}")
     });
-    let composer = terminal_output
-        .rfind("╭─ ")
-        .expect("working state should redraw the composer");
+    let reserved_output = &terminal_output[working_region..];
+    let composer = working_region
+        + reserved_output
+            .find("• ")
+            .expect("working state should redraw the composer");
     let model_footer = terminal_output
-        .rfind("╰─ anthropic/claude-sonnet-4-6")
+        .rfind("• anthropic/claude-sonnet-4-6")
         .expect("working state should redraw the model footer");
     let working = terminal_output
         .find("Working")
@@ -47,6 +49,10 @@ fn repl_keeps_working_indicator_above_composer_and_model_footer() {
     assert!(
         model_footer < working,
         "activity should render after the cursor is moved to the row above the composer: {terminal_output:?}"
+    );
+    assert!(
+        terminal_output.contains("0 tok"),
+        "model footer should include live token usage: {terminal_output:?}"
     );
 
     fs::remove_dir_all(&workspace).expect("workspace cleanup should succeed");
