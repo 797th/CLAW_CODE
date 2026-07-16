@@ -187,6 +187,151 @@ pub(crate) fn initialize_repo(cwd: &Path) -> Result<InitReport, Box<dyn std::err
     })
 }
 
+/// Command run by the scaffolded `SessionStart` hook (see
+/// `merge_session_start_hook`). Kept as a named constant so the test suite
+/// can assert on the exact string without duplicating it.
+const SESSION_START_HOOK_COMMAND: &str =
+    "echo 'Workflow harness active: run /start-work to begin gated work'";
+
+/// Scaffold the SAW-lite starter pack: gate agent, workflow slash commands,
+/// and reusable skills under `.claw/`, plus a `session_start` guidance hook
+/// merged into `.claw.json`. Write-if-absent only — an existing file (even
+/// one the user has since edited or deleted-then-recreated differently) is
+/// never overwritten; a second run only fills in whatever is still missing.
+///
+/// If an I/O error aborts this function partway through (e.g. disk full
+/// after the agent file but before the commands directory), the artifacts
+/// written so far are left in place rather than rolled back: that's safe
+/// because every step here is write-if-absent, so simply re-running
+/// `init --harness` after fixing the underlying error fills in exactly
+/// what's still missing without touching what already landed.
+pub(crate) fn initialize_harness(cwd: &Path) -> Result<InitReport, Box<dyn std::error::Error>> {
+    let mut artifacts = Vec::new();
+
+    let agents_dir = cwd.join(".claw").join("agents");
+    fs::create_dir_all(&agents_dir)?;
+    artifacts.push(InitArtifact {
+        name: ".claw/agents/qas.md",
+        status: write_file_if_missing(
+            &agents_dir.join("qas.md"),
+            crate::harness_templates::QAS_AGENT,
+        )?,
+    });
+
+    let commands_dir = cwd.join(".claw").join("commands");
+    fs::create_dir_all(&commands_dir)?;
+    artifacts.push(InitArtifact {
+        name: ".claw/commands/start-work.md",
+        status: write_file_if_missing(
+            &commands_dir.join("start-work.md"),
+            crate::harness_templates::START_WORK_COMMAND,
+        )?,
+    });
+    artifacts.push(InitArtifact {
+        name: ".claw/commands/pre-pr.md",
+        status: write_file_if_missing(
+            &commands_dir.join("pre-pr.md"),
+            crate::harness_templates::PRE_PR_COMMAND,
+        )?,
+    });
+    artifacts.push(InitArtifact {
+        name: ".claw/commands/end-work.md",
+        status: write_file_if_missing(
+            &commands_dir.join("end-work.md"),
+            crate::harness_templates::END_WORK_COMMAND,
+        )?,
+    });
+
+    let pattern_discovery_dir = cwd.join(".claw").join("skills").join("pattern-discovery");
+    fs::create_dir_all(&pattern_discovery_dir)?;
+    artifacts.push(InitArtifact {
+        name: ".claw/skills/pattern-discovery/SKILL.md",
+        status: write_file_if_missing(
+            &pattern_discovery_dir.join("SKILL.md"),
+            crate::harness_templates::PATTERN_DISCOVERY_SKILL,
+        )?,
+    });
+
+    let verification_dir = cwd
+        .join(".claw")
+        .join("skills")
+        .join("verification-before-completion");
+    fs::create_dir_all(&verification_dir)?;
+    artifacts.push(InitArtifact {
+        name: ".claw/skills/verification-before-completion/SKILL.md",
+        status: write_file_if_missing(
+            &verification_dir.join("SKILL.md"),
+            crate::harness_templates::VERIFICATION_BEFORE_COMPLETION_SKILL,
+        )?,
+    });
+
+    artifacts.push(InitArtifact {
+        name: ".claw.json (session_start hook)",
+        status: merge_session_start_hook(&cwd.join(".claw.json"))?,
+    });
+
+    Ok(InitReport {
+        project_root: cwd.to_path_buf(),
+        artifacts,
+    })
+}
+
+/// Merge a `session_start` guidance hook into `.claw.json`'s `hooks.SessionStart`
+/// list, preserving every other key already present. Creates a minimal
+/// `.claw.json` containing only the hook when the file does not exist yet.
+/// Never overwrites an existing `hooks.SessionStart` entry — if one is
+/// already present (whether or not it matches ours), the file is left
+/// untouched. If the existing file is not valid JSON (or its root is not a
+/// JSON object), the merge is skipped rather than risking corruption of a
+/// file we can't safely parse.
+fn merge_session_start_hook(path: &Path) -> Result<InitStatus, Box<dyn std::error::Error>> {
+    if !path.exists() {
+        let mut hooks = serde_json::Map::new();
+        hooks.insert(
+            "SessionStart".to_string(),
+            serde_json::Value::Array(vec![serde_json::Value::String(
+                SESSION_START_HOOK_COMMAND.to_string(),
+            )]),
+        );
+        let mut root = serde_json::Map::new();
+        root.insert("hooks".to_string(), serde_json::Value::Object(hooks));
+        let content = format!("{}\n", serde_json::to_string_pretty(&root)?);
+        fs::write(path, content)?;
+        return Ok(InitStatus::Created);
+    }
+
+    let existing = fs::read_to_string(path)?;
+    let Ok(mut value) = serde_json::from_str::<serde_json::Value>(&existing) else {
+        // Not valid JSON -- don't risk corrupting a file we can't parse.
+        return Ok(InitStatus::Skipped);
+    };
+    let Some(root) = value.as_object_mut() else {
+        return Ok(InitStatus::Skipped);
+    };
+
+    let hooks_entry = root
+        .entry("hooks".to_string())
+        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+    let Some(hooks_obj) = hooks_entry.as_object_mut() else {
+        return Ok(InitStatus::Skipped);
+    };
+
+    if hooks_obj.contains_key("SessionStart") {
+        return Ok(InitStatus::Skipped);
+    }
+
+    hooks_obj.insert(
+        "SessionStart".to_string(),
+        serde_json::Value::Array(vec![serde_json::Value::String(
+            SESSION_START_HOOK_COMMAND.to_string(),
+        )]),
+    );
+
+    let content = format!("{}\n", serde_json::to_string_pretty(&value)?);
+    fs::write(path, content)?;
+    Ok(InitStatus::Updated)
+}
+
 fn ensure_dir(path: &Path) -> Result<InitStatus, std::io::Error> {
     if path.is_dir() {
         return Ok(InitStatus::Skipped);

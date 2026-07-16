@@ -14,6 +14,7 @@
     clippy::unnecessary_wraps,
     clippy::unused_self
 )]
+mod harness_templates;
 mod init;
 mod input;
 mod mao;
@@ -1595,7 +1596,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
         CliAction::SessionList { output_format } => run_session_list(output_format)?,
         CliAction::State { output_format } => run_worker_state(output_format)?,
-        CliAction::Init { output_format } => run_init(output_format)?,
+        CliAction::Init {
+            output_format,
+            harness,
+        } => run_init(output_format, harness)?,
         CliAction::Setup { output_format: _ } => run_setup()?,
         // #146: dispatch pure-local introspection. Text mode uses existing
         // render_config_report/render_diff_report; JSON mode uses the
@@ -1759,6 +1763,7 @@ enum CliAction {
     },
     Init {
         output_format: CliOutputFormat,
+        harness: bool,
     },
     Setup {
         output_format: CliOutputFormat,
@@ -2657,7 +2662,27 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
         "acp" => parse_acp_args(&rest[1..], output_format),
         "login" => Err(removed_auth_surface_error(rest[0].as_str())),
         "logout" => Err(removed_auth_surface_error(rest[0].as_str())),
-        "init" => Ok(CliAction::Init { output_format }),
+        "init" => {
+            let unexpected: Vec<&String> = rest[1..]
+                .iter()
+                .filter(|arg| arg.as_str() != "--harness")
+                .collect();
+            if !unexpected.is_empty() {
+                return Err(format!(
+                    "unexpected extra arguments after `claw init`: {}\nUsage: claw init [--harness] [--output-format json]",
+                    unexpected
+                        .iter()
+                        .map(|s| s.as_str())
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                ));
+            }
+            let harness = rest[1..].iter().any(|arg| arg == "--harness");
+            Ok(CliAction::Init {
+                output_format,
+                harness,
+            })
+        }
         "export" => parse_export_args(&rest[1..], output_format),
         "orchestrate" => {
             // Usage: clawcli orchestrate [--worker-model <model>] <prompt…>
@@ -9306,7 +9331,7 @@ impl LiveCli {
                 false
             }
             SlashCommand::Init => {
-                run_init(CliOutputFormat::Text)?;
+                run_init(CliOutputFormat::Text, false)?;
                 false
             }
             SlashCommand::Diff => {
@@ -12537,9 +12562,16 @@ fn init_claude_md() -> Result<String, Box<dyn std::error::Error>> {
     Ok(initialize_repo(&cwd)?.render())
 }
 
-fn run_init(output_format: CliOutputFormat) -> Result<(), Box<dyn std::error::Error>> {
+fn run_init(
+    output_format: CliOutputFormat,
+    harness: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
     let cwd = env::current_dir()?;
-    let report = initialize_repo(&cwd)?;
+    let mut report = initialize_repo(&cwd)?;
+    if harness {
+        let harness_report = crate::init::initialize_harness(&cwd)?;
+        report.artifacts.extend(harness_report.artifacts);
+    }
     let message = report.render();
     match output_format {
         CliOutputFormat::Text => println!("{message}"),
@@ -17171,6 +17203,15 @@ mod tests {
             parse_args(&["init".to_string()]).expect("init should parse"),
             CliAction::Init {
                 output_format: CliOutputFormat::Text,
+                harness: false,
+            }
+        );
+        assert_eq!(
+            parse_args(&["init".to_string(), "--harness".to_string()])
+                .expect("init --harness should parse"),
+            CliAction::Init {
+                output_format: CliOutputFormat::Text,
+                harness: true,
             }
         );
         assert_eq!(
