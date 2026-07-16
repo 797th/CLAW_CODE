@@ -12,3 +12,6 @@ workspace = true
 plugins = { path = "../plugins" }
 runtime = { path = "../runtime" }
 serde_json.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

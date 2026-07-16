@@ -5,6 +5,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use plugins::{PluginError, PluginLoadFailure, PluginManager, PluginSummary};
+use runtime::harness_assets::CommandMeta;
 use runtime::{
     compact_session, CompactionConfig, ConfigLoader, ConfigSource, McpConfigCollection,
     McpInvalidServerConfig, McpOAuthConfig, McpServerConfig, RuntimeConfig, ScopedMcpServerConfig,
@@ -1209,6 +1210,17 @@ pub enum SlashCommand {
     Team {
         action: Option<String>,
     },
+    /// A user-defined markdown slash command discovered under
+    /// `.claw/commands/*.md` (see `runtime::harness_assets`). `body` is the
+    /// command's markdown file contents, minus the frontmatter block, with
+    /// every `$ARGUMENTS` occurrence substituted for the verbatim argument
+    /// string (empty when the command was invoked with no arguments).
+    /// Dispatched into the agent loop as a user turn — see
+    /// `SlashCommand::parse_with_commands`.
+    Custom {
+        name: String,
+        body: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1235,6 +1247,35 @@ impl std::error::Error for SlashCommandParseError {}
 impl SlashCommand {
     pub fn parse(input: &str) -> Result<Option<Self>, SlashCommandParseError> {
         validate_slash_command_input(input)
+    }
+
+    /// Parse slash-command input the same way as [`Self::parse`], but also
+    /// resolves user-defined markdown commands discovered under
+    /// `.claw/commands/` (`registry`, typically produced by
+    /// `runtime::harness_assets::discover` and filtered through
+    /// [`resolve_custom_commands`]). Built-in commands always win name
+    /// conflicts: `validate_slash_command_input`'s built-in match arms run
+    /// first, so a project command is only reachable when its name doesn't
+    /// match any built-in command or alias, which is exactly the case where
+    /// plain parsing would otherwise produce `Unknown`.
+    pub fn parse_with_commands(
+        input: &str,
+        registry: &[CommandMeta],
+    ) -> Result<Option<Self>, SlashCommandParseError> {
+        match validate_slash_command_input(input)? {
+            Some(SlashCommand::Unknown(name)) => {
+                match registry.iter().find(|candidate| candidate.name == name) {
+                    Some(meta) => {
+                        let arguments =
+                            remainder_after_command(input.trim(), &name).unwrap_or_default();
+                        let body = custom_command_body(meta, &arguments);
+                        Ok(Some(SlashCommand::Custom { name, body }))
+                    }
+                    None => Ok(Some(SlashCommand::Unknown(name))),
+                }
+            }
+            other => Ok(other),
+        }
     }
 
     /// Returns the canonical slash-command name (e.g. `"/branch"`) for use in
@@ -1530,6 +1571,99 @@ pub fn validate_slash_command_input(
         other => SlashCommand::Unknown(other.to_string()),
     }))
 }
+
+/// Returns `true` when `name` matches a built-in slash command name or one
+/// of its aliases. Used to make built-in commands always win name conflicts
+/// against user-defined `.claw/commands/*.md` project commands.
+#[must_use]
+pub fn is_builtin_command_name(name: &str) -> bool {
+    find_slash_command_spec(name).is_some()
+}
+
+/// Filter a discovered custom-command registry down to entries that don't
+/// collide with a built-in command name. Built-in commands always win: any
+/// conflicting entry is dropped and a human-readable warning is returned for
+/// it instead, so callers can surface the warning without failing discovery.
+#[must_use]
+pub fn resolve_custom_commands(discovered: Vec<CommandMeta>) -> (Vec<CommandMeta>, Vec<String>) {
+    let mut kept = Vec::new();
+    let mut warnings = Vec::new();
+    for meta in discovered {
+        if is_builtin_command_name(&meta.name) {
+            warnings.push(format!(
+                "skipping custom command \"/{}\": conflicts with a built-in command",
+                meta.name
+            ));
+        } else {
+            kept.push(meta);
+        }
+    }
+    (kept, warnings)
+}
+
+/// Build the markdown body for a resolved custom command: the file's
+/// contents with the leading frontmatter block stripped and every
+/// `$ARGUMENTS` occurrence substituted with `arguments` (already the
+/// verbatim, trimmed remainder after the command name; empty when the
+/// command was invoked with no arguments).
+fn custom_command_body(meta: &CommandMeta, arguments: &str) -> String {
+    let contents = fs::read_to_string(&meta.path).unwrap_or_default();
+    strip_frontmatter_block(&contents).replace("$ARGUMENTS", arguments)
+}
+
+/// Strip a leading `---`-delimited frontmatter block, returning the
+/// remaining body content, trimmed. Contents without a well-formed
+/// frontmatter block are returned unchanged (trimmed) — discovery already
+/// skips files that fail this check, so this is a defensive fallback only.
+fn strip_frontmatter_block(contents: &str) -> String {
+    let mut lines = contents.lines();
+    if lines.next().map(str::trim) != Some("---") {
+        return contents.trim().to_string();
+    }
+
+    let mut body_lines = Vec::new();
+    let mut closed = false;
+    for line in lines {
+        if !closed && line.trim() == "---" {
+            closed = true;
+            continue;
+        }
+        if closed {
+            body_lines.push(line);
+        }
+    }
+
+    if !closed {
+        return contents.trim().to_string();
+    }
+
+    body_lines.join("\n").trim().to_string()
+}
+
+/// Render the "Project commands" `/help` section listing user-defined
+/// `.claw/commands/*.md` commands and their frontmatter descriptions. Empty
+/// string when `registry` is empty, so callers can skip the section
+/// entirely rather than emitting an empty heading.
+#[must_use]
+pub fn render_project_commands_help(registry: &[CommandMeta]) -> String {
+    if registry.is_empty() {
+        return String::new();
+    }
+
+    let mut sorted: Vec<&CommandMeta> = registry.iter().collect();
+    sorted.sort_by(|a, b| a.name.cmp(&b.name));
+
+    let mut lines = vec!["Project commands".to_string()];
+    for meta in sorted {
+        let usage = match &meta.argument_hint {
+            Some(hint) => format!("/{} {hint}", meta.name),
+            None => format!("/{}", meta.name),
+        };
+        lines.push(format!("  {usage:<66} {}", meta.description));
+    }
+    lines.join("\n")
+}
+
 fn validate_no_args(command: &str, args: &[&str]) -> Result<(), SlashCommandParseError> {
     if args.is_empty() {
         return Ok(());
@@ -5430,6 +5564,7 @@ pub fn handle_slash_command(
         | SlashCommand::History { .. }
         | SlashCommand::Team { .. }
         | SlashCommand::Setup
+        | SlashCommand::Custom { .. }
         | SlashCommand::Unknown(_) => None,
     }
 }

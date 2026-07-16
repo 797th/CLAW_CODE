@@ -7552,7 +7552,8 @@ fn run_resume_command(
         | SlashCommand::OutputStyle { .. }
         | SlashCommand::AddDir { .. }
         | SlashCommand::Team { .. }
-        | SlashCommand::Setup => Err("unsupported resumed slash command".into()),
+        | SlashCommand::Setup
+        | SlashCommand::Custom { .. } => Err("unsupported resumed slash command".into()),
     }
 }
 
@@ -7687,6 +7688,19 @@ fn run_repl(
     let resolved_model = resolve_repl_model(model)?;
     let mut cli = LiveCli::new(resolved_model, true, allowed_tools, permission_mode)?;
     cli.set_reasoning_effort(reasoning_effort);
+    // Discover `.claw/commands/*.md` user-defined slash commands once at
+    // boot. Built-in commands always win name conflicts; a conflicting
+    // custom command is dropped and its warning surfaced here instead of
+    // failing REPL startup.
+    let discovered_commands = runtime::harness_assets::discover(
+        &env::current_dir().unwrap_or_default(),
+    )
+    .commands;
+    let (custom_commands, custom_command_warnings) =
+        commands::resolve_custom_commands(discovered_commands);
+    for warning in &custom_command_warnings {
+        eprintln!("{warning}");
+    }
     let mut editor = input::LineEditor::new(
         format_repl_prompt(&cli.model, cli.permission_mode),
         cli.repl_completion_candidates().unwrap_or_default(),
@@ -7713,7 +7727,7 @@ fn run_repl(
                     cli.persist_session()?;
                     break;
                 }
-                match SlashCommand::parse(&trimmed) {
+                match SlashCommand::parse_with_commands(&trimmed, &custom_commands) {
                     Ok(Some(command)) => {
                         if cli.handle_repl_command(command)? {
                             cli.persist_session()?;
@@ -9151,6 +9165,10 @@ impl LiveCli {
                 eprintln!("{}", format_unknown_slash_command(&name));
                 false
             }
+            SlashCommand::Custom { body, .. } => {
+                self.run_turn(&body)?;
+                false
+            }
         })
     }
 
@@ -10389,7 +10407,12 @@ fn session_clear_backup_path(session_path: &Path) -> PathBuf {
 }
 
 fn render_repl_help() -> String {
-    [
+    let (custom_commands, _warnings) = commands::resolve_custom_commands(
+        runtime::harness_assets::discover(&env::current_dir().unwrap_or_default()).commands,
+    );
+    let project_commands_help = commands::render_project_commands_help(&custom_commands);
+
+    let mut sections = vec![
         "REPL".to_string(),
         "  /exit                Quit the REPL".to_string(),
         "  /quit                Quit the REPL".to_string(),
@@ -10405,8 +10428,13 @@ fn render_repl_help() -> String {
         "  Show prompt history  /history [count]".to_string(),
         String::new(),
         render_slash_command_help_filtered(STUB_COMMANDS),
-    ]
-    .join(
+    ];
+    if !project_commands_help.is_empty() {
+        sections.push(String::new());
+        sections.push(project_commands_help);
+    }
+
+    sections.join(
         "
 ",
     )
