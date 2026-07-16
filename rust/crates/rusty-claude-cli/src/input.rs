@@ -18,7 +18,7 @@ use rustyline::history::DefaultHistory;
 use rustyline::validate::Validator;
 use rustyline::{
     Cmd, CompletionType, ConditionalEventHandler, Config, Context, EditMode, Editor, Event,
-    EventContext, EventHandler, Helper, KeyCode, KeyEvent, Modifiers, RepeatCount,
+    EventContext, EventHandler, Helper, KeyCode, KeyEvent, Modifiers, Movement, RepeatCount,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -27,6 +27,11 @@ pub enum ReadOutcome {
     Cancel,
     Exit,
 }
+
+/// Shared footer storage read by the live renderer while a model turn is in
+/// flight. Keeping the string behind a mutex lets the stream callback update
+/// usage without competing with the spinner thread for terminal ownership.
+pub type FooterStore = Arc<Mutex<String>>;
 
 // Shift+Tab cycles through four REPL permission/workspace modes, mirroring
 // Claude Code's default/plan/auto-accept/bypass rotation. "plan" is not a
@@ -158,14 +163,14 @@ fn redraw_footer_line(footer: &str) {
 
 struct PermissionToggleState {
     mode: AtomicU8,
-    footer: Mutex<String>,
+    footer: FooterStore,
 }
 
 impl PermissionToggleState {
     fn new() -> Self {
         Self {
             mode: AtomicU8::new(permission_mode_index("prompt")),
-            footer: Mutex::new(String::new()),
+            footer: Arc::new(Mutex::new(String::new())),
         }
     }
 
@@ -304,7 +309,10 @@ impl Highlighter for SlashCommandHelper {
 
     fn highlight_char(&self, line: &str, _pos: usize, _kind: CmdKind) -> bool {
         self.set_current_line(line);
-        false
+        // Ask rustyline to rerender the line after every edit while it is a
+        // slash command. This makes `/model`, `/login`, and partial commands
+        // turn blue as soon as the slash and command token are typed.
+        line.starts_with('/')
     }
 
     fn highlight_prompt<'b, 's: 'b, 'p: 'b>(
@@ -354,6 +362,13 @@ impl LineEditor {
         editor.set_helper(Some(SlashCommandHelper::new(completions)));
         editor.bind_sequence(KeyEvent(KeyCode::Char('J'), Modifiers::CTRL), Cmd::Newline);
         editor.bind_sequence(KeyEvent(KeyCode::Enter, Modifiers::SHIFT), Cmd::Newline);
+        // Escape cancels the current command buffer without leaving the REPL.
+        // Interactive command pickers and setup prompts handle Escape in the
+        // same way, so every command has a consistent cancellation gesture.
+        editor.bind_sequence(
+            KeyEvent(KeyCode::Esc, Modifiers::NONE),
+            Cmd::Kill(Movement::WholeBuffer),
+        );
         let footer_state = Arc::new(PermissionToggleState::new());
         editor.bind_sequence(
             KeyEvent(KeyCode::BackTab, Modifiers::NONE),
@@ -401,6 +416,13 @@ impl LineEditor {
         let footer = footer.into();
         self.footer.clone_from(&footer);
         self.footer_state.set_footer(footer);
+    }
+
+    /// Return the shared footer storage used by the background activity
+    /// renderer to repaint live usage counters.
+    #[must_use]
+    pub fn footer_store(&self) -> FooterStore {
+        Arc::clone(&self.footer_state.footer)
     }
 
     pub fn set_permission_mode(&mut self, mode: &str) {
@@ -830,6 +852,27 @@ mod tests {
 
         assert!(highlighted.contains("\u{1b}[38;5;12m/login\u{1b}[39m"));
         assert!(highlighted.ends_with(" later"));
+    }
+
+    #[test]
+    fn slash_command_highlighting_refreshes_as_each_token_character_is_typed() {
+        let helper = SlashCommandHelper::new(Vec::new());
+
+        assert!(helper.highlight_char(
+            "/",
+            1,
+            rustyline::highlight::CmdKind::Other
+        ));
+        assert!(helper.highlight_char(
+            "/model",
+            6,
+            rustyline::highlight::CmdKind::Other
+        ));
+        assert!(!helper.highlight_char(
+            "normal text",
+            11,
+            rustyline::highlight::CmdKind::Other
+        ));
     }
 
     #[test]

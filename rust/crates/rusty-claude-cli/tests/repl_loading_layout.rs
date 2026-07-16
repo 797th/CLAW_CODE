@@ -31,12 +31,14 @@ fn repl_keeps_working_indicator_above_composer_and_model_footer() {
         + reserved_output
             .find("> ")
             .expect("working state should redraw the composer");
-    let model_footer = terminal_output
-        .rfind("• anthropic/claude-sonnet-4-6")
-        .expect("working state should redraw the model footer");
     let working = terminal_output
         .find("Working")
         .expect("working state should render the activity indicator");
+    // The live spinner repaints the footer on every frame now, so inspect the
+    // first footer in the reserved working layout rather than the final frame.
+    let model_footer = terminal_output[..working]
+        .rfind("• anthropic/claude-sonnet-4-6")
+        .expect("working state should redraw the model footer");
 
     assert!(
         working_region < composer,

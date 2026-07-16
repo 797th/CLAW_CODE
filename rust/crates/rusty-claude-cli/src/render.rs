@@ -5,6 +5,7 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use crate::input::FooterStore;
 use crossterm::cursor::{MoveTo, MoveToColumn};
 use crossterm::style::{Color, Print, ResetColor, SetForegroundColor, Stylize};
 use crossterm::terminal::{self, Clear, ClearType};
@@ -236,12 +237,16 @@ pub struct LiveSpinner {
 }
 
 impl LiveSpinner {
-    pub fn start(label: impl Into<String>, theme: ColorTheme) -> io::Result<Self> {
+    pub fn start(
+        label: impl Into<String>,
+        theme: ColorTheme,
+        footer_store: Option<FooterStore>,
+    ) -> io::Result<Self> {
         let label = label.into();
         let (stop_tx, stop_rx) = mpsc::channel();
         let join_handle = thread::Builder::new()
             .name("claw-live-spinner".to_string())
-            .spawn(move || animate_spinner(label, theme, stop_rx))
+            .spawn(move || animate_spinner(label, theme, footer_store, stop_rx))
             .map_err(io::Error::other)?;
 
         Ok(Self {
@@ -272,19 +277,38 @@ impl Drop for LiveSpinner {
     }
 }
 
-fn animate_spinner(label: String, theme: ColorTheme, stop_rx: Receiver<()>) -> io::Result<()> {
+fn animate_spinner(
+    label: String,
+    theme: ColorTheme,
+    footer_store: Option<FooterStore>,
+    stop_rx: Receiver<()>,
+) -> io::Result<()> {
     let mut spinner = Spinner::new();
     let started_at = Instant::now();
     let mut stdout = io::stdout();
 
     loop {
-        if let Some((activity_row, _input_row)) = activity_cursor_rows() {
+        if let Some((activity_row, input_row)) = activity_cursor_rows() {
             // Keep the terminal cursor parked in the composer while the
             // activity line is redrawn above it. The saved position is the
             // composer position established by `LineEditor::begin_working`.
             write!(stdout, "\x1b7")?;
             queue!(stdout, MoveTo(0, activity_row))?;
             spinner.tick_elapsed(&label, started_at.elapsed(), &theme, &mut stdout)?;
+            if let Some(footer) = footer_store
+                .as_ref()
+                .and_then(|store| store.lock().ok().map(|footer| footer.clone()))
+            {
+                // The footer is the last row, below the composer. Render it
+                // in this same buffered frame so live token/cost changes do
+                // not race the spinner or move the parked cursor.
+                queue!(
+                    stdout,
+                    MoveTo(0, input_row.saturating_add(1)),
+                    Clear(ClearType::CurrentLine),
+                    Print(footer)
+                )?;
+            }
             write!(stdout, "\x1b8")?;
             stdout.flush()?;
         } else {
@@ -328,10 +352,11 @@ impl ActivityIndicator {
         label: &str,
         theme: ColorTheme,
         animated: bool,
+        footer_store: Option<FooterStore>,
         out: &mut impl Write,
     ) -> io::Result<Self> {
         if animated {
-            Ok(Self::Live(LiveSpinner::start(label, theme)?))
+            Ok(Self::Live(LiveSpinner::start(label, theme, footer_store)?))
         } else {
             let mut spinner = Spinner::new();
             spinner.tick(label, &theme, out)?;

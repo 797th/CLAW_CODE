@@ -1172,14 +1172,7 @@ fn prompt_text(label: &str, default: Option<&str>) -> io::Result<String> {
         print!(": ");
         io::stdout().flush()?;
 
-        let mut input = String::new();
-        let bytes_read = io::stdin().read_line(&mut input)?;
-        if bytes_read == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "provider setup cancelled",
-            ));
-        }
+        let input = read_line_with_escape()?;
         let value = input.trim();
         if value.is_empty() {
             if let Some(default) = default.filter(|value| !value.is_empty()) {
@@ -1189,6 +1182,82 @@ fn prompt_text(label: &str, default: Option<&str>) -> io::Result<String> {
             continue;
         }
         return Ok(value.to_string());
+    }
+}
+
+/// Read a visible interactive value while treating Escape as cancellation.
+/// The provider setup flow normally runs in a TTY, but the line-oriented
+/// fallback keeps tests and piped invocations working as before.
+fn read_line_with_escape() -> io::Result<String> {
+    use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+
+    if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
+        let mut input = String::new();
+        let bytes_read = io::stdin().read_line(&mut input)?;
+        if bytes_read == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "interactive prompt cancelled",
+            ));
+        }
+        return Ok(input);
+    }
+
+    crossterm::terminal::enable_raw_mode().map_err(io::Error::other)?;
+    let result = (|| {
+        let mut value = String::new();
+        loop {
+            let event = event::read().map_err(io::Error::other)?;
+            let Event::Key(key) = event else {
+                if let Event::Paste(text) = event {
+                    value.push_str(&text);
+                    print!("{text}");
+                    io::stdout().flush()?;
+                }
+                continue;
+            };
+            if key.kind != KeyEventKind::Press {
+                continue;
+            }
+            match key.code {
+                KeyCode::Enter => {
+                    println!();
+                    break Ok(value);
+                }
+                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    println!();
+                    break Err(io::Error::new(
+                        io::ErrorKind::Interrupted,
+                        "interactive prompt cancelled",
+                    ));
+                }
+                KeyCode::Esc => {
+                    println!();
+                    break Err(io::Error::new(
+                        io::ErrorKind::Interrupted,
+                        "interactive prompt cancelled",
+                    ));
+                }
+                KeyCode::Char(character) => {
+                    value.push(character);
+                    print!("{character}");
+                    io::stdout().flush()?;
+                }
+                KeyCode::Backspace => {
+                    if value.pop().is_some() {
+                        print!("\x08 \x08");
+                        io::stdout().flush()?;
+                    }
+                }
+                _ => {}
+            }
+        }
+    })();
+    let restore_result = crossterm::terminal::disable_raw_mode().map_err(io::Error::other);
+    match (result, restore_result) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(_), Err(error)) | (Err(_), Err(error)) => Err(error),
     }
 }
 
@@ -3889,6 +3958,132 @@ fn format_repl_footer(model: &str, permission_mode: PermissionMode, usage: Token
         style_ui(&cost, muted, false),
         input::styled_permission_segment(permission_mode.as_str()),
     )
+}
+
+fn add_token_usage(left: TokenUsage, right: TokenUsage) -> TokenUsage {
+    TokenUsage {
+        input_tokens: left.input_tokens.saturating_add(right.input_tokens),
+        output_tokens: left.output_tokens.saturating_add(right.output_tokens),
+        cache_creation_input_tokens: left
+            .cache_creation_input_tokens
+            .saturating_add(right.cache_creation_input_tokens),
+        cache_read_input_tokens: left
+            .cache_read_input_tokens
+            .saturating_add(right.cache_read_input_tokens),
+    }
+}
+
+#[derive(Debug, Clone)]
+struct LiveUsageReporter {
+    state: Arc<Mutex<LiveUsageState>>,
+}
+
+#[derive(Debug)]
+struct LiveUsageState {
+    base_usage: TokenUsage,
+    turn_usage: TokenUsage,
+    in_flight_output_tokens: u32,
+    model: String,
+    permission_mode: PermissionMode,
+    footer_store: input::FooterStore,
+}
+
+impl LiveUsageReporter {
+    fn new(footer_store: input::FooterStore) -> Self {
+        Self {
+            state: Arc::new(Mutex::new(LiveUsageState {
+                base_usage: TokenUsage::default(),
+                turn_usage: TokenUsage::default(),
+                in_flight_output_tokens: 0,
+                model: String::new(),
+                permission_mode: PermissionMode::Prompt,
+                footer_store,
+            })),
+        }
+    }
+
+    fn footer_store(&self) -> input::FooterStore {
+        self.state
+            .lock()
+            .expect("live usage state should not be poisoned")
+            .footer_store
+            .clone()
+    }
+
+    fn begin_turn(&self, model: &str, permission_mode: PermissionMode, base_usage: TokenUsage) {
+        {
+            let mut state = self
+                .state
+                .lock()
+                .expect("live usage state should not be poisoned");
+            state.base_usage = base_usage;
+            state.turn_usage = TokenUsage::default();
+            state.in_flight_output_tokens = 0;
+            state.model = model.to_string();
+            state.permission_mode = permission_mode;
+        }
+        self.publish();
+    }
+
+    /// Add a provider-reported usage sample for the completed model response
+    /// and replace the temporary output estimate shown while it streamed.
+    fn record_usage(&self, usage: TokenUsage) {
+        {
+            let mut state = self
+                .state
+                .lock()
+                .expect("live usage state should not be poisoned");
+            state.turn_usage = add_token_usage(state.turn_usage, usage);
+            state.in_flight_output_tokens = 0;
+        }
+        self.publish();
+    }
+
+    /// Keep the footer moving before the provider sends its final usage event.
+    /// Four visible characters are a conservative terminal-side token estimate;
+    /// the next provider usage event replaces it with the authoritative count.
+    fn record_output_estimate(&self, text: &str) {
+        let estimated = text.chars().count().saturating_add(3) / 4;
+        if estimated == 0 {
+            return;
+        }
+        {
+            let mut state = self
+                .state
+                .lock()
+                .expect("live usage state should not be poisoned");
+            state.in_flight_output_tokens = state
+                .in_flight_output_tokens
+                .saturating_add(u32::try_from(estimated).unwrap_or(u32::MAX));
+        }
+        self.publish();
+    }
+
+    fn publish(&self) {
+        let (footer_store, footer) = {
+            let state = self
+                .state
+                .lock()
+                .expect("live usage state should not be poisoned");
+            let usage = add_token_usage(
+                state.base_usage,
+                add_token_usage(
+                    state.turn_usage,
+                    TokenUsage {
+                        output_tokens: state.in_flight_output_tokens,
+                        ..TokenUsage::default()
+                    },
+                ),
+            );
+            (
+                state.footer_store.clone(),
+                format_repl_footer(&state.model, state.permission_mode, usage),
+            )
+        };
+        if let Ok(mut shared_footer) = footer_store.lock() {
+            *shared_footer = footer;
+        };
+    }
 }
 
 const SUPERPOWERS_CHECKLIST: &[&str] = &[
@@ -7971,6 +8166,8 @@ fn run_repl(
         format_repl_prompt(&cli.model, cli.permission_mode),
         cli.repl_completion_candidates().unwrap_or_default(),
     );
+    let live_usage_reporter = LiveUsageReporter::new(editor.footer_store());
+    cli.set_live_usage_reporter(live_usage_reporter.clone());
     if cli.is_connected() {
         println!("{}", cli.startup_banner());
         println!("{}", format_connected_line(&cli.model));
@@ -8029,6 +8226,11 @@ fn run_repl(
                         if let Some(prompt) = repl_command_model_prompt(&command) {
                             editor.push_history(input);
                             cli.record_prompt_history(&trimmed);
+                            live_usage_reporter.begin_turn(
+                                &cli.model,
+                                cli.permission_mode,
+                                cli.runtime.usage().cumulative_usage(),
+                            );
                             editor.begin_working()?;
                             if is_superpowers_invocation(&prompt) {
                                 print_superpowers_checklist();
@@ -8052,6 +8254,11 @@ fn run_repl(
                 if let Some(prompt) = try_resolve_bare_skill_prompt(&cwd, &trimmed) {
                     editor.push_history(input);
                     cli.record_prompt_history(&trimmed);
+                    live_usage_reporter.begin_turn(
+                        &cli.model,
+                        cli.permission_mode,
+                        cli.runtime.usage().cumulative_usage(),
+                    );
                     editor.begin_working()?;
                     if is_superpowers_invocation(&prompt) {
                         print_superpowers_checklist();
@@ -8061,6 +8268,11 @@ fn run_repl(
                 }
                 editor.push_history(input);
                 cli.record_prompt_history(&trimmed);
+                live_usage_reporter.begin_turn(
+                    &cli.model,
+                    cli.permission_mode,
+                    cli.runtime.usage().cumulative_usage(),
+                );
                 editor.begin_working()?;
                 cli.run_turn(&trimmed)?;
             }
@@ -8102,6 +8314,7 @@ struct LiveCli {
     runtime: BuiltRuntime,
     session: SessionHandle,
     prompt_history: Vec<PromptHistoryEntry>,
+    live_usage_reporter: Option<LiveUsageReporter>,
 }
 
 /// Fires the `SessionEnd` lifecycle hook, fire-and-forget, whenever a
@@ -8635,6 +8848,7 @@ impl LiveCli {
             runtime,
             session,
             prompt_history: Vec::new(),
+            live_usage_reporter: None,
         };
         cli.persist_session()?;
         Ok(cli)
@@ -8644,6 +8858,13 @@ impl LiveCli {
         if let Some(rt) = self.runtime.runtime.as_mut() {
             rt.api_client_mut().set_reasoning_effort(effort);
         }
+    }
+
+    fn set_live_usage_reporter(&mut self, reporter: LiveUsageReporter) {
+        self.live_usage_reporter = Some(reporter.clone());
+        self.runtime
+            .api_client_mut()
+            .set_live_usage_reporter(Some(reporter));
     }
 
     /// Whether the live runtime has real credentials configured. False until
@@ -8668,7 +8889,14 @@ impl LiveCli {
             return Ok(false);
         }
         let preferred_model = self.model.clone();
-        let setup = prompt_for_provider_setup(&preferred_model)?;
+        let setup = match prompt_for_provider_setup(&preferred_model) {
+            Ok(setup) => setup,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {
+                println!("Login cancelled.");
+                return Ok(false);
+            }
+            Err(error) => return Err(error.into()),
+        };
         let cwd = env::current_dir()?;
         let config_home = ConfigLoader::default_for(cwd).config_home().to_path_buf();
         persist_provider_setup(&config_home, &setup)?;
@@ -8757,8 +8985,8 @@ impl LiveCli {
         let shift_enter = style_ui("Shift+Enter", accent, true);
         let logo = style_ui(CUTE_CLAW_LOGO, accent, true);
         format!(
-            "{logo}\n\
-{top} {brand}\n\
+            "{top} {brand}\n\
+{logo}\n\
 {bottom} {help} commands · {status} context · {resume} restore\n\
    {tab} completes commands, models, sessions, and paths · Shift+Tab permission mode · {shift_enter} newline",
         )
@@ -8807,7 +9035,7 @@ impl LiveCli {
         if let Some(banner) = self.workflow_status_banner() {
             system_prompt.push(banner);
         }
-        let runtime = build_runtime(
+        let mut runtime = build_runtime(
             self.runtime.session().clone(),
             &self.session.id,
             self.model.clone(),
@@ -8817,8 +9045,11 @@ impl LiveCli {
             self.allowed_tools.clone(),
             self.permission_mode,
             None,
-        )?
-        .with_hook_abort_signal(hook_abort_signal.clone());
+        )?;
+        runtime
+            .api_client_mut()
+            .set_live_usage_reporter(self.live_usage_reporter.clone());
+        let runtime = runtime.with_hook_abort_signal(hook_abort_signal.clone());
         let hook_abort_monitor = HookAbortMonitor::spawn(hook_abort_signal);
 
         Ok((runtime, hook_abort_monitor))
@@ -8977,6 +9208,9 @@ impl LiveCli {
             "Working",
             *renderer.color_theme(),
             clean_interactive_output && stdout.is_terminal(),
+            self.live_usage_reporter
+                .as_ref()
+                .map(LiveUsageReporter::footer_store),
             &mut stdout,
         )?;
         let mut permission_prompter = CliPermissionPrompter::new(self.permission_mode);
@@ -9664,8 +9898,14 @@ impl LiveCli {
                 print!("  Provider/model   ");
                 io::stdout().flush()?;
 
-                let mut input = String::new();
-                io::stdin().read_line(&mut input)?;
+                let input = match read_line_with_escape() {
+                    Ok(input) => input,
+                    Err(error) if error.kind() == io::ErrorKind::Interrupted => {
+                        println!("Model selection cancelled.");
+                        return Ok(false);
+                    }
+                    Err(error) => return Err(error.into()),
+                };
                 let model = input.trim();
                 if model.is_empty() {
                     println!("Model unchanged.");
@@ -14172,6 +14412,7 @@ struct AnthropicRuntimeClient {
     allowed_tools: Option<AllowedToolSet>,
     tool_registry: GlobalToolRegistry,
     progress_reporter: Option<InternalPromptProgressReporter>,
+    live_usage_reporter: Option<LiveUsageReporter>,
     reasoning_effort: Option<String>,
 }
 
@@ -14252,12 +14493,17 @@ impl AnthropicRuntimeClient {
             allowed_tools,
             tool_registry,
             progress_reporter,
+            live_usage_reporter: None,
             reasoning_effort: None,
         })
     }
 
     fn set_reasoning_effort(&mut self, effort: Option<String>) {
         self.reasoning_effort = effort;
+    }
+
+    fn set_live_usage_reporter(&mut self, reporter: Option<LiveUsageReporter>) {
+        self.live_usage_reporter = reporter;
     }
 
     /// True when this client was built without real credentials. The REPL
@@ -14447,6 +14693,9 @@ impl AnthropicRuntimeClient {
                 ApiStreamEvent::ContentBlockDelta(delta) => match delta.delta {
                     ContentBlockDelta::TextDelta { text } => {
                         if !text.is_empty() {
+                            if let Some(live_usage_reporter) = &self.live_usage_reporter {
+                                live_usage_reporter.record_output_estimate(&text);
+                            }
                             if let Some(progress_reporter) = &self.progress_reporter {
                                 progress_reporter.mark_text_phase(&text);
                             }
@@ -14464,6 +14713,9 @@ impl AnthropicRuntimeClient {
                         }
                     }
                     ContentBlockDelta::ThinkingDelta { thinking } => {
+                        if let Some(live_usage_reporter) = &self.live_usage_reporter {
+                            live_usage_reporter.record_output_estimate(&thinking);
+                        }
                         if !block_has_thinking_summary {
                             render_thinking_block_summary(out, None, false)?;
                             block_has_thinking_summary = true;
@@ -14506,7 +14758,11 @@ impl AnthropicRuntimeClient {
                     }
                 }
                 ApiStreamEvent::MessageDelta(delta) => {
-                    events.push(AssistantEvent::Usage(delta.usage.token_usage()));
+                    let usage = delta.usage.token_usage();
+                    if let Some(live_usage_reporter) = &self.live_usage_reporter {
+                        live_usage_reporter.record_usage(usage);
+                    }
+                    events.push(AssistantEvent::Usage(usage));
                 }
                 ApiStreamEvent::MessageStop(_) => {
                     saw_stop = true;
@@ -14549,6 +14805,13 @@ impl AnthropicRuntimeClient {
                 RuntimeError::new(format_user_visible_api_error(&self.session_id, &error))
             })?;
         let mut events = response_to_events(response, out)?;
+        if let Some(live_usage_reporter) = &self.live_usage_reporter {
+            for event in &events {
+                if let AssistantEvent::Usage(usage) = event {
+                    live_usage_reporter.record_usage(*usage);
+                }
+            }
+        }
         push_prompt_cache_record(&self.client, &mut events);
         Ok(events)
     }
@@ -19401,6 +19664,10 @@ mod tests {
         assert!(banner.contains("Shift+Tab permission mode"));
         assert!(banner.contains("( o.o )"));
         assert!(banner.contains("🦞"));
+        assert!(
+            banner.find("Claw Code").unwrap() < banner.find("( o.o )").unwrap(),
+            "the startup figure should appear beneath the brand"
+        );
         assert!(!banner.contains("╭─"));
         assert!(!banner.contains("╰─"));
 
@@ -19536,6 +19803,34 @@ mod tests {
         assert!(footer.contains("$"));
         assert!(footer.contains("plan"));
         assert!(!footer.contains("read-only"));
+    }
+
+    #[test]
+    fn live_usage_reporter_updates_tokens_and_cost_before_turn_finishes() {
+        let footer_store = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let reporter = super::LiveUsageReporter::new(footer_store.clone());
+        reporter.begin_turn(
+            "custom-model",
+            PermissionMode::ReadOnly,
+            runtime::TokenUsage {
+                input_tokens: 1000,
+                ..Default::default()
+            },
+        );
+        reporter.record_output_estimate("streaming response");
+
+        let in_flight = footer_store.lock().expect("footer lock").clone();
+        assert!(in_flight.contains("1005 tok"));
+        assert!(in_flight.contains("plan"));
+        assert!(in_flight.contains("$"));
+
+        reporter.record_usage(runtime::TokenUsage {
+            input_tokens: 20,
+            output_tokens: 5,
+            ..Default::default()
+        });
+        let authoritative = footer_store.lock().expect("footer lock").clone();
+        assert!(authoritative.contains("1025 tok"));
     }
 
     #[test]
