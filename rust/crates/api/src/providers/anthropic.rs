@@ -211,6 +211,19 @@ impl AnthropicClient {
         self
     }
 
+    /// Replace the internal HTTP client with one that respects the given
+    /// timeout configuration. This controls connect and request-level
+    /// timeouts for all outbound API calls.
+    #[must_use]
+    pub fn with_timeout(mut self, timeout: &crate::http_client::TimeoutConfig) -> Self {
+        self.http = crate::http_client::build_http_client_with_opts(
+            &crate::http_client::ProxyConfig::from_env(),
+            timeout,
+        )
+        .unwrap_or_else(|_| reqwest::Client::new());
+        self
+    }
+
     #[must_use]
     pub fn with_session_tracer(mut self, session_tracer: SessionTracer) -> Self {
         self.session_tracer = Some(session_tracer);
@@ -454,7 +467,13 @@ impl AnthropicClient {
                 break;
             }
 
-            tokio::time::sleep(self.jittered_backoff_for_attempt(attempts)?).await;
+            let delay = if let Some(retry_after) = last_error.as_ref().and_then(|e| e.retry_after())
+            {
+                retry_after
+            } else {
+                self.jittered_backoff_for_attempt(attempts)?
+            };
+            tokio::time::sleep(delay).await;
         }
 
         Err(ApiError::RetriesExhausted {
@@ -468,8 +487,7 @@ impl AnthropicClient {
         request: &MessageRequest,
     ) -> Result<reqwest::Response, ApiError> {
         let request_url = format!("{}/v1/messages", self.base_url.trim_end_matches('/'));
-        let mut request_body = self.request_profile.render_json_body(request)?;
-        strip_unsupported_beta_body_fields(&mut request_body);
+        let request_body = render_standard_messages_body(&self.request_profile, request)?;
         let request_builder = self.build_request(&request_url).json(&request_body);
         request_builder.send().await.map_err(ApiError::from)
     }
@@ -529,8 +547,7 @@ impl AnthropicClient {
             "{}/v1/messages/count_tokens",
             self.base_url.trim_end_matches('/')
         );
-        let mut request_body = self.request_profile.render_json_body(request)?;
-        strip_unsupported_beta_body_fields(&mut request_body);
+        let request_body = render_standard_messages_body(&self.request_profile, request)?;
         let response = self
             .build_request(&request_url)
             .json(&request_body)
@@ -600,8 +617,9 @@ fn jitter_for_base(base: Duration) -> Duration {
     }
     let raw_nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|elapsed| u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX))
-        .unwrap_or(0);
+        .map_or(0, |elapsed| {
+            u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX)
+        });
     let tick = JITTER_COUNTER.fetch_add(1, Ordering::Relaxed);
     // splitmix64 finalizer — mixes the low bits so large bases still see
     // jitter across their full range instead of being clamped to subsec nanos.
@@ -856,19 +874,17 @@ impl MessageStream {
             StreamEvent::MessageDelta(MessageDeltaEvent { usage, .. }) => {
                 self.latest_usage = Some(usage.clone());
             }
-            StreamEvent::MessageStop(_) => {
-                if !self.usage_recorded {
-                    if let (Some(prompt_cache), Some(usage)) =
-                        (&self.prompt_cache, self.latest_usage.as_ref())
-                    {
-                        let record = prompt_cache.record_usage(&self.request, usage);
-                        *self
-                            .last_prompt_cache_record
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(record);
-                    }
-                    self.usage_recorded = true;
+            StreamEvent::MessageStop(_) if !self.usage_recorded => {
+                if let (Some(prompt_cache), Some(usage)) =
+                    (&self.prompt_cache, self.latest_usage.as_ref())
+                {
+                    let record = prompt_cache.record_usage(&self.request, usage);
+                    *self
+                        .last_prompt_cache_record
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(record);
                 }
+                self.usage_recorded = true;
             }
             _ => {}
         }
@@ -881,10 +897,12 @@ async fn expect_success(response: reqwest::Response) -> Result<reqwest::Response
         return Ok(response);
     }
 
-    let request_id = request_id_from_headers(response.headers());
+    let headers = response.headers().clone();
+    let request_id = request_id_from_headers(&headers);
     let body = response.text().await.unwrap_or_else(|_| String::new());
     let parsed_error = serde_json::from_str::<AnthropicErrorEnvelope>(&body).ok();
     let retryable = is_retryable_status(status);
+    let retry_after = parse_retry_after(&headers, status);
 
     Err(ApiError::Api {
         status,
@@ -898,11 +916,42 @@ async fn expect_success(response: reqwest::Response) -> Result<reqwest::Response
         body,
         retryable,
         suggested_action: None,
+        retry_after,
     })
+}
+
+fn parse_retry_after(
+    headers: &reqwest::header::HeaderMap,
+    status: reqwest::StatusCode,
+) -> Option<std::time::Duration> {
+    if status != reqwest::StatusCode::TOO_MANY_REQUESTS {
+        return None;
+    }
+    headers
+        .get("retry-after")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(std::time::Duration::from_secs)
 }
 
 const fn is_retryable_status(status: reqwest::StatusCode) -> bool {
     matches!(status.as_u16(), 408 | 409 | 429 | 500 | 502 | 503 | 504)
+}
+
+/// Some providers return HTTP 400 with an unparseable body when a gateway
+/// or proxy flakes (e.g. "HTTP 400 from backend (no parseable body)").
+/// These are transient network blips, not actual bad requests, and should
+/// be retried. We detect them by checking the body for known gateway error
+/// phrases.
+fn is_retryable_400(status: reqwest::StatusCode, body: &str) -> bool {
+    if status != reqwest::StatusCode::BAD_REQUEST {
+        return false;
+    }
+    let lowered = body.to_ascii_lowercase();
+    lowered.contains("no parseable body")
+        || lowered.contains("connection reset")
+        || lowered.contains("broken pipe")
+        || lowered.contains("empty reply from server")
 }
 
 /// Anthropic API keys (`sk-ant-*`) are accepted over the `x-api-key` header
@@ -923,6 +972,8 @@ fn enrich_bearer_auth_error(error: ApiError, auth: &AuthSource) -> ApiError {
         body,
         retryable,
         suggested_action,
+        retry_after,
+        ..
     } = error
     else {
         return error;
@@ -936,6 +987,7 @@ fn enrich_bearer_auth_error(error: ApiError, auth: &AuthSource) -> ApiError {
             body,
             retryable,
             suggested_action,
+            retry_after,
         };
     }
     let Some(bearer_token) = auth.bearer_token() else {
@@ -947,6 +999,7 @@ fn enrich_bearer_auth_error(error: ApiError, auth: &AuthSource) -> ApiError {
             body,
             retryable,
             suggested_action,
+            retry_after,
         };
     };
     if !bearer_token.starts_with("sk-ant-") {
@@ -958,6 +1011,7 @@ fn enrich_bearer_auth_error(error: ApiError, auth: &AuthSource) -> ApiError {
             body,
             retryable,
             suggested_action,
+            retry_after,
         };
     }
     // Only append the hint when the AuthSource is pure BearerToken. If both
@@ -973,6 +1027,7 @@ fn enrich_bearer_auth_error(error: ApiError, auth: &AuthSource) -> ApiError {
             body,
             retryable,
             suggested_action,
+            retry_after,
         };
     }
     let enriched_message = match message {
@@ -987,7 +1042,23 @@ fn enrich_bearer_auth_error(error: ApiError, auth: &AuthSource) -> ApiError {
         body,
         retryable,
         suggested_action,
+        retry_after,
     }
+}
+
+fn anthropic_wire_model(model: &str) -> &str {
+    model.strip_prefix("anthropic/").unwrap_or(model)
+}
+
+fn render_standard_messages_body(
+    request_profile: &AnthropicRequestProfile,
+    request: &MessageRequest,
+) -> Result<Value, serde_json::Error> {
+    let mut wire_request = request.clone();
+    wire_request.model = anthropic_wire_model(&request.model).to_string();
+    let mut body = request_profile.render_json_body(&wire_request)?;
+    strip_unsupported_beta_body_fields(&mut body);
+    Ok(body)
 }
 
 /// Remove beta-only body fields that the standard `/v1/messages` and
@@ -1564,6 +1635,27 @@ mod tests {
     }
 
     #[test]
+    fn standard_messages_body_strips_anthropic_routing_prefix() {
+        let client = AnthropicClient::new("test-key");
+        let request = MessageRequest {
+            model: "anthropic/claude-opus-4-6".to_string(),
+            max_tokens: 64,
+            messages: vec![],
+            system: None,
+            tools: None,
+            tool_choice: None,
+            stream: false,
+            ..Default::default()
+        };
+
+        let rendered = super::render_standard_messages_body(client.request_profile(), &request)
+            .expect("body should render");
+
+        assert_eq!(rendered["model"], serde_json::json!("claude-opus-4-6"));
+        assert!(rendered.get("betas").is_none());
+    }
+
+    #[test]
     fn enrich_bearer_auth_error_appends_sk_ant_hint_on_401_with_pure_bearer_token() {
         // given
         let auth = AuthSource::BearerToken("sk-ant-api03-deadbeef".to_string());
@@ -1575,6 +1667,7 @@ mod tests {
             body: String::new(),
             retryable: false,
             suggested_action: None,
+            retry_after: None,
         };
 
         // when
@@ -1616,6 +1709,7 @@ mod tests {
             body: String::new(),
             retryable: true,
             suggested_action: None,
+            retry_after: None,
         };
 
         // when
@@ -1645,6 +1739,7 @@ mod tests {
             body: String::new(),
             retryable: false,
             suggested_action: None,
+            retry_after: None,
         };
 
         // when
@@ -1673,6 +1768,7 @@ mod tests {
             body: String::new(),
             retryable: false,
             suggested_action: None,
+            retry_after: None,
         };
 
         // when
@@ -1698,6 +1794,7 @@ mod tests {
             body: String::new(),
             retryable: false,
             suggested_action: None,
+            retry_after: None,
         };
 
         // when

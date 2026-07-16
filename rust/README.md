@@ -66,6 +66,11 @@ export ANTHROPIC_BASE_URL="https://your-proxy.com"
 The wizard stores credentials in `~/.claw/.env` (or
 `$CLAW_CONFIG_HOME/.env`) and the selected model in `settings.json`.
 
+For local OpenAI-compatible servers such as Ollama, including Qwen reasoning
+models, see [`../docs/local-openai-compatible-providers.md`](../docs/local-openai-compatible-providers.md).
+Use the exact model tag exposed by the server, for example `qwen3:latest`, and
+prefer `OLLAMA_HOST` for Ollama-specific local routing.
+
 ## Mock parity harness
 
 The workspace now includes a deterministic Anthropic-compatible mock service and a clean-environment CLI harness for end-to-end parity checks.
@@ -113,7 +118,7 @@ Primary artifacts:
 | Sub-agent / agent surfaces | ✅ |
 | Todo tracking | ✅ |
 | Notebook editing | ✅ |
-| CLAUDE.md / project memory | ✅ |
+| CLAUDE.md / CLAW.md / AGENTS.md project memory | ✅ |
 | Config file hierarchy (`.claw.json` + merged config sections) | ✅ |
 | Permission system | ✅ |
 | MCP server lifecycle + inspection | ✅ |
@@ -126,7 +131,7 @@ Primary artifacts:
 | Slash commands (including `/skills`, `/agents`, `/mcp`, `/doctor`, `/plugin`, `/subagent`) | ✅ |
 | Hooks (`/hooks`, config-backed lifecycle hooks) | ✅ |
 | Plugin management surfaces | ✅ |
-| Skills inventory / install surfaces | ✅ |
+| Skills inventory / install / uninstall surfaces | ✅ |
 | Machine-readable JSON output across core CLI surfaces | ✅ |
 
 ## Model Aliases
@@ -151,10 +156,11 @@ cliclaw [OPTIONS] [COMMAND]
 
 Flags:
   --model MODEL
-  --output-format text|json
+  --output-format text|json  (case-insensitive; CLAW_OUTPUT_FORMAT supplies the default, flags override env)
   --permission-mode MODE
-  --dangerously-skip-permissions
-  --allowedTools TOOLS
+  --cwd PATH, -C PATH, --directory PATH
+  --dangerously-skip-permissions, --skip-permissions
+  --allowedTools TOOLS        canonical snake_case names or aliases; status JSON exposes allowed_tools.available/aliases
   --resume [SESSION.jsonl|session-id|latest]
   --version, -V
 
@@ -195,8 +201,8 @@ The REPL now exposes a much broader surface than the original minimal shell:
 - plugin management: `/plugin` (with aliases `/plugins`, `/marketplace`)
 
 Notable claw-first surfaces now available directly in slash form:
-- `/skills [list|install <path>|help]`
-- `/agents [list|help]`
+- `/skills [list|show <name>|install <path>|uninstall <name>|help]`
+- `/agents [list|show <name>|create <name>|help]`
 - `/mcp [list|show <server>|help]`
 - `/doctor`
 - `/plugin [list|install <path>|enable <name>|disable <name>|uninstall <id>|update <id>]`
@@ -213,7 +219,7 @@ rust/
 └── crates/
     ├── api/                # Provider clients + streaming + request preflight
     ├── commands/           # Shared slash-command registry + help rendering
-    ├── compat-harness/     # TS manifest extraction harness
+    ├── compat-harness/     # Compatibility/parity harness utilities
     ├── mock-anthropic-service/ # Deterministic local Anthropic-compatible mock
     ├── plugins/            # Plugin metadata, manager, install/enable/disable surfaces
     ├── runtime/            # Session, config, permissions, MCP, prompts, auth/runtime loop
@@ -226,7 +232,7 @@ rust/
 
 - **api** — provider clients, SSE streaming, request/response types, auth (`ANTHROPIC_API_KEY` + bearer-token support), request-size/context-window preflight
 - **commands** — slash command definitions, parsing, help text generation, JSON/text command rendering
-- **compat-harness** — extracts tool/prompt manifests from upstream TS source
+- **compat-harness** — compatibility and parity helpers for comparing behavior with upstream fixtures
 - **mock-anthropic-service** — deterministic `/v1/messages` mock for CLI parity tests and local harness runs
 - **plugins** — plugin metadata, install/enable/disable/update flows, plugin tool definitions, hook integration surfaces
 - **runtime** — `ConversationRuntime`, config loading, session persistence, permission policy, MCP client lifecycle, system prompt assembly, usage tracking

@@ -1,4 +1,6 @@
+use std::borrow::Cow;
 use std::collections::{BTreeMap, VecDeque};
+use std::net::Ipv4Addr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -14,7 +16,7 @@ use crate::types::{
     ToolChoice, ToolDefinition, ToolResultContentBlock, Usage,
 };
 
-use super::{preflight_message_request, Provider, ProviderFuture};
+use super::{preflight_message_request, resolve_model_alias, Provider, ProviderFuture};
 
 pub const DEFAULT_XAI_BASE_URL: &str = "https://api.x.ai/v1";
 pub const DEFAULT_OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
@@ -49,6 +51,14 @@ const XAI_MAX_REQUEST_BODY_BYTES: usize = 52_428_800; // 50MB
 const OPENAI_MAX_REQUEST_BODY_BYTES: usize = 104_857_600; // 100MB
 const DASHSCOPE_MAX_REQUEST_BODY_BYTES: usize = 6_291_456; // 6MB (observed limit in dogfood)
 const NVIDIA_NIM_MAX_REQUEST_BODY_BYTES: usize = 52_428_800; // 50MB
+
+pub const OLLAMA_CONFIG: OpenAiCompatConfig = OpenAiCompatConfig {
+    provider_name: "Ollama",
+    api_key_env: "OLLAMA_HOST",
+    base_url_env: "OLLAMA_HOST",
+    default_base_url: "http://127.0.0.1:11434/v1",
+    max_request_body_bytes: 104_857_600,
+};
 
 impl OpenAiCompatConfig {
     #[must_use]
@@ -148,18 +158,49 @@ impl OpenAiCompatClient {
     }
 
     pub fn from_env(config: OpenAiCompatConfig) -> Result<Self, ApiError> {
-        let Some(api_key) = read_env_non_empty(config.api_key_env)? else {
-            return Err(ApiError::missing_credentials(
-                config.provider_name,
-                config.credential_env_vars(),
-            ));
+        let base_url = read_base_url(config);
+        let api_key = match read_env_non_empty(config.api_key_env)? {
+            Some(api_key) => api_key,
+            None if config.provider_name == "OpenAI"
+                && is_local_openai_compatible_base_url(&base_url) =>
+            {
+                "local-dev-token".to_string()
+            }
+            None => {
+                return Err(ApiError::missing_credentials(
+                    config.provider_name,
+                    config.credential_env_vars(),
+                ));
+            }
         };
-        Ok(Self::new(api_key, config))
+        Ok(Self::new(api_key, config).with_base_url(base_url))
+    }
+    /// Create an Ollama client from `OLLAMA_HOST` env var.
+    /// Ollama requires no API key; a placeholder is used for the Authorization header.
+    pub fn from_ollama_env() -> Option<Self> {
+        let host =
+            std::env::var("OLLAMA_HOST").unwrap_or_else(|_| "http://127.0.0.1:11434".to_string());
+        let base_url = format!("{}/v1", host.trim_end_matches('/'));
+        Some(Self {
+            http: build_http_client_or_default(),
+            api_key: "ollama".to_string(),
+            config: OLLAMA_CONFIG,
+            base_url,
+            max_retries: DEFAULT_MAX_RETRIES,
+            initial_backoff: DEFAULT_INITIAL_BACKOFF,
+            max_backoff: DEFAULT_MAX_BACKOFF,
+        })
     }
 
     #[must_use]
     pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
         self.base_url = base_url.into();
+        self
+    }
+
+    #[must_use]
+    pub fn with_http_client(mut self, http: reqwest::Client) -> Self {
+        self.http = http;
         self
     }
 
@@ -176,22 +217,35 @@ impl OpenAiCompatClient {
         self
     }
 
+    /// Replace the internal HTTP client with one that respects the given
+    /// timeout configuration.
+    #[must_use]
+    pub fn with_timeout(mut self, timeout: &crate::http_client::TimeoutConfig) -> Self {
+        self.http = crate::http_client::build_http_client_with_opts(
+            &crate::http_client::ProxyConfig::from_env(),
+            timeout,
+        )
+        .unwrap_or_else(|_| reqwest::Client::new());
+        self
+    }
+
     pub async fn send_message(
         &self,
         request: &MessageRequest,
     ) -> Result<MessageResponse, ApiError> {
-        let request = MessageRequest {
+        let original_model = request.model.clone();
+        let canonical = resolve_model_alias(&request.model);
+
+        let mut request = MessageRequest {
             stream: false,
             ..request.clone()
         };
+        request.model = canonical;
+
         preflight_message_request(&request)?;
         let response = self.send_with_retry(&request).await?;
         let request_id = request_id_from_headers(response.headers());
         let body = response.text().await.map_err(ApiError::from)?;
-        // Some backends return {"error":{"message":"...","type":"...","code":...}}
-        // instead of a valid completion object. Check for this before attempting
-        // full deserialization so the user sees the actual error, not a cryptic
-        // "missing field 'id'" parse failure.
         if let Ok(raw) = serde_json::from_str::<serde_json::Value>(&body) {
             if let Some(err_obj) = raw.get("error") {
                 let msg = err_obj
@@ -218,16 +272,18 @@ impl OpenAiCompatClient {
                         reqwest::StatusCode::from_u16(code.unwrap_or(400))
                             .unwrap_or(reqwest::StatusCode::BAD_REQUEST),
                     ),
+                    retry_after: None,
                 });
             }
         }
         let payload = serde_json::from_str::<ChatCompletionResponse>(&body).map_err(|error| {
-            ApiError::json_deserialize(self.config.provider_name, &request.model, &body, error)
+            ApiError::json_deserialize(self.config.provider_name, &original_model, &body, error)
         })?;
         let mut normalized = normalize_response(&request.model, payload)?;
         if normalized.request_id.is_none() {
             normalized.request_id = request_id;
         }
+        normalized.model = original_model;
         Ok(normalized)
     }
 
@@ -235,17 +291,25 @@ impl OpenAiCompatClient {
         &self,
         request: &MessageRequest,
     ) -> Result<MessageStream, ApiError> {
-        preflight_message_request(request)?;
-        let response = self
-            .send_with_retry(&request.clone().with_streaming())
-            .await?;
+        let original_model = request.model.clone();
+        let canonical = resolve_model_alias(&request.model);
+
+        let mut streaming_request = request.clone().with_streaming();
+        streaming_request.model = canonical;
+
+        preflight_message_request(&streaming_request)?;
+        let response = self.send_with_retry(&streaming_request).await?;
+
         Ok(MessageStream {
             request_id: request_id_from_headers(response.headers()),
             response,
-            parser: OpenAiSseParser::with_context(self.config.provider_name, request.model.clone()),
+            parser: OpenAiSseParser::with_context(
+                self.config.provider_name,
+                original_model.clone(),
+            ),
             pending: VecDeque::new(),
             done: false,
-            state: StreamState::new(request.model.clone()),
+            state: StreamState::new(original_model),
         })
     }
 
@@ -271,7 +335,12 @@ impl OpenAiCompatClient {
                 break retryable_error;
             }
 
-            tokio::time::sleep(self.jittered_backoff_for_attempt(attempts)?).await;
+            let delay = if let Some(retry_after) = retryable_error.retry_after() {
+                retry_after
+            } else {
+                self.jittered_backoff_for_attempt(attempts)?
+            };
+            tokio::time::sleep(delay).await;
         };
 
         Err(ApiError::RetriesExhausted {
@@ -285,7 +354,7 @@ impl OpenAiCompatClient {
         request: &MessageRequest,
     ) -> Result<reqwest::Response, ApiError> {
         // Pre-flight check: verify request body size against provider limits
-        check_request_body_size(request, self.config())?;
+        check_request_body_size_for_base_url(request, self.config(), &self.base_url)?;
 
         let request_url = chat_completions_endpoint(&self.base_url);
         self.http
@@ -349,8 +418,9 @@ fn jitter_for_base(base: Duration) -> Duration {
     }
     let raw_nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|elapsed| u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX))
-        .unwrap_or(0);
+        .map_or(0, |elapsed| {
+            u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX)
+        });
     let tick = JITTER_COUNTER.fetch_add(1, Ordering::Relaxed);
     let mut mixed = raw_nanos
         .wrapping_add(tick)
@@ -511,19 +581,21 @@ impl StreamState {
         }
 
         if let Some(usage) = chunk.usage {
-            self.usage = Some(Usage {
-                input_tokens: usage.prompt_tokens,
-                cache_creation_input_tokens: 0,
-                cache_read_input_tokens: 0,
-                output_tokens: usage.completion_tokens,
-            });
+            self.usage = Some(usage.normalized());
         }
 
         for choice in chunk.choices {
+            // Handle reasoning/thinking from various provider fields
             if let Some(reasoning) = choice
                 .delta
                 .reasoning_content
                 .filter(|value| !value.is_empty())
+                .or(choice.delta.reasoning.filter(|value| !value.is_empty()))
+                .or(choice
+                    .delta
+                    .thinking
+                    .and_then(|t| t.content)
+                    .filter(|value| !value.is_empty()))
             {
                 if !self.thinking_started {
                     self.thinking_started = true;
@@ -751,6 +823,7 @@ impl ToolCallState {
 
 #[derive(Debug, Deserialize)]
 struct ChatCompletionResponse {
+    #[serde(default)]
     id: String,
     model: String,
     choices: Vec<ChatChoice>,
@@ -773,6 +846,8 @@ struct ChatMessage {
     #[serde(default)]
     reasoning_content: Option<String>,
     #[serde(default)]
+    reasoning: Option<String>,
+    #[serde(default)]
     tool_calls: Vec<ResponseToolCall>,
 }
 
@@ -794,10 +869,34 @@ struct OpenAiUsage {
     prompt_tokens: u32,
     #[serde(default)]
     completion_tokens: u32,
+    #[serde(default)]
+    prompt_tokens_details: Option<OpenAiPromptTokensDetails>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAiPromptTokensDetails {
+    #[serde(default)]
+    cached_tokens: u32,
+}
+
+impl OpenAiUsage {
+    fn normalized(&self) -> Usage {
+        let cached_tokens = self
+            .prompt_tokens_details
+            .as_ref()
+            .map_or(0, |details| details.cached_tokens);
+        Usage {
+            input_tokens: self.prompt_tokens.saturating_sub(cached_tokens),
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: cached_tokens,
+            output_tokens: self.completion_tokens,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
 struct ChatCompletionChunk {
+    #[serde(default)]
     id: String,
     #[serde(default)]
     model: Option<String>,
@@ -809,6 +908,7 @@ struct ChatCompletionChunk {
 
 #[derive(Debug, Deserialize)]
 struct ChunkChoice {
+    #[serde(default)]
     delta: ChunkDelta,
     #[serde(default)]
     finish_reason: Option<String>,
@@ -818,10 +918,21 @@ struct ChunkChoice {
 struct ChunkDelta {
     #[serde(default)]
     content: Option<String>,
+    /// Some providers (GLM, DeepSeek) emit reasoning in `reasoning_content`
     #[serde(default)]
     reasoning_content: Option<String>,
+    #[serde(default)]
+    reasoning: Option<String>,
+    #[serde(default)]
+    thinking: Option<ThinkingDelta>,
     #[serde(default, deserialize_with = "deserialize_null_as_empty_vec")]
     tool_calls: Vec<DeltaToolCall>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct ThinkingDelta {
+    #[serde(default)]
+    content: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -910,7 +1021,10 @@ fn strip_routing_prefix<'a>(model: &'a str, config: OpenAiCompatConfig, base_url
         let prefix = &model[..pos];
         // Only strip if the prefix before "/" is a known routing prefix,
         // not if "/" appears in the middle of the model name for other reasons.
-        if matches!(prefix, "openai" | "xai" | "grok" | "qwen" | "kimi") {
+        if matches!(
+            prefix,
+            "openai" | "xai" | "grok" | "qwen" | "kimi" | "local"
+        ) {
             &model[pos + 1..]
         } else {
             model
@@ -920,8 +1034,79 @@ fn strip_routing_prefix<'a>(model: &'a str, config: OpenAiCompatConfig, base_url
     }
 }
 
+fn normalize_base_url_for_model_routing(url: &str) -> &str {
+    let trimmed = url.trim_end_matches('/');
+    trimmed
+        .strip_suffix("/chat/completions")
+        .map(|value| value.trim_end_matches('/'))
+        .unwrap_or(trimmed)
+}
+
+fn url_host(url: &str) -> &str {
+    let after_scheme = url.split_once("://").map_or(url, |(_, rest)| rest);
+    let authority = after_scheme.split(['/', '?', '#']).next().unwrap_or("");
+    let host_port = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host_port)| host_port);
+    if host_port.starts_with('[') {
+        return host_port
+            .split(']')
+            .next()
+            .unwrap_or("")
+            .trim_start_matches('[');
+    }
+    host_port.split(':').next().unwrap_or("")
+}
+
+fn is_local_openai_compatible_base_url(url: &str) -> bool {
+    let host = url_host(url.trim());
+    if host.eq_ignore_ascii_case("localhost") || host == "::1" {
+        return true;
+    }
+    let Ok(address) = host.parse::<Ipv4Addr>() else {
+        return false;
+    };
+    let [first, second, ..] = address.octets();
+    matches!(first, 10 | 127)
+        || first == 192 && second == 168
+        || first == 172 && (16..=31).contains(&second)
+}
+
+fn wire_model_for_base_url<'a>(
+    model: &'a str,
+    config: OpenAiCompatConfig,
+    base_url: &str,
+) -> Cow<'a, str> {
+    let Some(pos) = model.find('/') else {
+        return Cow::Borrowed(model);
+    };
+    let prefix = &model[..pos];
+    let lowered_prefix = prefix.to_ascii_lowercase();
+
+    if lowered_prefix == "openai" {
+        let normalized_base_url = normalize_base_url_for_model_routing(base_url);
+        let default_base_url = normalize_base_url_for_model_routing(config.default_base_url);
+        if normalized_base_url.eq_ignore_ascii_case(default_base_url)
+            || is_local_openai_compatible_base_url(base_url)
+        {
+            return Cow::Borrowed(&model[pos + 1..]);
+        }
+        return Cow::Borrowed(model);
+    }
+
+    if matches!(lowered_prefix.as_str(), "xai" | "grok" | "qwen" | "kimi") {
+        return Cow::Borrowed(&model[pos + 1..]);
+    }
+    if lowered_prefix == "local" {
+        return Cow::Borrowed(&model[pos + 1..]);
+    }
+
+    Cow::Borrowed(model)
+}
+
 /// Estimate the serialized JSON size of a request payload in bytes.
 /// This is a pre-flight check to avoid hitting provider-specific size limits.
+#[must_use]
 pub fn estimate_request_body_size(request: &MessageRequest, config: OpenAiCompatConfig) -> usize {
     let payload = build_chat_completion_request(request, config);
     serde_json::to_vec(&payload).map_or(0, |v| v.len())
@@ -934,7 +1119,15 @@ pub fn check_request_body_size(
     request: &MessageRequest,
     config: OpenAiCompatConfig,
 ) -> Result<(), ApiError> {
-    let estimated_bytes = estimate_request_body_size(request, config);
+    check_request_body_size_for_base_url(request, config, &read_base_url(config))
+}
+
+fn check_request_body_size_for_base_url(
+    request: &MessageRequest,
+    config: OpenAiCompatConfig,
+    base_url: &str,
+) -> Result<(), ApiError> {
+    let estimated_bytes = estimate_request_body_size_for_base_url(request, config, base_url);
     let max_bytes = config.max_request_body_bytes;
 
     if estimated_bytes > max_bytes {
@@ -1039,7 +1232,34 @@ fn build_chat_completion_request_for_base_url(
         payload["reasoning_effort"] = json!(effort);
     }
 
+    for (key, value) in &request.extra_body {
+        if is_protected_extra_body_key(key) {
+            continue;
+        }
+        payload[key] = value.clone();
+    }
+
+    // DeepSeek V4 Pro/Flash thinking mode requires this provider-specific opt-in
+    // and also requires assistant reasoning history to be echoed as `reasoning_content`.
+    // Apply it after extra_body so callers cannot accidentally override the required shape.
+    if model_requires_reasoning_content_in_history(wire_model) {
+        payload["thinking"] = json!({"type": "enabled"});
+    }
+
     payload
+}
+
+fn is_protected_extra_body_key(key: &str) -> bool {
+    matches!(
+        key,
+        "model"
+            | "messages"
+            | "stream"
+            | "tools"
+            | "tool_choice"
+            | "max_tokens"
+            | "max_completion_tokens"
+    )
 }
 
 /// Returns true for models that do NOT support the `is_error` field in tool results.
@@ -1083,16 +1303,19 @@ pub fn translate_message(message: &InputMessage, model: &str) -> Vec<Value> {
                     InputContentBlock::ToolResult { .. } => {}
                 }
             }
-            let include_reasoning =
-                model_requires_reasoning_content_in_history(model) && !reasoning.is_empty();
-            if text.is_empty() && tool_calls.is_empty() && !include_reasoning {
+            let needs_reasoning = model_requires_reasoning_content_in_history(model);
+            if text.is_empty() && tool_calls.is_empty() && reasoning.is_empty() {
                 Vec::new()
             } else {
                 let mut msg = serde_json::json!({
                     "role": "assistant",
-                    "content": (!text.is_empty()).then_some(text),
                 });
-                if include_reasoning {
+                if !text.is_empty() {
+                    msg["content"] = json!(text);
+                } else if !needs_reasoning {
+                    msg["content"] = Value::Null;
+                }
+                if needs_reasoning {
                     msg["reasoning_content"] = json!(reasoning);
                 }
                 // Only include tool_calls when non-empty: some providers reject
@@ -1311,6 +1534,7 @@ fn normalize_response(
         .message
         .reasoning_content
         .filter(|value| !value.is_empty())
+        .or(choice.message.reasoning.filter(|value| !value.is_empty()))
     {
         content.push(OutputContentBlock::Thinking {
             thinking,
@@ -1338,18 +1562,10 @@ fn normalize_response(
             .finish_reason
             .map(|value| normalize_finish_reason(&value)),
         stop_sequence: None,
-        usage: Usage {
-            input_tokens: response
-                .usage
-                .as_ref()
-                .map_or(0, |usage| usage.prompt_tokens),
-            cache_creation_input_tokens: 0,
-            cache_read_input_tokens: 0,
-            output_tokens: response
-                .usage
-                .as_ref()
-                .map_or(0, |usage| usage.completion_tokens),
-        },
+        usage: response
+            .usage
+            .as_ref()
+            .map_or_else(Usage::default, OpenAiUsage::normalized),
         request_id: None,
     })
 }
@@ -1395,7 +1611,52 @@ fn parse_sse_frame(
             data_lines.push(data.trim_start());
         }
     }
+    // If no SSE data lines found, check if the entire frame is raw JSON (error or otherwise)
     if data_lines.is_empty() {
+        // Detect raw JSON error response (not SSE-framed)
+        if let Ok(raw) = serde_json::from_str::<serde_json::Value>(trimmed) {
+            if let Some(err_obj) = raw.get("error") {
+                let msg = err_obj
+                    .get("message")
+                    .and_then(|m| m.as_str())
+                    .unwrap_or("provider returned an error")
+                    .to_string();
+                let code = err_obj
+                    .get("code")
+                    .and_then(serde_json::Value::as_u64)
+                    .map(|c| c as u16);
+                let status = reqwest::StatusCode::from_u16(code.unwrap_or(500))
+                    .unwrap_or(reqwest::StatusCode::INTERNAL_SERVER_ERROR);
+                return Err(ApiError::Api {
+                    status,
+                    error_type: err_obj
+                        .get("type")
+                        .and_then(|t| t.as_str())
+                        .map(str::to_owned),
+                    message: Some(msg),
+                    request_id: None,
+                    body: trimmed.chars().take(500).collect(),
+                    retryable: false,
+                    suggested_action: suggested_action_for_status(status),
+                    retry_after: None,
+                });
+            }
+        }
+        // Detect HTML responses
+        if trimmed.starts_with('<') || trimmed.starts_with("<!") {
+            return Err(ApiError::Api {
+                status: reqwest::StatusCode::BAD_REQUEST,
+                error_type: Some("invalid_response".to_string()),
+                message: Some(
+                    "provider returned HTML instead of JSON (check endpoint URL)".to_string(),
+                ),
+                request_id: None,
+                body: trimmed.chars().take(200).collect(),
+                retryable: false,
+                suggested_action: Some("verify the API endpoint URL is correct".to_string()),
+                retry_after: None,
+            });
+        }
         return Ok(None);
     }
     let payload = data_lines.join("\n");
@@ -1429,8 +1690,25 @@ fn parse_sse_frame(
                 body: payload.clone(),
                 retryable: false,
                 suggested_action: suggested_action_for_status(status),
+                retry_after: None,
             });
         }
+    }
+    // Detect HTML or other non-JSON responses early for better error messages
+    let trimmed_payload = payload.trim();
+    if trimmed_payload.starts_with('<') || trimmed_payload.starts_with("<!") {
+        return Err(ApiError::Api {
+            status: reqwest::StatusCode::BAD_REQUEST,
+            error_type: Some("invalid_response".to_string()),
+            message: Some(
+                "provider returned HTML instead of JSON (check endpoint URL)".to_string(),
+            ),
+            request_id: None,
+            body: payload.chars().take(200).collect(),
+            retryable: false,
+            suggested_action: Some("verify the API endpoint URL is correct".to_string()),
+            retry_after: None,
+        });
     }
     serde_json::from_str::<ChatCompletionChunk>(&payload)
         .map(Some)
@@ -1492,10 +1770,12 @@ async fn expect_success(response: reqwest::Response) -> Result<reqwest::Response
         return Ok(response);
     }
 
-    let request_id = request_id_from_headers(response.headers());
+    let headers = response.headers().clone();
+    let request_id = request_id_from_headers(&headers);
     let body = response.text().await.unwrap_or_default();
     let parsed_error = serde_json::from_str::<ErrorEnvelope>(&body).ok();
     let retryable = is_retryable_status(status);
+    let retry_after = parse_retry_after(&headers, status);
 
     let suggested_action = suggested_action_for_status(status);
 
@@ -1511,11 +1791,41 @@ async fn expect_success(response: reqwest::Response) -> Result<reqwest::Response
         body,
         retryable,
         suggested_action,
+        retry_after,
     })
+}
+
+fn parse_retry_after(
+    headers: &reqwest::header::HeaderMap,
+    status: reqwest::StatusCode,
+) -> Option<std::time::Duration> {
+    if status != reqwest::StatusCode::TOO_MANY_REQUESTS {
+        return None;
+    }
+    headers
+        .get("retry-after")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(std::time::Duration::from_secs)
 }
 
 const fn is_retryable_status(status: reqwest::StatusCode) -> bool {
     matches!(status.as_u16(), 408 | 409 | 429 | 500 | 502 | 503 | 504)
+}
+
+/// Some providers return HTTP 400 with an unparseable body when a gateway
+/// or proxy flakes (e.g. "HTTP 400 from backend (no parseable body)").
+/// These are transient network blips, not actual bad requests, and should
+/// be retried.
+fn is_retryable_400(status: reqwest::StatusCode, body: &str) -> bool {
+    if status != reqwest::StatusCode::BAD_REQUEST {
+        return false;
+    }
+    let lowered = body.to_ascii_lowercase();
+    lowered.contains("no parseable body")
+        || lowered.contains("connection reset")
+        || lowered.contains("broken pipe")
+        || lowered.contains("empty reply from server")
 }
 
 /// Generate a suggested user action based on the HTTP status code and error context.
@@ -1570,6 +1880,8 @@ mod tests {
         ToolChoice, ToolDefinition, ToolResultContentBlock,
     };
     use serde_json::json;
+    use std::borrow::Cow;
+    use std::collections::BTreeMap;
     use std::sync::{Mutex, OnceLock};
 
     #[test]
@@ -1668,6 +1980,31 @@ mod tests {
     }
 
     #[test]
+    fn deepseek_v4_assistant_with_only_tool_calls_omits_content_and_includes_reasoning() {
+        let request = MessageRequest {
+            model: "deepseek-v4-pro".to_string(),
+            max_tokens: 100,
+            messages: vec![InputMessage {
+                role: "assistant".to_string(),
+                content: vec![InputContentBlock::ToolUse {
+                    id: "call_1".to_string(),
+                    name: "get_weather".to_string(),
+                    input: json!({"city": "Paris"}),
+                }],
+            }],
+            stream: false,
+            ..Default::default()
+        };
+
+        let payload = build_chat_completion_request(&request, OpenAiCompatConfig::openai());
+        let assistant = &payload["messages"][0];
+
+        assert!(assistant.get("content").is_none());
+        assert_eq!(assistant["reasoning_content"], json!(""));
+        assert_eq!(assistant["tool_calls"].as_array().map(Vec::len), Some(1));
+    }
+
+    #[test]
     fn deepseek_v4_flash_request_includes_reasoning_content_for_assistant_history() {
         // Given an assistant history turn containing thinking.
         let request = assistant_history_with_thinking_request("deepseek-v4-flash");
@@ -1691,6 +2028,7 @@ mod tests {
                     role: "assistant".to_string(),
                     content: Some("final answer".to_string()),
                     reasoning_content: Some("hidden thought".to_string()),
+                    reasoning: None,
                     tool_calls: Vec::new(),
                 },
                 finish_reason: Some("stop".to_string()),
@@ -1728,6 +2066,8 @@ mod tests {
                     delta: super::ChunkDelta {
                         content: None,
                         reasoning_content: Some("think".to_string()),
+                        reasoning: None,
+                        thinking: None,
                         tool_calls: Vec::new(),
                     },
                     finish_reason: None,
@@ -1744,6 +2084,8 @@ mod tests {
                         delta: super::ChunkDelta {
                             content: Some(" answer".to_string()),
                             reasoning_content: None,
+                            reasoning: None,
+                            thinking: None,
                             tool_calls: Vec::new(),
                         },
                         finish_reason: Some("stop".to_string()),
@@ -1852,6 +2194,49 @@ mod tests {
     }
 
     #[test]
+    fn deepseek_v4_request_includes_thinking_parameter() {
+        let payload = build_chat_completion_request(
+            &MessageRequest {
+                model: "deepseek-v4-pro".to_string(),
+                max_tokens: 1024,
+                messages: vec![InputMessage::user_text("hello")],
+                ..Default::default()
+            },
+            OpenAiCompatConfig::openai(),
+        );
+        assert_eq!(payload["thinking"], json!({"type": "enabled"}));
+        assert_eq!(payload["model"], json!("deepseek-v4-pro"));
+
+        let mut extra_body = BTreeMap::new();
+        extra_body.insert("thinking".to_string(), json!({"type": "disabled"}));
+        let payload_with_override = build_chat_completion_request(
+            &MessageRequest {
+                model: "openai/deepseek-v4-flash".to_string(),
+                max_tokens: 1024,
+                messages: vec![InputMessage::user_text("hello")],
+                extra_body,
+                ..Default::default()
+            },
+            OpenAiCompatConfig::openai(),
+        );
+        assert_eq!(
+            payload_with_override["thinking"],
+            json!({"type": "enabled"})
+        );
+
+        let non_deepseek_payload = build_chat_completion_request(
+            &MessageRequest {
+                model: "gpt-4o".to_string(),
+                max_tokens: 64,
+                messages: vec![InputMessage::user_text("hello")],
+                ..Default::default()
+            },
+            OpenAiCompatConfig::openai(),
+        );
+        assert!(non_deepseek_payload.get("thinking").is_none());
+    }
+
+    #[test]
     fn reasoning_effort_omitted_when_not_set() {
         let payload = build_chat_completion_request(
             &MessageRequest {
@@ -1936,6 +2321,28 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn local_openai_base_url_does_not_require_api_key() {
+        let _lock = env_lock();
+        let original_base_url = std::env::var_os("OPENAI_BASE_URL");
+        let original_api_key = std::env::var_os("OPENAI_API_KEY");
+        std::env::set_var("OPENAI_BASE_URL", "http://127.0.0.1:11434/v1");
+        std::env::remove_var("OPENAI_API_KEY");
+
+        let client = OpenAiCompatClient::from_env(OpenAiCompatConfig::openai())
+            .expect("local OpenAI-compatible endpoint should not require an API key");
+        assert_eq!(client.base_url(), "http://127.0.0.1:11434/v1");
+
+        match original_base_url {
+            Some(value) => std::env::set_var("OPENAI_BASE_URL", value),
+            None => std::env::remove_var("OPENAI_BASE_URL"),
+        }
+        match original_api_key {
+            Some(value) => std::env::set_var("OPENAI_API_KEY", value),
+            None => std::env::remove_var("OPENAI_API_KEY"),
+        }
     }
 
     #[test]
@@ -2049,6 +2456,7 @@ mod tests {
             presence_penalty: Some(0.3),
             stop: Some(vec!["\n".to_string()]),
             reasoning_effort: None,
+            extra_body: BTreeMap::new(),
         };
         let payload = build_chat_completion_request(&request, OpenAiCompatConfig::openai());
         assert_eq!(payload["temperature"], 0.7);
@@ -2056,6 +2464,39 @@ mod tests {
         assert_eq!(payload["frequency_penalty"], 0.5);
         assert_eq!(payload["presence_penalty"], 0.3);
         assert_eq!(payload["stop"], json!(["\n"]));
+    }
+
+    #[test]
+    fn extra_body_params_are_passed_through_without_overriding_core_fields() {
+        let mut extra_body = BTreeMap::new();
+        extra_body.insert(
+            "web_search_options".to_string(),
+            json!({"search_context_size": "medium"}),
+        );
+        extra_body.insert("parallel_tool_calls".to_string(), json!(false));
+        extra_body.insert("model".to_string(), json!("bad-override"));
+        extra_body.insert("messages".to_string(), json!([]));
+        extra_body.insert("max_tokens".to_string(), json!(1));
+
+        let payload = build_chat_completion_request(
+            &MessageRequest {
+                model: "gpt-4o".to_string(),
+                max_tokens: 1024,
+                messages: vec![InputMessage::user_text("hello")],
+                extra_body,
+                ..Default::default()
+            },
+            OpenAiCompatConfig::openai(),
+        );
+
+        assert_eq!(payload["model"], json!("gpt-4o"));
+        assert_eq!(payload["max_tokens"], json!(1024));
+        assert_eq!(payload["messages"].as_array().map(Vec::len), Some(1));
+        assert_eq!(
+            payload["web_search_options"],
+            json!({"search_context_size": "medium"})
+        );
+        assert_eq!(payload["parallel_tool_calls"], json!(false));
     }
 
     #[test]
@@ -2562,6 +3003,66 @@ mod tests {
             }
             _ => panic!("expected RequestBodySizeExceeded error, got {err:?}"),
         }
+    }
+
+    #[test]
+    fn wire_model_strips_openai_prefix_for_default_and_local_preserves_custom_gateways() {
+        assert_eq!(
+            super::wire_model_for_base_url(
+                "openai/gpt-4o",
+                OpenAiCompatConfig::openai(),
+                super::DEFAULT_OPENAI_BASE_URL,
+            ),
+            Cow::Borrowed("gpt-4o")
+        );
+        assert_eq!(
+            super::wire_model_for_base_url(
+                "openai/qwen2.5-coder:7b",
+                OpenAiCompatConfig::openai(),
+                "http://127.0.0.1:11434/v1",
+            ),
+            Cow::Borrowed("qwen2.5-coder:7b")
+        );
+        assert_eq!(
+            super::wire_model_for_base_url(
+                "openai/llama3.2",
+                OpenAiCompatConfig::openai(),
+                "http://localhost:11434/v1/chat/completions",
+            ),
+            Cow::Borrowed("llama3.2")
+        );
+        assert_eq!(
+            super::wire_model_for_base_url(
+                "openai/gpt-4.1-mini",
+                OpenAiCompatConfig::openai(),
+                "https://openrouter.ai/api/v1",
+            ),
+            Cow::Borrowed("openai/gpt-4.1-mini")
+        );
+        assert_eq!(
+            super::wire_model_for_base_url(
+                "openai/gpt-4.1-mini",
+                OpenAiCompatConfig::openai(),
+                "https://not-localhost.example.com/v1",
+            ),
+            Cow::Borrowed("openai/gpt-4.1-mini")
+        );
+    }
+
+    #[test]
+    fn local_routing_prefix_strips_only_escape_hatch() {
+        assert_eq!(
+            super::strip_routing_prefix("local/Qwen/Qwen3.6-27B-FP8"),
+            "Qwen/Qwen3.6-27B-FP8"
+        );
+        assert_eq!(
+            super::wire_model_for_base_url(
+                "local/Qwen/Qwen3.6-27B-FP8",
+                OpenAiCompatConfig::openai(),
+                "http://127.0.0.1:8000/v1",
+            ),
+            Cow::Borrowed("Qwen/Qwen3.6-27B-FP8")
+        );
     }
 
     #[test]

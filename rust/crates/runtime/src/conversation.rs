@@ -204,6 +204,13 @@ where
         self
     }
 
+    /// Update the auto-compaction threshold after construction. This allows the
+    /// caller to tune the threshold based on runtime information (e.g., the
+    /// server-returned context window size from a 400 error).
+    pub fn set_auto_compaction_input_tokens_threshold(&mut self, threshold: u32) {
+        self.auto_compaction_input_tokens_threshold = threshold;
+    }
+
     #[must_use]
     pub fn with_hook_abort_signal(mut self, hook_abort_signal: HookAbortSignal) -> Self {
         self.hook_abort_signal = hook_abort_signal;
@@ -342,6 +349,7 @@ where
         let mut tool_results = Vec::new();
         let mut prompt_cache_events = Vec::new();
         let mut iterations = 0;
+        let mut auto_compaction = None;
 
         loop {
             iterations += 1;
@@ -396,6 +404,12 @@ where
                 .push_message(assistant_message.clone())
                 .map_err(|error| RuntimeError::new(error.to_string()))?;
             assistant_messages.push(assistant_message);
+
+            // Run auto-compaction check before next API call, including on the terminal
+            // (no-tool) iteration, to prevent unbounded session growth (#3106).
+            if let Some(compaction) = self.maybe_auto_compact() {
+                auto_compaction = Some(compaction);
+            }
 
             if pending_tool_uses.is_empty() {
                 break;
@@ -502,8 +516,6 @@ where
                 tool_results.push(result_message);
             }
         }
-
-        let auto_compaction = self.maybe_auto_compact();
 
         let summary = TurnSummary {
             assistant_messages,
