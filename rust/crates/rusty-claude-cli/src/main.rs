@@ -17,6 +17,7 @@
 mod init;
 mod input;
 mod mao;
+mod picker;
 mod render;
 mod setup_wizard;
 
@@ -268,14 +269,14 @@ fn env_model_for_runtime() -> Option<EnvModel> {
         "ANTHROPIC_MODEL",
         "ANTHROPIC_DEFAULT_MODEL",
     ]
-        .into_iter()
-        .find_map(|name| {
-            env::var(name)
-                .ok()
-                .map(|value| value.trim().to_string())
-                .filter(|value| !value.is_empty())
-                .map(|value| EnvModel { name, value })
-        })
+    .into_iter()
+    .find_map(|name| {
+        env::var(name)
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .map(|value| EnvModel { name, value })
+    })
 }
 
 fn max_tokens_for_model(model: &str) -> u32 {
@@ -1069,8 +1070,7 @@ fn credentials_present_for_model(model: &str) -> bool {
         ProviderKind::Xai => api::has_api_key("XAI_API_KEY"),
         ProviderKind::NvidiaNim => api::has_api_key("NVIDIA_API_KEY"),
         ProviderKind::OpenAi => {
-            let credential_env = if api::configured_provider_kind() == Some(ProviderKind::OpenAi)
-            {
+            let credential_env = if api::configured_provider_kind() == Some(ProviderKind::OpenAi) {
                 "OPENAI_API_KEY"
             } else {
                 let canonical = api::resolve_model_alias(model).to_ascii_lowercase();
@@ -1117,9 +1117,7 @@ fn prompt_for_provider_setup(preferred_model: &str) -> io::Result<ProviderSetup>
     println!();
     println!("No API credentials were detected for the selected model.");
     println!("Choose a connection type:");
-    println!(
-        "  1) OpenAI-compatible (recommended) — custom URL plus API key"
-    );
+    println!("  1) OpenAI-compatible (recommended) — custom URL plus API key");
     println!("  2) Anthropic-compatible — custom URL plus API key");
 
     let protocol = loop {
@@ -1283,8 +1281,7 @@ fn setup_default_model(protocol: EndpointProtocol, preferred_model: &str) -> Str
             .unwrap_or(preferred_model),
     };
     if normalized.is_empty()
-        || (protocol == EndpointProtocol::OpenAiCompatible
-            && normalized.starts_with("claude"))
+        || (protocol == EndpointProtocol::OpenAiCompatible && normalized.starts_with("claude"))
         || (protocol == EndpointProtocol::AnthropicCompatible
             && (normalized.starts_with("gpt-") || normalized.starts_with("gpt_")))
     {
@@ -1297,10 +1294,9 @@ fn setup_default_model(protocol: EndpointProtocol, preferred_model: &str) -> Str
 fn normalize_setup_model(protocol: EndpointProtocol, value: &str) -> String {
     let value = value.trim();
     match protocol {
-        EndpointProtocol::OpenAiCompatible => value
-            .strip_prefix("openai/")
-            .unwrap_or(value)
-            .to_string(),
+        EndpointProtocol::OpenAiCompatible => {
+            value.strip_prefix("openai/").unwrap_or(value).to_string()
+        }
         EndpointProtocol::AnthropicCompatible => value
             .strip_prefix("anthropic/")
             .unwrap_or(value)
@@ -2096,7 +2092,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
             "--permission-mode" => {
                 let value = args
                     .get(index + 1)
-                    .ok_or_else(|| "missing_flag_value: missing value for --permission-mode.\nUsage: --permission-mode read-only|workspace-write|danger-full-access".to_string())?;
+                    .ok_or_else(|| "missing_flag_value: missing value for --permission-mode.\nUsage: --permission-mode prompt|read-only|workspace-write|danger-full-access".to_string())?;
                 // #468: track duplicate --permission-mode flags
                 if permission_mode_override.is_some() {
                     push_duplicate_flag("--permission-mode (overwriting previous value)");
@@ -3097,6 +3093,16 @@ fn try_resolve_bare_skill_prompt(cwd: &Path, trimmed: &str) -> Option<String> {
     }
 }
 
+fn repl_command_model_prompt(command: &SlashCommand) -> Option<String> {
+    match command {
+        SlashCommand::Skills { args } => match classify_skills_slash_command(args.as_deref()) {
+            SkillSlashDispatch::Invoke(prompt) => Some(prompt),
+            SkillSlashDispatch::Local => None,
+        },
+        _ => None,
+    }
+}
+
 fn join_optional_args(args: &[String]) -> Option<String> {
     let joined = args.join(" ");
     let trimmed = joined.trim();
@@ -3578,7 +3584,7 @@ fn parse_permission_mode_arg(value: &str) -> Result<PermissionMode, String> {
     normalize_permission_mode(value)
         .ok_or_else(|| {
             format!(
-                "invalid_permission_mode: unsupported permission mode '{value}'.\nUsage: --permission-mode read-only|workspace-write|danger-full-access"
+                "invalid_permission_mode: unsupported permission mode '{value}'.\nUsage: --permission-mode prompt|read-only|workspace-write|danger-full-access"
             )
         })
         .map(permission_mode_from_label)
@@ -3586,6 +3592,7 @@ fn parse_permission_mode_arg(value: &str) -> Result<PermissionMode, String> {
 
 fn permission_mode_from_label(mode: &str) -> PermissionMode {
     match mode {
+        "prompt" | "ask" => PermissionMode::Prompt,
         "read-only" => PermissionMode::ReadOnly,
         "workspace-write" => PermissionMode::WorkspaceWrite,
         "danger-full-access" => PermissionMode::DangerFullAccess,
@@ -3723,26 +3730,11 @@ fn style_ui(text: &str, color: Color, bold: bool) -> String {
     }
 }
 
-fn repl_permission_label(permission_mode: PermissionMode) -> &'static str {
-    match permission_mode {
-        PermissionMode::DangerFullAccess => "full access",
-        PermissionMode::WorkspaceWrite => "workspace write",
-        PermissionMode::ReadOnly => "read-only",
-        PermissionMode::Prompt => "ask before tools",
-        PermissionMode::Allow => "allow",
-    }
-}
-
 fn format_repl_prompt(_model: &str, _permission_mode: PermissionMode) -> String {
-    let muted = Color::Rgb {
-        r: 148,
-        g: 163,
-        b: 184,
-    };
-    format!("{} ", style_ui("╭─", muted, false))
+    input::styled_input_chip()
 }
 
-fn format_repl_footer(model: &str, permission_mode: PermissionMode) -> String {
+fn format_repl_footer(model: &str, permission_mode: PermissionMode, usage: TokenUsage) -> String {
     let accent = Color::Rgb {
         r: 129,
         g: 140,
@@ -3753,13 +3745,46 @@ fn format_repl_footer(model: &str, permission_mode: PermissionMode) -> String {
         g: 163,
         b: 184,
     };
+    let pricing = pricing_for_model(model).unwrap_or_else(ModelPricing::default_sonnet_tier);
+    let cost = format_usd(
+        usage
+            .estimate_cost_usd_with_pricing(pricing)
+            .total_cost_usd(),
+    );
     format!(
-        "{} {} {} {}",
-        style_ui("╰─", muted, false),
+        "{} {} {} {} {} {} {}",
+        style_ui("•", muted, false),
         style_ui(model, accent, false),
         style_ui("·", muted, false),
-        style_ui(repl_permission_label(permission_mode), muted, false),
+        style_ui(&format!("{} tok", usage.total_tokens()), muted, false),
+        style_ui("·", muted, false),
+        style_ui(&cost, muted, false),
+        input::styled_permission_segment(permission_mode.as_str()),
     )
+}
+
+const SUPERPOWERS_CHECKLIST: &[&str] = &[
+    "understand request and constraints",
+    "make a focused implementation plan",
+    "work incrementally with verification",
+    "review the result before handoff",
+];
+
+fn is_superpowers_invocation(prompt: &str) -> bool {
+    prompt
+        .trim()
+        .trim_start_matches('$')
+        .split_whitespace()
+        .next()
+        == Some("superpowers")
+}
+
+fn print_superpowers_checklist() {
+    println!();
+    println!("• Superpowers workflow");
+    for item in SUPERPOWERS_CHECKLIST {
+        println!("  ☐ {item}");
+    }
 }
 
 fn filter_tool_specs(
@@ -6843,6 +6868,13 @@ fn format_auto_compaction_notice(removed: usize) -> String {
     format!("[auto-compacted: removed {removed} messages]")
 }
 
+fn overflow_compaction_target(estimated_tokens: usize, reduction_percent: usize) -> usize {
+    estimated_tokens
+        .saturating_mul(reduction_percent)
+        .saturating_div(100)
+        .max(1)
+}
+
 fn parse_git_status_metadata(status: Option<&str>) -> (Option<PathBuf>, Option<String>) {
     parse_git_status_metadata_for(
         &env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
@@ -7713,9 +7745,17 @@ fn run_repl(
 
     loop {
         editor.set_prompt(format_repl_prompt(&cli.model, cli.permission_mode));
-        editor.set_footer(format_repl_footer(&cli.model, cli.permission_mode));
+        editor.set_permission_mode(cli.permission_mode.as_str());
+        editor.set_footer(cli.repl_footer());
         editor.set_completions(cli.repl_completion_candidates().unwrap_or_default());
-        match editor.read_line()? {
+        let read_outcome = editor.read_line()?;
+        let requested_permission_mode = editor.permission_mode();
+        if requested_permission_mode != cli.permission_mode.as_str() {
+            cli.set_permissions(Some(requested_permission_mode))?;
+            cli.persist_session()?;
+        }
+
+        match read_outcome {
             input::ReadOutcome::Submit(input) => {
                 let trimmed = input.trim().to_string();
                 if trimmed.is_empty() {
@@ -7751,7 +7791,15 @@ fn run_repl(
                 };
                 match SlashCommand::parse_with_commands(&trimmed, &custom_commands) {
                     Ok(Some(command)) => {
-                        if cli.handle_repl_command(command, &custom_commands)? {
+                        if let Some(prompt) = repl_command_model_prompt(&command) {
+                            editor.push_history(input);
+                            cli.record_prompt_history(&trimmed);
+                            editor.begin_working()?;
+                            if is_superpowers_invocation(&prompt) {
+                                print_superpowers_checklist();
+                            }
+                            cli.run_turn(&prompt)?;
+                        } else if cli.handle_repl_command(command, &custom_commands)? {
                             cli.persist_session()?;
                         }
                         continue;
@@ -7769,11 +7817,16 @@ fn run_repl(
                 if let Some(prompt) = try_resolve_bare_skill_prompt(&cwd, &trimmed) {
                     editor.push_history(input);
                     cli.record_prompt_history(&trimmed);
+                    editor.begin_working()?;
+                    if is_superpowers_invocation(&prompt) {
+                        print_superpowers_checklist();
+                    }
                     cli.run_turn(&prompt)?;
                     continue;
                 }
                 editor.push_history(input);
                 cli.record_prompt_history(&trimmed);
+                editor.begin_working()?;
                 cli.run_turn(&trimmed)?;
             }
             input::ReadOutcome::Cancel => {}
@@ -8460,8 +8513,8 @@ impl LiveCli {
             b: 184,
         };
         let brand = style_ui("Claw Code", accent, true);
-        let top = style_ui("╭─", accent, false);
-        let bottom = style_ui("╰─", muted, false);
+        let top = style_ui("•", accent, false);
+        let bottom = style_ui("•", muted, false);
         let help = style_ui("/help", accent, false);
         let status = style_ui("/status", accent, false);
         let resume = style_ui("/resume latest", accent, false);
@@ -8470,12 +8523,20 @@ impl LiveCli {
         format!(
             "{top} {brand}\n\
 {bottom} {help} commands · {status} context · {resume} restore\n\
-   {tab} completes commands, models, sessions, and paths · {shift_enter} newline",
+   {tab} completes commands, models, sessions, and paths · Shift+Tab permission mode · {shift_enter} newline",
         )
     }
 
     fn disconnected_startup_banner(&self) -> String {
         format!("{}\n{NEEDS_LOGIN_HINT}", self.startup_banner())
+    }
+
+    fn repl_footer(&self) -> String {
+        format_repl_footer(
+            &self.model,
+            self.permission_mode,
+            self.runtime.usage().cumulative_usage(),
+        )
     }
 
     fn repl_completion_candidates(&self) -> Result<Vec<String>, Box<dyn std::error::Error>> {
@@ -8697,11 +8758,6 @@ impl LiveCli {
             }
             Err(error) => {
                 runtime.shutdown_plugins()?;
-                activity.fail(
-                    "Request failed",
-                    renderer.color_theme(),
-                    &mut stdout,
-                )?;
 
                 // ============================================================================
                 // Auto-compact retry on context window errors
@@ -8746,60 +8802,80 @@ impl LiveCli {
                     || error_str.contains("error decoding response body");
 
                 if is_context_window || is_no_content {
+                    // Keep automatic recovery out of the interactive transcript. The
+                    // activity row is replaced by the eventual response (or one final
+                    // failure), rather than exposing each internal retry round.
+                    activity.clear(&mut stdout)?;
+
                     // If the error tells us the server's actual context window, adapt our
                     // auto-compaction threshold so future auto-compact-trigger checks are accurate.
                     if let Some(window) = extract_context_window_tokens_from_error(&error_str) {
-                        // Set threshold at 70% of the reported window to leave headroom.
-                        let threshold: u32 = (window as f64 * 0.7).round() as u32;
-                        println!(
-                            "  Server context window: {} tokens — setting auto-compaction threshold to {}",
-                            window, threshold
-                        );
+                        // Trigger before the provider's hard limit. Keeping a
+                        // 25% reserve absorbs the system prompt, tool schemas,
+                        // and the next assistant response.
+                        let threshold: u32 = (window as f64 * 0.75).round() as u32;
+                        if !clean_interactive_output {
+                            println!(
+                                "  Server context window: {} tokens — setting auto-compaction threshold to {}",
+                                window, threshold
+                            );
+                        }
                         runtime.set_auto_compaction_input_tokens_threshold(threshold);
                     }
 
-                    // A single compaction pass may not free enough context space.
-                    // Progressive retry: each round preserves fewer recent messages (4→2→1→0),
-                    // trading conversation continuity for a smaller payload until it fits.
-                    // Max 4 rounds before giving up and surfacing the error to the user.
+                    // A single compaction pass may not free enough context
+                    // space. Progressive retry reduces the target budget while
+                    // the compactor still protects recent turns by token
+                    // budget. Max 4 rounds prevents a retry loop.
                     let max_compact_rounds = 4;
-                    let preserve_schedule = [4, 2, 1, 0];
+                    let target_schedule = [60usize, 45, 30, 20];
+                    let preferred_preserve_recent_messages =
+                        CompactionConfig::default().preserve_recent_messages;
 
                     for round in 0..max_compact_rounds {
-                        let preserve = preserve_schedule[round];
-                        println!(
-                            "  Auto-compacting session (round {}/{}, preserving {} recent messages)...",
-                            round + 1,
-                            max_compact_rounds,
-                            preserve
+                        let target_estimated_tokens = overflow_compaction_target(
+                            runtime.estimated_tokens(),
+                            target_schedule[round],
                         );
+                        if !clean_interactive_output {
+                            println!(
+                                "  Auto-compacting session (round {}/{}, target ~{} estimated tokens)...",
+                                round + 1,
+                                max_compact_rounds,
+                                target_estimated_tokens
+                            );
+                        }
 
-                        // Run Trident pipeline then summary-based compaction
-                        let result = runtime::trident::trident_compact_session(
+                        // Run Trident pipeline then compact until the reduced
+                        // session estimate fits the round's target budget.
+                        let result = runtime::trident::trident_compact_session_to_target(
                             runtime.session(),
-                            CompactionConfig {
-                                preserve_recent_messages: preserve,
-                                max_estimated_tokens: 0,
-                            },
+                            preferred_preserve_recent_messages,
+                            target_estimated_tokens,
                             &runtime::trident::TridentConfig::default(),
                         );
                         let removed = result.removed_message_count;
 
-                        if removed == 0 && round > 0 {
-                            // No more messages to compact — further rounds won't help
+                        let changed = removed > 0
+                            || result.compacted_session.messages != runtime.session().messages;
+                        if !changed {
+                            // No more messages or oversized tool payloads to
+                            // compact — further rounds cannot change the request.
                             println!("  No further compaction possible.");
                             break;
                         }
 
                         if removed > 0 {
-                            println!(
-                                "{}",
-                                format_compact_report(
-                                    removed,
-                                    result.compacted_session.messages.len(),
-                                    false
-                                )
-                            );
+                            if !clean_interactive_output {
+                                println!(
+                                    "{}",
+                                    format_compact_report(
+                                        removed,
+                                        result.compacted_session.messages.len(),
+                                        false
+                                    )
+                                );
+                            }
                         }
 
                         // Without this, prepare_turn_runtime() reads from self.runtime.session()
@@ -8868,7 +8944,7 @@ impl LiveCli {
                                     if let Some(window) =
                                         extract_context_window_tokens_from_error(&retry_str)
                                     {
-                                        let threshold: u32 = (window as f64 * 0.7).round() as u32;
+                                        let threshold: u32 = (window as f64 * 0.75).round() as u32;
                                         new_runtime
                                             .set_auto_compaction_input_tokens_threshold(threshold);
                                     }
@@ -8882,6 +8958,11 @@ impl LiveCli {
                                 }
 
                                 // Not a context window error, or out of rounds
+                                activity.fail(
+                                    "Request failed",
+                                    renderer.color_theme(),
+                                    &mut stdout,
+                                )?;
                                 return Err(Box::new(retry_error));
                             }
                         }
@@ -8889,6 +8970,7 @@ impl LiveCli {
                 }
 
                 // If not a context window error, return original error
+                activity.fail("Request failed", renderer.color_theme(), &mut stdout)?;
                 Err(Box::new(error))
             }
         }
@@ -9038,7 +9120,8 @@ impl LiveCli {
                 self.compact()?;
                 false
             }
-            SlashCommand::Model { model } => self.set_model(model)?,
+            SlashCommand::Model { model: Some(model) } => self.set_model(Some(model))?,
+            SlashCommand::Model { model: None } => self.choose_model_interactively()?,
             SlashCommand::Permissions { mode } => self.set_permissions(mode)?,
             SlashCommand::Clear { confirm } => self.clear_session(confirm)?,
             SlashCommand::Cost => {
@@ -9099,7 +9182,12 @@ impl LiveCli {
             }
             SlashCommand::Skills { args } => {
                 match classify_skills_slash_command(args.as_deref()) {
-                    SkillSlashDispatch::Invoke(prompt) => self.run_turn(&prompt)?,
+                    SkillSlashDispatch::Invoke(prompt) => {
+                        if is_superpowers_invocation(&prompt) {
+                            print_superpowers_checklist();
+                        }
+                        self.run_turn(&prompt)?;
+                    }
                     SkillSlashDispatch::Local => {
                         if let Err(error) =
                             Self::print_skills(args.as_deref(), CliOutputFormat::Text)
@@ -9285,6 +9373,50 @@ impl LiveCli {
         );
     }
 
+    fn choose_model_interactively(&mut self) -> Result<bool, Box<dyn std::error::Error>> {
+        const ALIASES: [&str; 4] = ["opus", "sonnet", "haiku", "gpt-oss"];
+
+        let mut items: Vec<picker::PickerItem> = ALIASES
+            .iter()
+            .map(|alias| picker::PickerItem::new(*alias, resolve_model_alias_with_config(alias)))
+            .collect();
+        items.push(picker::PickerItem::new("custom…", "type a provider/model"));
+
+        let initial = ALIASES
+            .iter()
+            .position(|alias| resolve_model_alias_with_config(alias) == self.model)
+            .unwrap_or(0);
+
+        println!();
+        match picker::select_from_list("Select model", &items, initial)? {
+            picker::PickerOutcome::Cancelled => {
+                println!("Model unchanged.");
+                Ok(false)
+            }
+            picker::PickerOutcome::Selected(index) if index < ALIASES.len() => {
+                self.set_model(Some(ALIASES[index].to_string()))
+            }
+            // The "custom…" row, or a non-interactive session (piped stdin):
+            // fall back to a typed provider/model prompt.
+            picker::PickerOutcome::Selected(_) | picker::PickerOutcome::NotInteractive => {
+                println!("Model selection");
+                println!("  Current          {}", self.model);
+                println!("  Aliases          opus · sonnet · haiku · gpt-oss");
+                print!("  Provider/model   ");
+                io::stdout().flush()?;
+
+                let mut input = String::new();
+                io::stdin().read_line(&mut input)?;
+                let model = input.trim();
+                if model.is_empty() {
+                    println!("Model unchanged.");
+                    return Ok(false);
+                }
+                self.set_model(Some(model.to_string()))
+            }
+        }
+    }
+
     fn set_model(&mut self, model: Option<String>) -> Result<bool, Box<dyn std::error::Error>> {
         let Some(model) = model else {
             println!(
@@ -9349,7 +9481,7 @@ impl LiveCli {
 
         let normalized = normalize_permission_mode(&mode).ok_or_else(|| {
             format!(
-                "invalid_flag_value: unsupported permission mode '{mode}'.\nUsage: --permission-mode read-only|workspace-write|danger-full-access"
+                "invalid_flag_value: unsupported permission mode '{mode}'.\nUsage: --permission-mode prompt|read-only|workspace-write|danger-full-access"
             )
         })?;
 
@@ -9948,6 +10080,7 @@ impl LiveCli {
                 Ok(false)
             }
             Some("advance") => {
+                let already_existed = self.runtime.session().workflow.is_some();
                 let workflow = self
                     .runtime
                     .session_mut()
@@ -9955,7 +10088,15 @@ impl LiveCli {
                     .get_or_insert_with(WorkflowState::default);
                 let result = workflow.try_advance();
                 let phase = workflow.phase;
-                self.persist_session()?;
+                // Skip the write when nothing changed: a pre-existing
+                // workflow that stayed Blocked mutated no persisted state.
+                // (A brand-new default WorkflowState is still worth
+                // persisting so /workflow status reflects Idle immediately.)
+                let state_unchanged =
+                    already_existed && matches!(result, GateCheck::Blocked { .. });
+                if !state_unchanged {
+                    self.persist_session()?;
+                }
                 match result {
                     GateCheck::Pass => println!("Workflow advanced\n  Phase            {phase:?}"),
                     GateCheck::Blocked { reason } => {
@@ -9970,6 +10111,10 @@ impl LiveCli {
                     return Ok(false);
                 };
                 let detail = tokens.collect::<Vec<_>>().join(" ");
+                if detail.trim().is_empty() {
+                    println!("Usage: /workflow gate <kind> <detail>");
+                    return Ok(false);
+                }
                 let workflow = self
                     .runtime
                     .session_mut()
@@ -10564,6 +10709,7 @@ fn render_repl_help(custom_commands: &[runtime::harness_assets::CommandMeta]) ->
         "  Up/Down              Navigate prompt history".to_string(),
         "  Ctrl-R               Reverse-search prompt history".to_string(),
         "  Tab                  Complete commands, modes, and recent sessions".to_string(),
+        "  Shift+Tab            Cycle ask, workspace, and bypass permissions".to_string(),
         "  Ctrl-C               Clear input (or exit on empty prompt)".to_string(),
         "  Shift+Enter/Ctrl+J   Insert a newline".to_string(),
         "  Auto-save            .claw/sessions/<workspace-fingerprint>/<session-id>.jsonl"
@@ -12217,6 +12363,7 @@ fn init_json_value(report: &crate::init::InitReport, message: &str) -> serde_jso
 
 fn normalize_permission_mode(mode: &str) -> Option<&'static str> {
     match mode.trim() {
+        "prompt" | "ask" => Some("prompt"),
         "default" | "plan" | "read-only" => Some("read-only"),
         "acceptEdits" | "auto" | "workspace-write" => Some("workspace-write"),
         "dontAsk" | "bypassPermissions" | "dangerFullAccess" | "danger-full-access" => {
@@ -15522,29 +15669,28 @@ mod tests {
         format_compact_report, format_connected_line, format_cost_report, format_history_timestamp,
         format_internal_prompt_progress_line, format_issue_report, format_model_report,
         format_model_switch_report, format_permissions_report, format_permissions_switch_report,
-        format_pr_report, format_resume_report, format_status_report, format_tool_call_start,
-        format_tool_result, format_ultraplan_report, format_unknown_slash_command,
-        format_unknown_slash_command_message, format_user_visible_api_error,
-        merge_prompt_with_stdin, normalize_permission_mode, parse_args, parse_export_args,
-        parse_git_status_branch, parse_git_status_metadata_for, parse_git_workspace_summary,
-        parse_history_count, permission_policy, print_help_to, push_output_block,
-        render_config_report, render_diff_report, render_diff_report_for, render_help_topic,
-        render_help_topic_json, render_memory_report, render_prompt_history_report,
-        render_repl_help, render_repl_response, render_resume_usage, render_session_list,
-        render_session_markdown, format_repl_footer, format_repl_prompt, resolve_model_alias,
-        resolve_model_alias_with_config, resolve_repl_model,
-        resolve_session_reference, response_to_events, resume_supported_slash_commands,
-        run_resume_command, short_tool_id, slash_command_completion_candidates_with_sessions,
+        format_pr_report, format_repl_footer, format_repl_prompt, format_resume_report,
+        format_status_report, format_tool_call_start, format_tool_result, format_ultraplan_report,
+        format_unknown_slash_command, format_unknown_slash_command_message,
+        format_user_visible_api_error, merge_prompt_with_stdin, normalize_permission_mode,
+        parse_args, parse_export_args, parse_git_status_branch, parse_git_status_metadata_for,
+        parse_git_workspace_summary, parse_history_count, permission_policy,
+        persist_provider_setup, print_help_to, push_output_block, render_config_report,
+        render_diff_report, render_diff_report_for, render_help_topic, render_help_topic_json,
+        render_memory_report, render_prompt_history_report, render_repl_help, render_repl_response,
+        render_resume_usage, render_session_list, render_session_markdown, resolve_model_alias,
+        resolve_model_alias_with_config, resolve_repl_model, resolve_session_reference,
+        response_to_events, resume_supported_slash_commands, run_resume_command,
+        setup_default_model, short_tool_id, slash_command_completion_candidates_with_sessions,
         split_error_hint, status_context, status_json_value, summarize_tool_payload_for_markdown,
         try_resolve_bare_skill_prompt, validate_endpoint_url, validate_no_args,
-        write_mcp_server_fixture, EndpointProtocol, ProviderSetup, CliAction, CliOutputFormat,
-        CliToolExecutor, GitWorkspaceSummary, InternalPromptProgressEvent,
-        InternalPromptProgressState, LiveCli, LocalHelpTopic, PromptHistoryEntry,
-        SessionLifecycleKind, SessionLifecycleSummary, SlashCommand, StatusUsage, TmuxPaneSnapshot,
-        DEFAULT_ANTHROPIC_COMPAT_BASE_URL, DEFAULT_ANTHROPIC_COMPAT_MODEL,
-        DEFAULT_MODEL, DEFAULT_OPENAI_COMPAT_BASE_URL, DEFAULT_OPENAI_COMPAT_MODEL,
-        GitOperation, LATEST_SESSION_REFERENCE, PermissionModeProvenance, persist_provider_setup,
-        setup_default_model, STUB_COMMANDS,
+        write_mcp_server_fixture, CliAction, CliOutputFormat, CliToolExecutor, EndpointProtocol,
+        GitOperation, GitWorkspaceSummary, InternalPromptProgressEvent,
+        InternalPromptProgressState, LiveCli, LocalHelpTopic, PermissionModeProvenance,
+        PromptHistoryEntry, ProviderSetup, SessionLifecycleKind, SessionLifecycleSummary,
+        SlashCommand, StatusUsage, TmuxPaneSnapshot, DEFAULT_ANTHROPIC_COMPAT_BASE_URL,
+        DEFAULT_ANTHROPIC_COMPAT_MODEL, DEFAULT_MODEL, DEFAULT_OPENAI_COMPAT_BASE_URL,
+        DEFAULT_OPENAI_COMPAT_MODEL, LATEST_SESSION_REFERENCE, STUB_COMMANDS,
     };
     use api::{ApiError, MessageResponse, OutputContentBlock, Usage};
     use plugins::{
@@ -16104,7 +16250,7 @@ mod tests {
                 model: DEFAULT_MODEL.to_string(),
                 output_format: CliOutputFormat::Text,
                 allowed_tools: None,
-                permission_mode: PermissionMode::WorkspaceWrite,
+                permission_mode: PermissionMode::DangerFullAccess,
                 compact: false,
                 base_commit: None,
                 reasoning_effort: None,
@@ -16195,7 +16341,7 @@ mod tests {
                 model: "claude-opus-4-6".to_string(),
                 output_format: CliOutputFormat::Json,
                 allowed_tools: None,
-                permission_mode: PermissionMode::WorkspaceWrite,
+                permission_mode: PermissionMode::DangerFullAccess,
                 compact: false,
                 base_commit: None,
                 reasoning_effort: None,
@@ -16217,7 +16363,7 @@ mod tests {
                 model: DEFAULT_MODEL.to_string(),
                 output_format: CliOutputFormat::Text,
                 allowed_tools: None,
-                permission_mode: PermissionMode::WorkspaceWrite,
+                permission_mode: PermissionMode::DangerFullAccess,
                 compact: false,
                 base_commit: None,
                 reasoning_effort: None,
@@ -16233,7 +16379,7 @@ mod tests {
                 model: DEFAULT_MODEL.to_string(),
                 output_format: CliOutputFormat::Text,
                 allowed_tools: None,
-                permission_mode: PermissionMode::WorkspaceWrite,
+                permission_mode: PermissionMode::DangerFullAccess,
                 compact: false,
                 base_commit: None,
                 reasoning_effort: None,
@@ -16249,7 +16395,7 @@ mod tests {
                 model: DEFAULT_MODEL.to_string(),
                 output_format: CliOutputFormat::Text,
                 allowed_tools: None,
-                permission_mode: PermissionMode::WorkspaceWrite,
+                permission_mode: PermissionMode::DangerFullAccess,
                 compact: false,
                 base_commit: None,
                 reasoning_effort: None,
@@ -16287,7 +16433,7 @@ mod tests {
                 model: DEFAULT_MODEL.to_string(),
                 output_format: CliOutputFormat::Text,
                 allowed_tools: None,
-                permission_mode: PermissionMode::WorkspaceWrite,
+                permission_mode: PermissionMode::DangerFullAccess,
                 compact: true,
                 base_commit: None,
                 reasoning_effort: None,
@@ -16302,7 +16448,7 @@ mod tests {
                 model: DEFAULT_MODEL.to_string(),
                 output_format: CliOutputFormat::Text,
                 allowed_tools: None,
-                permission_mode: PermissionMode::WorkspaceWrite,
+                permission_mode: PermissionMode::DangerFullAccess,
                 compact: true,
                 base_commit: None,
                 reasoning_effort: None,
@@ -16345,7 +16491,7 @@ mod tests {
                 model: "claude-opus-4-6".to_string(),
                 output_format: CliOutputFormat::Text,
                 allowed_tools: None,
-                permission_mode: PermissionMode::WorkspaceWrite,
+                permission_mode: PermissionMode::DangerFullAccess,
                 compact: false,
                 base_commit: None,
                 reasoning_effort: None,
@@ -16554,7 +16700,7 @@ mod tests {
                         .map(str::to_string)
                         .collect()
                 ),
-                permission_mode: PermissionMode::WorkspaceWrite,
+                permission_mode: PermissionMode::DangerFullAccess,
                 base_commit: None,
                 reasoning_effort: None,
                 allow_broad_cwd: false,
@@ -16921,10 +17067,7 @@ mod tests {
                 model_flag_raw,
                 ..
             } => {
-                assert_eq!(
-                    model, "claude-sonnet-4-6",
-                    "sonnet alias should resolve"
-                );
+                assert_eq!(model, "claude-sonnet-4-6", "sonnet alias should resolve");
                 assert_eq!(
                     model_flag_raw.as_deref(),
                     Some("sonnet"),
@@ -18490,7 +18633,7 @@ mod tests {
                 model: DEFAULT_MODEL.to_string(),
                 output_format: CliOutputFormat::Text,
                 allowed_tools: None,
-                permission_mode: PermissionMode::WorkspaceWrite,
+                permission_mode: PermissionMode::DangerFullAccess,
                 compact: false,
                 base_commit: None,
                 reasoning_effort: None,
@@ -18519,7 +18662,7 @@ mod tests {
                 model: DEFAULT_MODEL.to_string(),
                 output_format: CliOutputFormat::Text,
                 allowed_tools: None,
-                permission_mode: PermissionMode::WorkspaceWrite,
+                permission_mode: PermissionMode::DangerFullAccess,
                 compact: false,
                 base_commit: None,
                 reasoning_effort: None,
@@ -18808,6 +18951,9 @@ mod tests {
 
         assert!(banner.contains("Tab"));
         assert!(banner.contains("completes commands, models, sessions, and paths"));
+        assert!(banner.contains("Shift+Tab permission mode"));
+        assert!(!banner.contains("╭─"));
+        assert!(!banner.contains("╰─"));
 
         fs::remove_dir_all(root).expect("cleanup temp dir");
         std::env::remove_var("ANTHROPIC_API_KEY");
@@ -18881,6 +19027,18 @@ mod tests {
             cli.handle_workflow_command(Some("frobnicate"))
                 .expect("unknown subcommand should render usage, not error");
             assert_eq!(cli.runtime.session().workflow.clone().unwrap(), workflow);
+
+            // /workflow gate <kind> with no detail must print usage and
+            // record no evidence -- a whitespace-only detail is otherwise
+            // silently ignored by Task 7's Verify->Review gate, so accepting
+            // it here would create useless evidence records.
+            cli.handle_workflow_command(Some("gate test_run"))
+                .expect("gate without detail should render usage, not error");
+            assert_eq!(
+                cli.runtime.session().workflow.clone().unwrap(),
+                workflow,
+                "gate with missing detail must not record evidence"
+            );
         });
 
         fs::remove_dir_all(root).expect("cleanup temp dir");
@@ -18890,15 +19048,45 @@ mod tests {
     #[test]
     fn repl_prompt_places_input_before_static_model_footer() {
         let prompt = format_repl_prompt("custom-model", PermissionMode::DangerFullAccess);
-        let footer = format_repl_footer("custom-model", PermissionMode::DangerFullAccess);
+        let footer = format_repl_footer(
+            "custom-model",
+            PermissionMode::DangerFullAccess,
+            runtime::TokenUsage {
+                input_tokens: 10,
+                output_tokens: 5,
+                ..Default::default()
+            },
+        );
 
-        assert!(prompt.contains("╭─"));
+        // The input prompt is now a shaded chip (chevron), not a bare dot.
+        assert!(prompt.contains('›'));
         assert!(!prompt.contains("custom-model"));
         assert!(!prompt.contains('\n'));
         assert!(footer.contains("custom-model"));
-        assert!(footer.contains("full access"));
-        assert!(footer.contains("╰─"));
+        assert!(footer.contains("15 tok"));
+        assert!(footer.contains("$"));
+        assert!(footer.contains("bypass"));
+        assert!(footer.contains('•'));
         assert!(!footer.contains('\n'));
+    }
+
+    #[test]
+    fn repl_footer_counters_and_plan_mode_label() {
+        // Live token + dollar counters climb with cumulative usage and the
+        // plan posture (read-only) renders its own label in the footer.
+        let footer = format_repl_footer(
+            "custom-model",
+            PermissionMode::ReadOnly,
+            runtime::TokenUsage {
+                input_tokens: 1000,
+                output_tokens: 500,
+                ..Default::default()
+            },
+        );
+        assert!(footer.contains("1500 tok"));
+        assert!(footer.contains("$"));
+        assert!(footer.contains("plan"));
+        assert!(!footer.contains("read-only"));
     }
 
     #[test]
@@ -18940,7 +19128,10 @@ mod tests {
             .expect("cli should initialize");
             assert!(cli.is_connected(), "seeded env should look connected");
             cli.run_logout().expect("logout should succeed");
-            assert!(!cli.is_connected(), "logout should rebuild disconnected runtime");
+            assert!(
+                !cli.is_connected(),
+                "logout should rebuild disconnected runtime"
+            );
             cli.disconnected_startup_banner()
         });
 
@@ -19909,6 +20100,8 @@ UU conflicted.rs",
 
     #[test]
     fn normalizes_supported_permission_modes() {
+        assert_eq!(normalize_permission_mode("prompt"), Some("prompt"));
+        assert_eq!(normalize_permission_mode("ask"), Some("prompt"));
         assert_eq!(normalize_permission_mode("read-only"), Some("read-only"));
         assert_eq!(
             normalize_permission_mode("workspace-write"),
@@ -20299,6 +20492,7 @@ UU conflicted.rs",
         let help = render_repl_help(&[]);
         assert!(help.contains("Up/Down"));
         assert!(help.contains("Tab"));
+        assert!(help.contains("Shift+Tab"));
         assert!(help.contains("Shift+Enter/Ctrl+J"));
         assert!(help.contains("Ctrl-R"));
         assert!(help.contains("Reverse-search prompt history"));
@@ -21409,10 +21603,7 @@ mod alias_resolution_tests {
     #[test]
     fn test_alias_resolution_builtin() {
         // Built-in aliases should resolve to their full IDs
-        assert_eq!(
-            resolve_model_alias_with_config("opus"),
-            "claude-opus-4-6"
-        );
+        assert_eq!(resolve_model_alias_with_config("opus"), "claude-opus-4-6");
         assert_eq!(
             resolve_model_alias_with_config("sonnet"),
             "claude-sonnet-4-6"

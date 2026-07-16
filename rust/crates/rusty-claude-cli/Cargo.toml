@@ -22,7 +22,7 @@ api = { path = "../api" }
 commands = { path = "../commands" }
 crossterm = "0.28"
 pulldown-cmark = "0.13"
-rustyline = "15"
+rustyline = { version = "15", features = ["custom-bindings"] }
 runtime = { path = "../runtime" }
 plugins = { path = "../plugins" }
 serde = { version = "1", features = ["derive"] }

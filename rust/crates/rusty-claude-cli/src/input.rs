@@ -1,9 +1,12 @@
 use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::BTreeSet;
+use std::env;
 use std::fs;
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::{Arc, Mutex};
 
 use crossterm::style::{style, Color, Stylize};
 use crossterm::terminal;
@@ -14,7 +17,8 @@ use rustyline::hint::Hinter;
 use rustyline::history::DefaultHistory;
 use rustyline::validate::Validator;
 use rustyline::{
-    Cmd, CompletionType, Config, Context, EditMode, Editor, Helper, KeyCode, KeyEvent, Modifiers,
+    Cmd, CompletionType, ConditionalEventHandler, Config, Context, EditMode, Editor, Event,
+    EventContext, EventHandler, Helper, KeyCode, KeyEvent, Modifiers, RepeatCount,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -22,6 +26,179 @@ pub enum ReadOutcome {
     Submit(String),
     Cancel,
     Exit,
+}
+
+// Shift+Tab cycles through four REPL permission/workspace modes, mirroring
+// Claude Code's default/plan/auto-accept/bypass rotation. "plan" is not a
+// separate runtime `PermissionMode`; it maps onto read-only enforcement (the
+// agent can research and plan but not modify the workspace) while presenting a
+// distinct label and color so the planning posture is visible.
+const PERMISSION_MODE_CYCLE: [&str; 4] = [
+    "prompt",
+    "read-only",
+    "workspace-write",
+    "danger-full-access",
+];
+const PERMISSION_MODE_DISPLAY: [&str; 4] = ["ask", "plan", "workspace", "bypass"];
+
+fn permission_mode_index(mode: &str) -> u8 {
+    match mode.trim() {
+        "read-only" | "plan" => 1,
+        "workspace-write" | "workspace" => 2,
+        "danger-full-access" | "bypass" | "full access" => 3,
+        _ => 0,
+    }
+}
+
+fn permission_mode_for_index(index: u8) -> &'static str {
+    PERMISSION_MODE_CYCLE[usize::from(index) % PERMISSION_MODE_CYCLE.len()]
+}
+
+fn permission_display_for_index(index: u8) -> &'static str {
+    PERMISSION_MODE_DISPLAY[usize::from(index) % PERMISSION_MODE_DISPLAY.len()]
+}
+
+/// Distinct footer accent color per mode so each posture is visually
+/// recognizable at a glance: muted (ask), blue (plan), green (workspace),
+/// red (bypass).
+fn permission_mode_color(index: u8) -> Color {
+    match index % 4 {
+        1 => Color::Rgb { r: 96, g: 165, b: 250 },
+        2 => Color::Rgb { r: 52, g: 211, b: 153 },
+        3 => Color::Rgb { r: 248, g: 113, b: 113 },
+        _ => Color::Rgb {
+            r: 148,
+            g: 163,
+            b: 184,
+        },
+    }
+}
+
+/// Render the `· <label>` permission segment shown in the REPL footer, colored
+/// for the given mode. This is the single source of truth shared by the static
+/// footer (built in `main.rs`) and the live Shift+Tab redraw below, so the
+/// dynamic redraw can locate and swap the exact segment string in place.
+#[must_use]
+pub fn styled_permission_segment(mode: &str) -> String {
+    permission_segment_for_index(permission_mode_index(mode))
+}
+
+/// Render the REPL input prompt as a shaded block ("chip") rather than a bare
+/// dot, so the user can clearly see where typing begins. The chip is a padded,
+/// background-filled region; typed text follows it on the same row.
+#[must_use]
+pub fn styled_input_chip() -> String {
+    if env::var_os("NO_COLOR").is_some() {
+        return "> ".to_string();
+    }
+    let bg = Color::Rgb {
+        r: 39,
+        g: 45,
+        b: 62,
+    };
+    let fg = Color::Rgb {
+        r: 148,
+        g: 163,
+        b: 184,
+    };
+    // A padded, background-shaded chevron block, then a space so typed text is
+    // not visually glued to the shaded region.
+    format!("{} ", style(" › ").on(bg).with(fg))
+}
+
+fn permission_segment_for_index(index: u8) -> String {
+    let label = permission_display_for_index(index);
+    if env::var_os("NO_COLOR").is_some() {
+        return format!("· {label}");
+    }
+    format!("{}", style(format!("· {label}")).with(permission_mode_color(index)))
+}
+
+fn redraw_footer_line(footer: &str) {
+    let rows = terminal::size().map(|(_, rows)| rows).unwrap_or_default();
+    if rows < 3 {
+        return;
+    }
+
+    let mut stdout = io::stdout();
+    // Save the cursor while rustyline owns the editable input row, redraw the
+    // pinned footer, then restore the cursor so the current line stays intact.
+    let _ = write!(
+        stdout,
+        "\x1b7\x1b[{rows};1H\x1b[2K{footer}\x1b8"
+    );
+    let _ = stdout.flush();
+}
+
+struct PermissionToggleState {
+    mode: AtomicU8,
+    footer: Mutex<String>,
+}
+
+impl PermissionToggleState {
+    fn new() -> Self {
+        Self {
+            mode: AtomicU8::new(permission_mode_index("prompt")),
+            footer: Mutex::new(String::new()),
+        }
+    }
+
+    fn set_mode(&self, mode: &str) {
+        self.mode
+            .store(permission_mode_index(mode), Ordering::Relaxed);
+    }
+
+    fn current_mode(&self) -> &'static str {
+        permission_mode_for_index(self.mode.load(Ordering::Relaxed))
+    }
+
+    fn set_footer(&self, footer: String) {
+        if let Ok(mut shared_footer) = self.footer.lock() {
+            *shared_footer = footer;
+        }
+    }
+
+    fn cycle(&self) {
+        let current = self.mode.load(Ordering::Relaxed);
+        let next = current.wrapping_add(1) % u8::try_from(PERMISSION_MODE_CYCLE.len()).unwrap_or(1);
+        self.mode.store(next, Ordering::Relaxed);
+
+        let old_segment = permission_segment_for_index(current);
+        let new_segment = permission_segment_for_index(next);
+        let footer = self
+            .footer
+            .lock()
+            .ok()
+            .map(|mut footer| {
+                if let Some(pos) = footer.find(&old_segment) {
+                    footer.replace_range(pos..pos + old_segment.len(), &new_segment);
+                }
+                footer.clone()
+            });
+        if let Some(footer) = footer {
+            if let Ok(mut shared_footer) = self.footer.lock() {
+                *shared_footer = footer.clone();
+            }
+            redraw_footer_line(&footer);
+        }
+    }
+}
+
+struct PermissionToggleHandler {
+    state: Arc<PermissionToggleState>,
+}
+
+impl ConditionalEventHandler for PermissionToggleHandler {
+    fn handle(
+        &self,
+        _event: &Event,
+        _repeat_count: RepeatCount,
+        _positive: bool,
+        _context: &EventContext,
+    ) -> Option<Cmd> {
+        self.state.cycle();
+        Some(Cmd::Repaint)
+    }
 }
 
 struct SlashCommandHelper {
@@ -103,6 +280,17 @@ impl Highlighter for SlashCommandHelper {
         self.set_current_line(line);
         false
     }
+
+    fn highlight_prompt<'b, 's: 'b, 'p: 'b>(
+        &'s self,
+        prompt: &'p str,
+        _default: bool,
+    ) -> Cow<'b, str> {
+        // The prompt is already rendered as a shaded input chip by the caller
+        // (see `styled_input_chip`). Preserve it verbatim so the affordance is
+        // stable regardless of whether the line is a slash command.
+        Cow::Borrowed(prompt)
+    }
 }
 
 impl Validator for SlashCommandHelper {}
@@ -121,7 +309,9 @@ fn highlight_slash_command(line: &str) -> String {
 pub struct LineEditor {
     prompt: String,
     footer: String,
+    footer_state: Arc<PermissionToggleState>,
     footer_active: bool,
+    working_active: bool,
     editor: Editor<SlashCommandHelper, DefaultHistory>,
 }
 
@@ -138,11 +328,26 @@ impl LineEditor {
         editor.set_helper(Some(SlashCommandHelper::new(completions)));
         editor.bind_sequence(KeyEvent(KeyCode::Char('J'), Modifiers::CTRL), Cmd::Newline);
         editor.bind_sequence(KeyEvent(KeyCode::Enter, Modifiers::SHIFT), Cmd::Newline);
+        let footer_state = Arc::new(PermissionToggleState::new());
+        editor.bind_sequence(
+            KeyEvent(KeyCode::BackTab, Modifiers::NONE),
+            EventHandler::Conditional(Box::new(PermissionToggleHandler {
+                state: Arc::clone(&footer_state),
+            })),
+        );
+        editor.bind_sequence(
+            KeyEvent(KeyCode::Tab, Modifiers::SHIFT),
+            EventHandler::Conditional(Box::new(PermissionToggleHandler {
+                state: Arc::clone(&footer_state),
+            })),
+        );
 
         Self {
             prompt: prompt.into(),
             footer: String::new(),
+            footer_state,
             footer_active: false,
+            working_active: false,
             editor,
         }
     }
@@ -167,7 +372,25 @@ impl LineEditor {
     }
 
     pub fn set_footer(&mut self, footer: impl Into<String>) {
-        self.footer = footer.into();
+        let footer = footer.into();
+        self.footer.clone_from(&footer);
+        self.footer_state.set_footer(footer);
+    }
+
+    pub fn set_permission_mode(&mut self, mode: &str) {
+        self.footer_state.set_mode(mode);
+        self.sync_footer();
+    }
+
+    pub fn permission_mode(&mut self) -> String {
+        self.sync_footer();
+        self.footer_state.current_mode().to_string()
+    }
+
+    fn sync_footer(&mut self) {
+        if let Ok(footer) = self.footer_state.footer.lock() {
+            self.footer.clone_from(&footer);
+        }
     }
 
     pub fn read_line(&mut self) -> io::Result<ReadOutcome> {
@@ -216,12 +439,44 @@ impl LineEditor {
             write!(stdout, "\r\x1b[2K")?;
             stdout.flush()?;
             self.footer_active = false;
+            self.working_active = false;
             return Ok(());
         }
 
         write!(stdout, "\x1b[r\x1b[{rows};1H\x1b[2K\x1b[{rows};1H")?;
         stdout.flush()?;
         self.footer_active = false;
+        self.working_active = false;
+        Ok(())
+    }
+
+    /// Reserve a line above the composer for the live activity indicator.
+    /// The transcript scrolls above that line; the composer and model footer
+    /// stay pinned at the bottom of the terminal.
+    pub fn begin_working(&mut self) -> io::Result<()> {
+        if self.footer.is_empty() || !self.footer_active || self.working_active {
+            return Ok(());
+        }
+
+        let rows = terminal::size().map(|(_, rows)| rows).unwrap_or_default();
+        if rows < 4 {
+            return Ok(());
+        }
+
+        let working_row = rows - 2;
+        let input_row = rows - 1;
+        let mut stdout = io::stdout();
+
+        // The submitted input currently occupies the bottom scroll row. Move
+        // it into the transcript before reserving a fresh activity row.
+        write!(stdout, "\x1b[1;{working_row}r\x1b[{working_row};1H\r\n")?;
+        write!(
+            stdout,
+            "\x1b[{input_row};1H\x1b[2K{}\x1b[{rows};1H\x1b[2K{}\x1b[{working_row};1H\x1b[2K",
+            self.prompt, self.footer
+        )?;
+        stdout.flush()?;
+        self.working_active = true;
         Ok(())
     }
 
@@ -246,6 +501,7 @@ impl LineEditor {
 
         let rows = terminal::size().map(|(_, rows)| rows).unwrap_or_default();
         if rows < 3 {
+            self.working_active = false;
             return self.prepare_relative_footer();
         }
 
@@ -256,7 +512,10 @@ impl LineEditor {
             "\x1b[1;{input_row}r\x1b[{rows};1H\x1b[2K{}\x1b[{input_row};1H\x1b[2K",
             self.footer
         )?;
-        stdout.flush().map(|()| self.footer_active = true)
+        stdout.flush().map(|()| {
+            self.footer_active = true;
+            self.working_active = false;
+        })
     }
 
     fn prepare_relative_footer(&mut self) -> io::Result<()> {
@@ -265,6 +524,7 @@ impl LineEditor {
         write!(stdout, "{}\x1b[1A\x1b[1G", self.footer)?;
         stdout.flush()?;
         self.footer_active = true;
+        self.working_active = false;
         Ok(())
     }
 
@@ -446,7 +706,8 @@ fn normalize_completions(completions: Vec<String>) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        highlight_slash_command, path_completion_candidates, slash_command_prefix, LineEditor,
+        highlight_slash_command, path_completion_candidates, permission_display_for_index,
+        permission_mode_for_index, permission_mode_index, slash_command_prefix, LineEditor,
         SlashCommandHelper,
     };
     use std::fs;
@@ -542,6 +803,61 @@ mod tests {
 
         assert!(highlighted.contains("\u{1b}[38;5;12m/login\u{1b}[39m"));
         assert!(highlighted.ends_with(" later"));
+    }
+
+    #[test]
+    fn shift_tab_permission_cycle_matches_repl_labels() {
+        assert_eq!(permission_mode_index("ask"), 0);
+        assert_eq!(permission_mode_index("plan"), 1);
+        assert_eq!(permission_mode_index("read-only"), 1);
+        assert_eq!(permission_mode_index("workspace"), 2);
+        assert_eq!(permission_mode_index("bypass"), 3);
+        assert_eq!(permission_mode_for_index(0), "prompt");
+        assert_eq!(permission_mode_for_index(1), "read-only");
+        assert_eq!(permission_mode_for_index(2), "workspace-write");
+        assert_eq!(permission_mode_for_index(3), "danger-full-access");
+        // Cycle wraps back to the first mode.
+        assert_eq!(permission_mode_for_index(4), "prompt");
+    }
+
+    #[test]
+    fn shift_tab_cycle_advances_through_all_four_modes() {
+        let state = super::PermissionToggleState::new();
+        state.set_mode("prompt");
+        assert_eq!(state.current_mode(), "prompt");
+        state.cycle();
+        assert_eq!(state.current_mode(), "read-only");
+        state.cycle();
+        assert_eq!(state.current_mode(), "workspace-write");
+        state.cycle();
+        assert_eq!(state.current_mode(), "danger-full-access");
+        state.cycle();
+        assert_eq!(state.current_mode(), "prompt");
+    }
+
+    #[test]
+    fn permission_display_labels_track_index() {
+        assert_eq!(permission_display_for_index(0), "ask");
+        assert_eq!(permission_display_for_index(1), "plan");
+        assert_eq!(permission_display_for_index(2), "workspace");
+        assert_eq!(permission_display_for_index(3), "bypass");
+    }
+
+    #[test]
+    fn cycle_swaps_the_colored_footer_segment_in_place() {
+        let state = super::PermissionToggleState::new();
+        state.set_mode("prompt");
+        let footer = format!("• model {}", super::styled_permission_segment("prompt"));
+        state.set_footer(footer);
+        state.cycle();
+        let updated = state
+            .footer
+            .lock()
+            .expect("footer lock")
+            .clone();
+        // After cycling, the footer carries the plan segment, not the ask one.
+        assert!(updated.contains(&super::styled_permission_segment("read-only")));
+        assert!(!updated.contains(&super::styled_permission_segment("prompt")));
     }
 
     #[test]
