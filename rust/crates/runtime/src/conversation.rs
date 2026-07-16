@@ -8,7 +8,9 @@ use crate::compact::{
     compact_session, estimate_session_tokens, CompactionConfig, CompactionResult,
 };
 use crate::config::RuntimeFeatureConfig;
-use crate::hooks::{HookAbortSignal, HookProgressReporter, HookRunResult, HookRunner};
+use crate::hooks::{
+    HookAbortSignal, HookDecision, HookEvent, HookProgressReporter, HookRunResult, HookRunner,
+};
 use crate::permissions::{
     PermissionContext, PermissionOutcome, PermissionPolicy, PermissionPrompter,
 };
@@ -118,6 +120,12 @@ pub struct TurnSummary {
     pub iterations: usize,
     pub usage: TokenUsage,
     pub auto_compaction: Option<AutoCompactionEvent>,
+    /// Non-blocking lifecycle hook problems surfaced during this turn (e.g. a
+    /// `SessionStart`/`UserPromptSubmit`/`Stop` hook that exited with a
+    /// non-blocking failure status, or a `Stop` hook that kept blocking past
+    /// the consecutive-block cap and was forcibly allowed to stop). Callers
+    /// should surface these to the user rather than silently dropping them.
+    pub lifecycle_warnings: Vec<String>,
 }
 
 /// Details about automatic session compaction applied during a turn.
@@ -232,6 +240,16 @@ where
         self
     }
 
+    /// Access to the configured lifecycle/tool-use hook runner. Exposed so
+    /// transport shells (e.g. the CLI) can fire fire-and-forget lifecycle
+    /// events — `SessionEnd` in particular — from outside the turn loop
+    /// (e.g. on process exit), reusing the same `HookRunner` this runtime
+    /// already carries for `SessionStart`/`UserPromptSubmit`/`Stop`.
+    #[must_use]
+    pub fn hook_runner(&self) -> &HookRunner {
+        &self.hook_runner
+    }
+
     fn run_pre_tool_use_hook(&mut self, tool_name: &str, input: &str) -> HookRunResult {
         if let Some(reporter) = self.hook_progress_reporter.as_mut() {
             self.hook_runner.run_pre_tool_use_with_context(
@@ -340,9 +358,56 @@ where
             }
         }
 
+        let mut lifecycle_warnings = Vec::new();
+        let mut lifecycle_context_parts = Vec::new();
+
+        // `SessionStart` fires once per session: an empty message list is
+        // this runtime's proxy for "this is the first turn of the session"
+        // (a fresh `ConversationRuntime` is built per turn by the CLI shell,
+        // so there is no longer-lived place to track "already fired" state).
+        if self.session.messages.is_empty() {
+            let outcome = self
+                .hook_runner
+                .run_lifecycle(HookEvent::SessionStart, &Value::Object(Map::new()));
+            if let HookDecision::Block { reason } = outcome.decision {
+                return Err(RuntimeError::new(format!(
+                    "SessionStart hook blocked session start: {reason}"
+                )));
+            }
+            if let Some(context) = outcome.additional_context {
+                lifecycle_context_parts.push(context);
+            }
+            if let Some(warning) = outcome.warning {
+                lifecycle_warnings.push(warning);
+            }
+        }
+
+        let mut prompt_payload = Map::new();
+        prompt_payload.insert("prompt".to_string(), Value::String(user_input.clone()));
+        let submit_outcome = self
+            .hook_runner
+            .run_lifecycle(HookEvent::UserPromptSubmit, &Value::Object(prompt_payload));
+        if let HookDecision::Block { reason } = submit_outcome.decision {
+            return Err(RuntimeError::new(format!(
+                "UserPromptSubmit hook blocked this turn: {reason}"
+            )));
+        }
+        if let Some(context) = submit_outcome.additional_context {
+            lifecycle_context_parts.push(context);
+        }
+        if let Some(warning) = submit_outcome.warning {
+            lifecycle_warnings.push(warning);
+        }
+
+        let effective_user_input = if lifecycle_context_parts.is_empty() {
+            user_input.clone()
+        } else {
+            format!("{user_input}\n\n{}", lifecycle_context_parts.join("\n\n"))
+        };
+
         self.record_turn_started(&user_input);
         self.session
-            .push_user_text(user_input)
+            .push_user_text(effective_user_input)
             .map_err(|error| RuntimeError::new(error.to_string()))?;
 
         let mut assistant_messages = Vec::new();
@@ -350,6 +415,8 @@ where
         let mut prompt_cache_events = Vec::new();
         let mut iterations = 0;
         let mut auto_compaction = None;
+        let mut consecutive_stop_blocks = 0;
+        const MAX_CONSECUTIVE_STOP_BLOCKS: u32 = 3;
 
         loop {
             iterations += 1;
@@ -412,6 +479,27 @@ where
             }
 
             if pending_tool_uses.is_empty() {
+                let stop_outcome = self
+                    .hook_runner
+                    .run_lifecycle(HookEvent::Stop, &Value::Object(Map::new()));
+                if let Some(warning) = stop_outcome.warning {
+                    lifecycle_warnings.push(warning);
+                }
+                if let HookDecision::Block { reason } = stop_outcome.decision {
+                    if consecutive_stop_blocks < MAX_CONSECUTIVE_STOP_BLOCKS {
+                        consecutive_stop_blocks += 1;
+                        self.session
+                            .push_user_text(format!(
+                                "[Stop hook] You may not stop yet: {reason}"
+                            ))
+                            .map_err(|error| RuntimeError::new(error.to_string()))?;
+                        continue;
+                    }
+                    lifecycle_warnings.push(format!(
+                        "Stop hook blocked {MAX_CONSECUTIVE_STOP_BLOCKS} consecutive times \
+                         (last reason: {reason}); forcing stop to avoid an infinite loop."
+                    ));
+                }
                 break;
             }
 
@@ -524,6 +612,7 @@ where
             iterations,
             usage: self.usage_tracker.cumulative_usage(),
             auto_compaction,
+            lifecycle_warnings,
         };
         self.record_turn_completed(&summary);
 

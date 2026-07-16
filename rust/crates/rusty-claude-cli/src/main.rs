@@ -7780,6 +7780,25 @@ struct LiveCli {
     prompt_history: Vec<PromptHistoryEntry>,
 }
 
+/// Fires the `SessionEnd` lifecycle hook, fire-and-forget, whenever a
+/// `LiveCli` goes out of scope — on every normal exit path (one-shot prompt,
+/// `/exit`, EOF, early `?` returns) since `Drop` runs regardless of how the
+/// scope ends. The hook's decision is intentionally ignored: `SessionEnd`
+/// cannot block process exit, so only a non-blocking-failure warning is
+/// surfaced (to stderr, since stdout may be carrying structured JSON output).
+impl Drop for LiveCli {
+    fn drop(&mut self) {
+        if let Some(runtime) = self.runtime.runtime.as_ref() {
+            let outcome = runtime
+                .hook_runner()
+                .run_lifecycle(runtime::HookEvent::SessionEnd, &serde_json::json!({}));
+            if let Some(warning) = outcome.warning {
+                eprintln!("SessionEnd hook warning: {warning}");
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct PromptHistoryEntry {
     timestamp_ms: u64,
@@ -8634,6 +8653,7 @@ impl LiveCli {
                         format_auto_compaction_notice(event.removed_message_count)
                     );
                 }
+                print_lifecycle_warnings(&summary);
                 self.persist_session()?;
                 self.append_turn_log(input, &summary);
                 self.maybe_auto_dream_after_success();
@@ -8786,6 +8806,7 @@ impl LiveCli {
                                         format_auto_compaction_notice(event.removed_message_count)
                                     );
                                 }
+                                print_lifecycle_warnings(&summary);
                                 self.persist_session()?;
                                 return Ok(());
                             }
@@ -8870,6 +8891,7 @@ impl LiveCli {
         let result = runtime.run_turn(input, Some(&mut permission_prompter));
         hook_abort_monitor.stop();
         let summary = result?;
+        print_lifecycle_warnings(&summary);
         self.replace_runtime(runtime)?;
         self.persist_session()?;
         println!(
@@ -8895,6 +8917,7 @@ impl LiveCli {
         let result = runtime.run_turn(input, Some(&mut permission_prompter));
         hook_abort_monitor.stop();
         let summary = result?;
+        print_lifecycle_warnings(&summary);
         self.replace_runtime(runtime)?;
         self.persist_session()?;
         println!(
@@ -14046,6 +14069,17 @@ fn final_assistant_text(summary: &runtime::TurnSummary) -> String {
                 .join("")
         })
         .unwrap_or_default()
+}
+
+/// Surfaces non-blocking lifecycle hook problems (see
+/// `TurnSummary::lifecycle_warnings`) to stderr so they aren't silently
+/// dropped — e.g. a `SessionStart`/`UserPromptSubmit`/`Stop` hook that exited
+/// non-zero without an explicit JSON decision, or a `Stop` hook that kept
+/// blocking past the consecutive-block cap and was forcibly allowed to stop.
+fn print_lifecycle_warnings(summary: &runtime::TurnSummary) {
+    for warning in &summary.lifecycle_warnings {
+        eprintln!("warning: {warning}");
+    }
 }
 
 fn render_repl_response(text: &str) -> String {
