@@ -8,7 +8,7 @@ use crate::compact::{
     compact_session, compact_session_to_target, estimate_session_tokens, CompactionConfig,
     CompactionResult,
 };
-use crate::config::RuntimeFeatureConfig;
+use crate::config::{RuntimeFeatureConfig, WorkflowGateMode};
 use crate::hooks::{
     HookAbortSignal, HookDecision, HookEvent, HookProgressReporter, HookRunResult, HookRunner,
 };
@@ -17,6 +17,7 @@ use crate::permissions::{
 };
 use crate::session::{ContentBlock, ConversationMessage, Session};
 use crate::usage::{TokenUsage, UsageTracker};
+use crate::workflow_gates::{evaluate_pre_tool_use_gate, evaluate_stop_gate, GateCheckEvent};
 
 const DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD: u32 = 100_000;
 const AUTO_COMPACTION_THRESHOLD_ENV_VAR: &str = "CLAUDE_CODE_AUTO_COMPACT_INPUT_TOKENS";
@@ -129,6 +130,11 @@ pub struct TurnSummary {
     /// the consecutive-block cap and was forcibly allowed to stop). Callers
     /// should surface these to the user rather than silently dropping them.
     pub lifecycle_warnings: Vec<String>,
+    /// Workflow gate decisions (Task 9) recorded during this turn — both
+    /// enforced blocks and advisory warnings. Empty unless `workflow_gates`
+    /// is enabled and a workflow is active. Callers may persist these as
+    /// `gate_check` NDJSON audit events.
+    pub gate_events: Vec<GateCheckEvent>,
 }
 
 /// Details about automatic session compaction applied during a turn.
@@ -151,6 +157,7 @@ pub struct ConversationRuntime<C, T> {
     hook_abort_signal: HookAbortSignal,
     hook_progress_reporter: Option<Box<dyn HookProgressReporter>>,
     session_tracer: Option<SessionTracer>,
+    workflow_gate_mode: WorkflowGateMode,
 }
 
 impl<C, T> ConversationRuntime<C, T>
@@ -200,6 +207,7 @@ where
             hook_abort_signal: HookAbortSignal::default(),
             hook_progress_reporter: None,
             session_tracer: None,
+            workflow_gate_mode: feature_config.workflow_gates(),
         }
     }
 
@@ -363,6 +371,8 @@ where
 
         let mut lifecycle_warnings = Vec::new();
         let mut lifecycle_context_parts = Vec::new();
+        let mut gate_events: Vec<GateCheckEvent> = Vec::new();
+        let workflow_gate_mode = self.workflow_gate_mode;
 
         // `SessionStart` fires once per session: an empty message list is
         // this runtime's proxy for "this is the first turn of the session"
@@ -496,7 +506,29 @@ where
                 if let Some(warning) = stop_outcome.warning {
                     lifecycle_warnings.push(warning);
                 }
-                if let HookDecision::Block { reason } = stop_outcome.decision {
+
+                // Task 9: QAS Stop gate. In `Enforced` mode a Verify phase
+                // with no `test_run` evidence blocks the stop (reusing the
+                // same re-prompt machinery + 3-strike cap as the Stop hook);
+                // in `Advisory` mode it surfaces a warning without blocking.
+                let gate_outcome =
+                    evaluate_stop_gate(workflow_gate_mode, self.session.workflow.as_ref());
+                let mut gate_block_reason = None;
+                if let Some(outcome) = gate_outcome {
+                    gate_events.push(outcome.event);
+                    if outcome.blocking {
+                        gate_block_reason = Some(outcome.reason);
+                    } else {
+                        lifecycle_warnings.push(format!("[workflow gate] {}", outcome.reason));
+                    }
+                }
+
+                let block_reason = match &stop_outcome.decision {
+                    HookDecision::Block { reason } => Some(reason.clone()),
+                    HookDecision::Allow => gate_block_reason.clone(),
+                };
+
+                if let Some(reason) = block_reason {
                     if consecutive_stop_blocks < MAX_CONSECUTIVE_STOP_BLOCKS {
                         consecutive_stop_blocks += 1;
                         self.session
@@ -514,6 +546,29 @@ where
 
             for (tool_use_id, tool_name, input) in pending_tool_uses {
                 let pre_hook_result = self.run_pre_tool_use_hook(&tool_name, &input);
+
+                // Task 9: stop-the-line PreToolUse gate, evaluated at the same
+                // seam the hook PreToolUse decision merges into the permission
+                // pipeline. `Enforced` denies the tool (short-circuiting like a
+                // hook Block); `Advisory` lets it run but injects the reason as
+                // additional context the model sees in the tool result.
+                let gate_outcome = evaluate_pre_tool_use_gate(
+                    workflow_gate_mode,
+                    self.session.workflow.as_ref(),
+                    &tool_name,
+                );
+                let mut gate_denial: Option<String> = None;
+                let mut gate_advisory: Option<String> = None;
+                if let Some(outcome) = gate_outcome {
+                    gate_events.push(outcome.event);
+                    if outcome.blocking {
+                        gate_denial = Some(outcome.reason);
+                    } else {
+                        lifecycle_warnings.push(format!("[workflow gate] {}", outcome.reason));
+                        gate_advisory = Some(outcome.reason);
+                    }
+                }
+
                 let effective_input = pre_hook_result
                     .updated_input()
                     .map_or_else(|| input.clone(), ToOwned::to_owned);
@@ -522,7 +577,9 @@ where
                     pre_hook_result.permission_reason().map(ToOwned::to_owned),
                 );
 
-                let permission_outcome = if pre_hook_result.is_cancelled() {
+                let permission_outcome = if let Some(reason) = gate_denial.clone() {
+                    PermissionOutcome::Deny { reason }
+                } else if pre_hook_result.is_cancelled() {
                     PermissionOutcome::Deny {
                         reason: format_hook_message(
                             &pre_hook_result,
@@ -596,6 +653,9 @@ where
                                 || post_hook_result.is_failed()
                                 || post_hook_result.is_cancelled(),
                         );
+                        if let Some(advisory) = &gate_advisory {
+                            output = format!("{output}\n\n[workflow gate] {advisory}");
+                        }
 
                         ConversationMessage::tool_result(tool_use_id, tool_name, output, is_error)
                     }
@@ -622,6 +682,7 @@ where
             usage: self.usage_tracker.cumulative_usage(),
             auto_compaction,
             lifecycle_warnings,
+            gate_events,
         };
         self.record_turn_completed(&summary);
 

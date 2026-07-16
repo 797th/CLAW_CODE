@@ -8550,16 +8550,31 @@ impl LiveCli {
         ))
     }
 
+    /// Task 9: the one-line workflow phase banner appended to the system
+    /// prompt when a workflow is active and gates are not `Off`. Loads the
+    /// gate mode from config; returns `None` on any config error (banner is
+    /// best-effort and must never fail a turn).
+    fn workflow_status_banner(&self) -> Option<String> {
+        let phase = self.runtime.session().workflow.as_ref()?.phase;
+        let cwd = env::current_dir().ok()?;
+        let config = ConfigLoader::default_for(&cwd).load().ok()?;
+        runtime::render_workflow_status(phase, config.workflow_gates())
+    }
+
     fn prepare_turn_runtime(
         &self,
         emit_output: bool,
     ) -> Result<(BuiltRuntime, HookAbortMonitor), Box<dyn std::error::Error>> {
         let hook_abort_signal = runtime::HookAbortSignal::new();
+        let mut system_prompt = self.system_prompt.clone();
+        if let Some(banner) = self.workflow_status_banner() {
+            system_prompt.push(banner);
+        }
         let runtime = build_runtime(
             self.runtime.session().clone(),
             &self.session.id,
             self.model.clone(),
-            self.system_prompt.clone(),
+            system_prompt,
             true,
             emit_output,
             self.allowed_tools.clone(),

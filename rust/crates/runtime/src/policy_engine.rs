@@ -2,6 +2,8 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
+use crate::workflow::WorkflowPhase;
+
 pub type GreenLevel = u8;
 
 const STALE_BRANCH_THRESHOLD: Duration = Duration::from_hours(1);
@@ -53,6 +55,10 @@ pub enum PolicyCondition {
     StaleCleanupRequired,
     ApprovalTokenPresent,
     ApprovalTokenMissing,
+    /// Matches when the lane's workflow gate state machine is in `phase`
+    /// (Task 9). Non-workflow lanes leave `LaneContext::workflow_phase` as
+    /// `None`, so this condition never matches for them.
+    WorkflowPhaseIs(WorkflowPhase),
 }
 
 impl PolicyCondition {
@@ -80,6 +86,7 @@ impl PolicyCondition {
             Self::StaleCleanupRequired => context.stale_cleanup_required,
             Self::ApprovalTokenPresent => context.approval_token.is_some(),
             Self::ApprovalTokenMissing => context.approval_token.is_none(),
+            Self::WorkflowPhaseIs(phase) => context.workflow_phase == Some(*phase),
         }
     }
 }
@@ -203,6 +210,10 @@ pub struct LaneContext {
     pub rebase_required: bool,
     pub stale_cleanup_required: bool,
     pub approval_token: Option<ApprovalToken>,
+    /// SAW-style workflow phase for this lane (Task 9). `None` for lanes that
+    /// have no workflow gate state, so `WorkflowPhaseIs` conditions stay
+    /// dormant unless a phase is explicitly attached.
+    pub workflow_phase: Option<WorkflowPhase>,
 }
 
 impl LaneContext {
@@ -231,6 +242,7 @@ impl LaneContext {
             rebase_required: false,
             stale_cleanup_required: false,
             approval_token: None,
+            workflow_phase: None,
         }
     }
 
@@ -252,7 +264,14 @@ impl LaneContext {
             rebase_required: false,
             stale_cleanup_required: false,
             approval_token: None,
+            workflow_phase: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_workflow_phase(mut self, phase: WorkflowPhase) -> Self {
+        self.workflow_phase = Some(phase);
+        self
     }
 
     #[must_use]

@@ -996,6 +996,14 @@ impl RuntimeFeatureConfig {
         self
     }
 
+    /// Override the workflow gate mode. Primarily a test/wiring seam; the
+    /// production value is parsed from `settings.workflow_gates`.
+    #[must_use]
+    pub fn with_workflow_gates(mut self, workflow_gates: WorkflowGateMode) -> Self {
+        self.workflow_gates = workflow_gates;
+        self
+    }
+
     #[must_use]
     pub fn hooks(&self) -> &RuntimeHookConfig {
         &self.hooks

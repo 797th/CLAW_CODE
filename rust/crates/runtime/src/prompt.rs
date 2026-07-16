@@ -3,10 +3,11 @@ use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use crate::config::{ConfigError, ConfigLoader, RulesImportConfig, RuntimeConfig};
+use crate::config::{ConfigError, ConfigLoader, RulesImportConfig, RuntimeConfig, WorkflowGateMode};
 use crate::dreamer::DreamerError;
 use crate::git_context::GitContext;
 use crate::harness_assets::SkillMeta;
+use crate::workflow::WorkflowPhase;
 use crate::MemoryManager;
 
 /// Errors raised while assembling the final system prompt.
@@ -221,6 +222,7 @@ pub struct SystemPromptBuilder {
     config: Option<RuntimeConfig>,
     memory_prompt: Option<String>,
     skills: Vec<SkillMeta>,
+    workflow_status: Option<String>,
 }
 
 impl SystemPromptBuilder {
@@ -273,6 +275,19 @@ impl SystemPromptBuilder {
         self
     }
 
+    /// Attach the one-line workflow phase banner (Task 9). Only rendered when
+    /// a workflow is active (`phase != Idle`) and gates are not `Off`, so the
+    /// model can self-route based on the active gate mode.
+    #[must_use]
+    pub fn with_workflow_status(
+        mut self,
+        phase: WorkflowPhase,
+        mode: WorkflowGateMode,
+    ) -> Self {
+        self.workflow_status = render_workflow_status(phase, mode);
+        self
+    }
+
     #[must_use]
     pub fn append_section(mut self, section: impl Into<String>) -> Self {
         self.append_sections.push(section.into());
@@ -301,6 +316,9 @@ impl SystemPromptBuilder {
         }
         if let Some(skill_index) = render_skill_index(&self.skills) {
             sections.push(skill_index);
+        }
+        if let Some(workflow_status) = &self.workflow_status {
+            sections.push(workflow_status.clone());
         }
         if let Some(memory_prompt) = &self.memory_prompt {
             sections.push(memory_prompt.clone());
@@ -780,6 +798,30 @@ pub fn render_skill_index(skills: &[SkillMeta]) -> Option<String> {
     Some(lines.join("\n"))
 }
 
+/// Renders the one-line workflow phase banner (Task 9). Returns `None` when a
+/// workflow is not active (`Idle`) or gates are `Off`, so those sessions see
+/// no prompt change.
+#[must_use]
+pub fn render_workflow_status(phase: WorkflowPhase, mode: WorkflowGateMode) -> Option<String> {
+    let gates = match mode {
+        WorkflowGateMode::Off => return None,
+        WorkflowGateMode::Advisory => "advisory",
+        WorkflowGateMode::Enforced => "enforced",
+    };
+    if phase == WorkflowPhase::Idle {
+        return None;
+    }
+    let phase_label = match phase {
+        WorkflowPhase::Idle => "idle",
+        WorkflowPhase::Spec => "spec",
+        WorkflowPhase::Implement => "implement",
+        WorkflowPhase::Verify => "verify",
+        WorkflowPhase::Review => "review",
+        WorkflowPhase::Done => "done",
+    };
+    Some(format!("Workflow phase: {phase_label} — gates: {gates}"))
+}
+
 fn render_config_section(config: &RuntimeConfig) -> String {
     let mut lines = vec!["# Runtime config".to_string()];
     if config.loaded_entries().is_empty() {
@@ -857,12 +899,13 @@ fn get_actions_section() -> String {
 mod tests {
     use super::{
         collapse_blank_lines, display_context_path, normalize_instruction_content,
-        render_instruction_content, render_instruction_files, render_skill_index, truncate_diff,
-        truncate_instruction_content, ContextFile, ModelFamilyIdentity, ProjectContext,
-        SystemPromptBuilder, MAX_GIT_DIFF_CHARS, MAX_SKILL_INDEX_BYTES,
-        SKILL_INDEX_TRUNCATION_NOTE, SYSTEM_PROMPT_DYNAMIC_BOUNDARY,
+        render_instruction_content, render_instruction_files, render_skill_index,
+        render_workflow_status, truncate_diff, truncate_instruction_content, ContextFile,
+        ModelFamilyIdentity, ProjectContext, SystemPromptBuilder, MAX_GIT_DIFF_CHARS,
+        MAX_SKILL_INDEX_BYTES, SKILL_INDEX_TRUNCATION_NOTE, SYSTEM_PROMPT_DYNAMIC_BOUNDARY,
     };
-    use crate::config::ConfigLoader;
+    use crate::config::{ConfigLoader, WorkflowGateMode};
+    use crate::workflow::WorkflowPhase;
     use crate::harness_assets::SkillMeta;
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -1610,6 +1653,32 @@ mod tests {
         let body = &result[..result.len() - marker.len()];
         assert!(body.len() <= MAX_GIT_DIFF_CHARS);
         assert!(body.is_char_boundary(body.len()));
+    }
+
+    #[test]
+    fn workflow_status_banner_renders_only_when_active_and_gated() {
+        // Off mode: no banner regardless of phase.
+        assert!(render_workflow_status(WorkflowPhase::Implement, WorkflowGateMode::Off).is_none());
+        // Idle phase: no banner even when gated.
+        assert!(render_workflow_status(WorkflowPhase::Idle, WorkflowGateMode::Enforced).is_none());
+        // Active + enforced.
+        assert_eq!(
+            render_workflow_status(WorkflowPhase::Implement, WorkflowGateMode::Enforced).as_deref(),
+            Some("Workflow phase: implement — gates: enforced")
+        );
+        // Active + advisory.
+        assert_eq!(
+            render_workflow_status(WorkflowPhase::Verify, WorkflowGateMode::Advisory).as_deref(),
+            Some("Workflow phase: verify — gates: advisory")
+        );
+    }
+
+    #[test]
+    fn build_splices_workflow_banner_after_skill_index() {
+        let prompt = SystemPromptBuilder::new()
+            .with_workflow_status(WorkflowPhase::Spec, WorkflowGateMode::Enforced)
+            .render();
+        assert!(prompt.contains("Workflow phase: spec — gates: enforced"));
     }
 
     fn skill(name: &str, description: &str) -> SkillMeta {
