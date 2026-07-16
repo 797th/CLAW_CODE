@@ -319,6 +319,68 @@ impl HookRunner {
         )
     }
 
+    /// Runs the hook commands configured for a lifecycle event
+    /// (`SessionStart`, `SessionEnd`, `UserPromptSubmit`, `Stop`,
+    /// `PreCompact`) through the JSON hook decision protocol
+    /// (`run_hook_command`/`classify_hook_exit`), the same protocol
+    /// implementation the tool-use path (`run_command`) uses. `payload`
+    /// should carry whatever fields are applicable for `event` (e.g.
+    /// `prompt`/`cwd` for `UserPromptSubmit`); `hook_event_name` is merged in
+    /// automatically. Commands run in configured order; the first `Block`
+    /// short-circuits the remaining commands. Tool-use events
+    /// (`PreToolUse`/`PostToolUse`/`PostToolUseFailure`) have no configured
+    /// commands here — use `run_pre_tool_use`/`run_post_tool_use`/
+    /// `run_post_tool_use_failure` for those.
+    #[must_use]
+    pub fn run_lifecycle(&self, event: HookEvent, payload: &Value) -> HookOutcome {
+        let commands: &[RuntimeHookCommand] = match event {
+            HookEvent::SessionStart => self.config.session_start_entries(),
+            HookEvent::SessionEnd => self.config.session_end_entries(),
+            HookEvent::UserPromptSubmit => self.config.user_prompt_submit_entries(),
+            HookEvent::Stop => self.config.stop_entries(),
+            HookEvent::PreCompact => self.config.pre_compact_entries(),
+            HookEvent::PreToolUse | HookEvent::PostToolUse | HookEvent::PostToolUseFailure => &[],
+        };
+
+        let mut contexts = Vec::new();
+        let mut warning = None;
+
+        for command in commands {
+            match run_hook_command(command.command(), event, payload) {
+                Ok(outcome) => {
+                    if let Some(context) = outcome.additional_context {
+                        contexts.push(context);
+                    }
+                    if warning.is_none() {
+                        warning = outcome.warning;
+                    }
+                    if matches!(outcome.decision, HookDecision::Block { .. }) {
+                        return HookOutcome {
+                            decision: outcome.decision,
+                            additional_context: join_hook_contexts(contexts),
+                            warning,
+                        };
+                    }
+                }
+                Err(error) => {
+                    if warning.is_none() {
+                        warning = Some(format!(
+                            "{} hook `{}` failed to start: {error}",
+                            event.as_str(),
+                            command.command()
+                        ));
+                    }
+                }
+            }
+        }
+
+        HookOutcome {
+            decision: HookDecision::Allow,
+            additional_context: join_hook_contexts(contexts),
+            warning,
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn run_commands(
         event: HookEvent,
@@ -454,7 +516,29 @@ impl HookRunner {
             Ok(CommandExecution::Finished(output)) => {
                 let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
                 let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-                let parsed = parse_hook_output(event, tool_name, command, &stdout, &stderr);
+                let mut parsed = parse_hook_output(event, tool_name, command, &stdout, &stderr);
+
+                // Run the same JSON hook decision protocol used by the
+                // standalone `run_hook_command` entry point over this
+                // command's captured stdout/stderr/exit code, and fold the
+                // canonical decision into the legacy `ParsedHookOutput` so
+                // both code paths agree on Allow/Block and PreToolUse denials
+                // keep producing a permission override even when the hook
+                // only speaks the plain `{"decision":"block",...}`/exit-2
+                // protocol rather than the richer `hookSpecificOutput` shape.
+                let outcome = classify_hook_exit(&stdout, &stderr, output.status.code());
+                if let HookDecision::Block { .. } = &outcome.decision {
+                    parsed.deny = true;
+                    if event == HookEvent::PreToolUse && parsed.permission_override.is_none() {
+                        parsed.permission_override = Some(PermissionOverride::Deny);
+                    }
+                }
+                if let Some(context) = outcome.additional_context.as_deref() {
+                    if !parsed.messages.iter().any(|message| message == context) {
+                        parsed.messages.push(context.to_string());
+                    }
+                }
+
                 let primary_message = parsed.primary_message().map(ToOwned::to_owned);
                 match output.status.code() {
                     Some(0) => {
@@ -465,10 +549,11 @@ impl HookRunner {
                         }
                     }
                     Some(2) => HookCommandOutcome::Deny {
-                        parsed: parsed.with_fallback_message(format!(
-                            "{} hook denied tool `{tool_name}`",
-                            event.as_str()
-                        )),
+                        parsed: parsed.with_fallback_message(if stderr.is_empty() {
+                            format!("{} hook denied tool `{tool_name}`", event.as_str())
+                        } else {
+                            stderr.clone()
+                        }),
                     },
                     Some(code) => HookCommandOutcome::Failed {
                         parsed: parsed.with_fallback_message(format_hook_failure(
@@ -507,6 +592,14 @@ impl HookRunner {
     }
 }
 
+fn join_hook_contexts(contexts: Vec<String>) -> Option<String> {
+    if contexts.is_empty() {
+        None
+    } else {
+        Some(contexts.join("\n\n"))
+    }
+}
+
 enum HookCommandOutcome {
     Allow { parsed: ParsedHookOutput },
     Deny { parsed: ParsedHookOutput },
@@ -520,6 +613,11 @@ enum HookCommandOutcome {
 pub struct HookOutcome {
     pub decision: HookDecision,
     pub additional_context: Option<String>,
+    /// Set when the hook process exited with a code other than 0/2, or was
+    /// terminated by a signal: a non-blocking execution problem that still
+    /// resolves to `Allow` but that callers should surface/log rather than
+    /// silently ignore (mirrors `HookRunner`'s tool-use `Failed` outcome).
+    pub warning: Option<String>,
 }
 
 impl HookOutcome {
@@ -545,7 +643,11 @@ pub enum HookDecision {
 
 /// Runs a single hook `command` for `event`, sending `payload` (with
 /// `hook_event_name` merged in) as JSON on the child's stdin and mapping the
-/// result to a `HookOutcome` per the JSON hook decision protocol:
+/// result to a `HookOutcome` per the JSON hook decision protocol. This is the
+/// same decision logic (`classify_hook_exit`) that `HookRunner`'s tool-use
+/// path (`run_command`) uses internally, so lifecycle callers (see
+/// `HookRunner::run_lifecycle`) and tool-use hooks share one implementation
+/// of the protocol:
 ///
 /// - exit 0 -> Allow
 /// - exit 2 -> Block, reason = stderr
@@ -553,6 +655,10 @@ pub enum HookDecision {
 ///   exit-code inference
 /// - `additionalContext` in JSON stdout (or, for non-JSON stdout, the raw
 ///   stdout text) is carried as `HookOutcome::additional_context`
+/// - any other exit code, or a signal-terminated process, is treated as a
+///   non-blocking failure: `decision` stays `Allow` but `HookOutcome::warning`
+///   is populated so callers can surface/log it (mirrors the `Failed`
+///   handling `HookRunner`'s tool-use path already has for these exit codes).
 pub fn run_hook_command(
     command: &str,
     event: HookEvent,
@@ -573,7 +679,11 @@ pub fn run_hook_command(
     child.stderr(Stdio::piped());
 
     match child.output_with_stdin(&payload_bytes, None)? {
-        CommandExecution::Finished(output) => Ok(hook_outcome_from_output(&output)),
+        CommandExecution::Finished(output) => {
+            let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            Ok(classify_hook_exit(&stdout, &stderr, output.status.code()))
+        }
         CommandExecution::Cancelled => Ok(HookOutcome::default()),
     }
 }
@@ -587,11 +697,15 @@ pub(crate) fn run_hook_command_for_test(
     run_hook_command(command, event, payload).expect("hook command should run")
 }
 
-fn hook_outcome_from_output(output: &std::process::Output) -> HookOutcome {
-    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-
-    if let Ok(Value::Object(root)) = serde_json::from_str::<Value>(&stdout) {
+/// The single implementation of the JSON hook decision protocol: given the
+/// captured stdout/stderr and exit code of a hook process, decides
+/// Allow/Block (+ reason), additional context, and any non-blocking-failure
+/// warning. Shared by `run_hook_command` (used by `HookRunner::run_lifecycle`
+/// and directly by callers of the standalone protocol) and by
+/// `HookRunner::run_command` (the tool-use path), so there is exactly one
+/// place that interprets a hook's stdout/stderr/exit code.
+fn classify_hook_exit(stdout: &str, stderr: &str, code: Option<i32>) -> HookOutcome {
+    if let Ok(Value::Object(root)) = serde_json::from_str::<Value>(stdout) {
         let additional_context = root
             .get("additionalContext")
             .and_then(Value::as_str)
@@ -606,33 +720,61 @@ fn hook_outcome_from_output(output: &std::process::Output) -> HookOutcome {
             return HookOutcome {
                 decision: HookDecision::Block { reason },
                 additional_context,
+                warning: None,
             };
         }
 
+        let (decision, warning) = exit_code_decision(code, stderr);
         return HookOutcome {
-            decision: exit_code_decision(output.status.code(), &stderr),
+            decision,
             additional_context,
+            warning,
         };
     }
 
-    let decision = exit_code_decision(output.status.code(), &stderr);
-    let additional_context = if matches!(decision, HookDecision::Allow) && !stdout.is_empty() {
-        Some(stdout)
+    let (decision, warning) = exit_code_decision(code, stderr);
+    let additional_context = if matches!(decision, HookDecision::Allow)
+        && warning.is_none()
+        && !stdout.is_empty()
+    {
+        Some(stdout.to_string())
     } else {
         None
     };
     HookOutcome {
         decision,
         additional_context,
+        warning,
     }
 }
 
-fn exit_code_decision(code: Option<i32>, stderr: &str) -> HookDecision {
+/// Maps a hook process's exit code to a decision plus an optional
+/// non-blocking-failure warning. Exit 0 allows; exit 2 blocks with `stderr`
+/// as the reason; any other exit code, or a signal-terminated process
+/// (`code` is `None`), is a non-blocking failure: it still allows, but a
+/// warning is returned so the caller can surface/log it rather than silently
+/// swallowing the unexpected exit.
+fn exit_code_decision(code: Option<i32>, stderr: &str) -> (HookDecision, Option<String>) {
     match code {
-        Some(2) => HookDecision::Block {
-            reason: stderr.to_string(),
-        },
-        _ => HookDecision::Allow,
+        Some(0) => (HookDecision::Allow, None),
+        Some(2) => (
+            HookDecision::Block {
+                reason: stderr.to_string(),
+            },
+            None,
+        ),
+        Some(other) => {
+            let warning = if stderr.is_empty() {
+                format!("hook exited with non-blocking status {other}")
+            } else {
+                format!("hook exited with non-blocking status {other}: {stderr}")
+            };
+            (HookDecision::Allow, Some(warning))
+        }
+        None => (
+            HookDecision::Allow,
+            Some("hook terminated by signal".to_string()),
+        ),
     }
 }
 
@@ -1361,6 +1503,7 @@ mod tests {
             HookOutcome {
                 decision: HookDecision::Allow,
                 additional_context: None,
+                warning: None,
             }
         );
     }
@@ -1372,6 +1515,7 @@ mod tests {
                 reason: "no".to_string(),
             },
             additional_context: None,
+            warning: None,
         };
         assert_eq!(
             outcome.permission_override_for_pre_tool_use(),
@@ -1383,5 +1527,83 @@ mod tests {
     fn allow_decision_has_no_permission_override() {
         let outcome = HookOutcome::default();
         assert_eq!(outcome.permission_override_for_pre_tool_use(), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_blocking_exit_code_allows_but_surfaces_warning() {
+        let out = run_hook_command_for_test(
+            "sh -c 'echo trouble >&2; exit 1'",
+            HookEvent::PreToolUse,
+            &json!({"tool_name":"Bash"}),
+        );
+        assert_eq!(out.decision, HookDecision::Allow);
+        let warning = out.warning.expect("exit code 1 should surface a warning");
+        assert!(warning.contains('1'));
+        assert!(warning.contains("trouble"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn signal_killed_hook_allows_but_surfaces_warning() {
+        let out = run_hook_command_for_test(
+            "sh -c 'kill -TERM $$'",
+            HookEvent::PreToolUse,
+            &json!({"tool_name":"Bash"}),
+        );
+        assert_eq!(out.decision, HookDecision::Allow);
+        let warning = out
+            .warning
+            .expect("signal-terminated hook should surface a warning");
+        assert!(warning.contains("signal"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_lifecycle_runs_configured_session_start_commands_through_json_protocol() {
+        let config = RuntimeHookConfig::default().with_lifecycle_hook_commands(
+            vec![RuntimeHookCommand::new(shell_snippet(
+                "echo 'workflow: run /start-work first'",
+            ))],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        );
+        let runner = HookRunner::new(config);
+
+        let outcome = runner.run_lifecycle(HookEvent::SessionStart, &json!({}));
+
+        assert_eq!(outcome.decision, HookDecision::Allow);
+        assert!(outcome.additional_context.unwrap().contains("/start-work"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_lifecycle_stop_event_blocks_on_json_decision() {
+        let config = RuntimeHookConfig::default().with_lifecycle_hook_commands(
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            vec![RuntimeHookCommand::new(
+                r#"echo '{"decision":"block","reason":"missing AC"}'"#.to_string(),
+            )],
+            Vec::new(),
+        );
+        let runner = HookRunner::new(config);
+
+        let outcome = runner.run_lifecycle(HookEvent::Stop, &json!({}));
+
+        assert!(
+            matches!(outcome.decision, HookDecision::Block { ref reason } if reason == "missing AC")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_lifecycle_is_a_noop_for_unconfigured_tool_use_events() {
+        let runner = HookRunner::new(RuntimeHookConfig::default());
+        let outcome = runner.run_lifecycle(HookEvent::PreToolUse, &json!({}));
+        assert_eq!(outcome, HookOutcome::default());
     }
 }

@@ -1317,6 +1317,26 @@ impl RuntimeHookConfig {
         }
     }
 
+    /// Builder for tests/callers that need to set lifecycle-event
+    /// (`SessionStart`/`SessionEnd`/`UserPromptSubmit`/`Stop`/`PreCompact`)
+    /// command lists directly rather than via config-file parsing.
+    #[must_use]
+    pub fn with_lifecycle_hook_commands(
+        mut self,
+        session_start: Vec<RuntimeHookCommand>,
+        session_end: Vec<RuntimeHookCommand>,
+        user_prompt_submit: Vec<RuntimeHookCommand>,
+        stop: Vec<RuntimeHookCommand>,
+        pre_compact: Vec<RuntimeHookCommand>,
+    ) -> Self {
+        self.session_start = session_start;
+        self.session_end = session_end;
+        self.user_prompt_submit = user_prompt_submit;
+        self.stop = stop;
+        self.pre_compact = pre_compact;
+        self
+    }
+
     #[must_use]
     pub fn pre_tool_use(&self) -> Vec<String> {
         hook_commands(&self.pre_tool_use)
