@@ -1,7 +1,7 @@
 use std::fmt::Write as FmtWrite;
 use std::io::{self, Write};
 
-use crossterm::cursor::{MoveToColumn, RestorePosition, SavePosition};
+use crossterm::cursor::MoveToColumn;
 use crossterm::style::{Color, Print, ResetColor, SetForegroundColor, Stylize};
 use crossterm::terminal::{Clear, ClearType};
 use crossterm::{execute, queue};
@@ -67,14 +67,18 @@ impl Spinner {
         self.frame_index += 1;
         queue!(
             out,
-            SavePosition,
             MoveToColumn(0),
             Clear(ClearType::CurrentLine),
             SetForegroundColor(theme.spinner_active),
             Print(format!("{frame} {label}")),
-            ResetColor,
-            RestorePosition
+            ResetColor
         )?;
+        out.flush()
+    }
+
+    pub fn clear(&mut self, out: &mut impl Write) -> io::Result<()> {
+        self.frame_index = 0;
+        execute!(out, MoveToColumn(0), Clear(ClearType::CurrentLine))?;
         out.flush()
     }
 

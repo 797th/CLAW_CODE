@@ -157,6 +157,10 @@ impl LineEditor {
         }
     }
 
+    pub fn set_prompt(&mut self, prompt: impl Into<String>) {
+        self.prompt = prompt.into();
+    }
+
     pub fn read_line(&mut self) -> io::Result<ReadOutcome> {
         if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
             return self.read_line_fallback();
