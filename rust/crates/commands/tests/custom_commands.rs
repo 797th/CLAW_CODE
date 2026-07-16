@@ -96,6 +96,34 @@ fn joins_multiple_arguments_verbatim() {
 }
 
 #[test]
+fn frontmatter_only_command_file_parses_to_empty_body_without_panicking() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let path = temp.path().join("noop.md");
+    // Frontmatter block with no trailing body content at all (not even a
+    // blank line) — the degenerate case for `strip_frontmatter_block`.
+    write_md(&path, "---\nname: noop\ndescription: Does nothing\n---\n");
+    let meta = CommandMeta {
+        name: "noop".to_string(),
+        description: "Does nothing".to_string(),
+        path,
+        argument_hint: None,
+    };
+    let registry = vec![meta];
+
+    let parsed = SlashCommand::parse_with_commands("/noop", &registry)
+        .expect("parse should succeed")
+        .expect("should produce a command");
+
+    assert_eq!(
+        parsed,
+        SlashCommand::Custom {
+            name: "noop".to_string(),
+            body: String::new(),
+        }
+    );
+}
+
+#[test]
 fn unknown_command_name_still_errors_as_unknown() {
     let registry: Vec<CommandMeta> = Vec::new();
     let parsed = SlashCommand::parse_with_commands("/totally-not-a-command", &registry)

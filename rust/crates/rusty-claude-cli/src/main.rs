@@ -7119,13 +7119,23 @@ fn run_resume_command(
     };
 
     match command {
-        SlashCommand::Help => Ok(ResumeCommandOutcome {
-            session: session.clone(),
-            message: Some(render_repl_help()),
-            json: Some(
-                serde_json::json!({ "kind": "help", "action": "help", "status": "ok", "message": render_repl_help() }),
-            ),
-        }),
+        SlashCommand::Help => {
+            // One-shot (non-interactive `--resume ... /help`) invocation:
+            // always discover fresh, there's no dispatch snapshot to stay
+            // consistent with here.
+            let (custom_commands, _warnings) = commands::resolve_custom_commands(
+                runtime::harness_assets::discover(&env::current_dir().unwrap_or_default())
+                    .commands,
+            );
+            let help_text = render_repl_help(&custom_commands);
+            Ok(ResumeCommandOutcome {
+                session: session.clone(),
+                json: Some(
+                    serde_json::json!({ "kind": "help", "action": "help", "status": "ok", "message": help_text.clone() }),
+                ),
+                message: Some(help_text),
+            })
+        }
         SlashCommand::Compact => {
             let result = runtime::trident::trident_compact_session(
                 session,
@@ -7688,19 +7698,6 @@ fn run_repl(
     let resolved_model = resolve_repl_model(model)?;
     let mut cli = LiveCli::new(resolved_model, true, allowed_tools, permission_mode)?;
     cli.set_reasoning_effort(reasoning_effort);
-    // Discover `.claw/commands/*.md` user-defined slash commands once at
-    // boot. Built-in commands always win name conflicts; a conflicting
-    // custom command is dropped and its warning surfaced here instead of
-    // failing REPL startup.
-    let discovered_commands = runtime::harness_assets::discover(
-        &env::current_dir().unwrap_or_default(),
-    )
-    .commands;
-    let (custom_commands, custom_command_warnings) =
-        commands::resolve_custom_commands(discovered_commands);
-    for warning in &custom_command_warnings {
-        eprintln!("{warning}");
-    }
     let mut editor = input::LineEditor::new(
         format_repl_prompt(&cli.model, cli.permission_mode),
         cli.repl_completion_candidates().unwrap_or_default(),
@@ -7727,9 +7724,32 @@ fn run_repl(
                     cli.persist_session()?;
                     break;
                 }
+                // Re-discover `.claw/commands/*.md` fresh for every slash
+                // command (rather than once at boot): a bounded, shallow
+                // directory walk, cheap enough to redo per input, and it
+                // keeps dispatch and `/help` from disagreeing about which
+                // custom commands exist mid-session (a file added after
+                // boot would otherwise show in `/help` but fail to parse).
+                // Built-in commands always win name conflicts; a
+                // conflicting custom command is dropped and its warning
+                // surfaced here instead of failing dispatch.
+                let custom_commands = if trimmed.starts_with('/') {
+                    let (kept, warnings) = commands::resolve_custom_commands(
+                        runtime::harness_assets::discover(
+                            &env::current_dir().unwrap_or_default(),
+                        )
+                        .commands,
+                    );
+                    for warning in &warnings {
+                        eprintln!("{warning}");
+                    }
+                    kept
+                } else {
+                    Vec::new()
+                };
                 match SlashCommand::parse_with_commands(&trimmed, &custom_commands) {
                     Ok(Some(command)) => {
-                        if cli.handle_repl_command(command)? {
+                        if cli.handle_repl_command(command, &custom_commands)? {
                             cli.persist_session()?;
                         }
                         continue;
@@ -8969,10 +8989,11 @@ impl LiveCli {
     fn handle_repl_command(
         &mut self,
         command: SlashCommand,
+        custom_commands: &[runtime::harness_assets::CommandMeta],
     ) -> Result<bool, Box<dyn std::error::Error>> {
         Ok(match command {
             SlashCommand::Help => {
-                println!("{}", render_repl_help());
+                println!("{}", render_repl_help(custom_commands));
                 false
             }
             SlashCommand::Status => {
@@ -10406,11 +10427,16 @@ fn session_clear_backup_path(session_path: &Path) -> PathBuf {
     session_path.with_file_name(format!("{file_name}.before-clear-{timestamp}.bak"))
 }
 
-fn render_repl_help() -> String {
-    let (custom_commands, _warnings) = commands::resolve_custom_commands(
-        runtime::harness_assets::discover(&env::current_dir().unwrap_or_default()).commands,
-    );
-    let project_commands_help = commands::render_project_commands_help(&custom_commands);
+/// Render the REPL's `/help` text. `custom_commands` is the caller's
+/// already-resolved `.claw/commands/*.md` registry (see
+/// `commands::resolve_custom_commands`) — this function only formats it, it
+/// never discovers on its own, so callers control freshness. This keeps the
+/// REPL's dispatch (`SlashCommand::parse_with_commands`) and `/help` output
+/// consistent: both are handed the exact same snapshot for a given input
+/// (see `run_repl`), rather than `/help` silently re-discovering a possibly
+/// different registry than the one dispatch is using.
+fn render_repl_help(custom_commands: &[runtime::harness_assets::CommandMeta]) -> String {
+    let project_commands_help = commands::render_project_commands_help(custom_commands);
 
     let mut sections = vec![
         "REPL".to_string(),
@@ -18589,7 +18615,7 @@ mod tests {
 
     #[test]
     fn repl_help_includes_shared_commands_and_exit() {
-        let help = render_repl_help();
+        let help = render_repl_help(&[]);
         assert!(help.contains("REPL"));
         assert!(help.contains("/help"));
         assert!(help.contains("Complete commands, modes, and recent sessions"));
@@ -20077,7 +20103,7 @@ UU conflicted.rs",
     }
     #[test]
     fn repl_help_mentions_history_completion_and_multiline() {
-        let help = render_repl_help();
+        let help = render_repl_help(&[]);
         assert!(help.contains("Up/Down"));
         assert!(help.contains("Tab"));
         assert!(help.contains("Shift+Enter/Ctrl+J"));
