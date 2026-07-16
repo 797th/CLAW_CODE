@@ -135,6 +135,12 @@ Technical content stays intact: code, commands, paths, identifiers, URLs, and
 exact errors remain unchanged. Ask for normal mode or more detail whenever a
 long-form explanation is useful.
 
+`clawcli` also includes an always-on Superpowers-style development workflow.
+For non-trivial changes it automatically applies focused discovery,
+brainstorming, planning, TDD, systematic debugging, review, and verification.
+Clear requests and small edits stay proportionate; no plugin installation or
+explicit skill invocation is required.
+
 <details>
 <summary>First run: connect an API</summary>
 

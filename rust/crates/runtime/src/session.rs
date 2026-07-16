@@ -630,6 +630,10 @@ impl Session {
             return Ok(());
         };
 
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+
         // Open with create+append in one syscall to avoid a TOCTOU race between
         // checking existence and opening. Inspect the already-open handle's
         // length to decide whether a full bootstrap write is needed.
@@ -651,6 +655,10 @@ impl Session {
         let Some(path) = self.persistence_path() else {
             return Ok(());
         };
+
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
 
         let mut file = OpenOptions::new().create(true).append(true).open(path)?;
         let needs_bootstrap = file.metadata()?.len() == 0;

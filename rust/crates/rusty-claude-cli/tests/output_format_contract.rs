@@ -780,12 +780,12 @@ fn status_json_accepts_namespaced_model_env_and_surfaces_alias_426() {
     let parsed = assert_json_command_with_env(&root, &["--output-format", "json", "status"], &envs);
 
     assert_eq!(parsed["status"], "ok");
-    assert_eq!(parsed["model"], "anthropic/claude-opus-4-7");
+    assert_eq!(parsed["model"], "claude-opus-4-6");
     assert_eq!(parsed["model_source"], "env");
     assert_eq!(parsed["model_raw"], "opus");
     assert_eq!(
         parsed["model_alias_resolved_to"],
-        "anthropic/claude-opus-4-7"
+        "claude-opus-4-6"
     );
     assert_eq!(parsed["model_env_var"], "CLAW_MODEL");
 }

@@ -209,6 +209,18 @@ const TOP_LEVEL_FIELDS: &[FieldSpec] = &[
         expected: FieldType::StringArray,
     },
     FieldSpec {
+        name: "provider",
+        expected: FieldType::Object,
+    },
+    FieldSpec {
+        name: "rulesImport",
+        expected: FieldType::RulesImport,
+    },
+    FieldSpec {
+        name: "subagentModel",
+        expected: FieldType::String,
+    },
+    FieldSpec {
         name: "autoMemoryEnabled",
         expected: FieldType::Bool,
     },

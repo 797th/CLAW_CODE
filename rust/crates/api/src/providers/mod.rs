@@ -405,9 +405,18 @@ pub fn provider_diagnostics_for_model(model: &str) -> ProviderDiagnostics {
                     base_url_env: "OPENAI_BASE_URL",
                     default_base_url: openai_compat::DEFAULT_OPENAI_BASE_URL,
                 },
+                ProviderKind::NvidiaNim => ProviderMetadata {
+                    provider: ProviderKind::NvidiaNim,
+                    auth_env: "NVIDIA_API_KEY",
+                    base_url_env: "NVIDIA_BASE_URL",
+                    default_base_url: openai_compat::DEFAULT_NVIDIA_NIM_BASE_URL,
+                },
             }
         });
-    let openai_compatible = matches!(metadata.provider, ProviderKind::OpenAi | ProviderKind::Xai);
+    let openai_compatible = matches!(
+        metadata.provider,
+        ProviderKind::OpenAi | ProviderKind::Xai | ProviderKind::NvidiaNim
+    );
     let reasoning_model = openai_compatible && openai_compat::is_reasoning_model(&resolved_model);
 
     ProviderDiagnostics {
@@ -441,6 +450,14 @@ pub fn detect_provider_kind(model: &str) -> ProviderKind {
     }
     if let Some(metadata) = metadata_for_model(model) {
         return metadata.provider;
+    }
+    // Local model tags (for example `llama3.2` or `qwen2.5-coder:7b`) should
+    // use an explicitly configured OpenAI-compatible endpoint even when an
+    // unrelated Anthropic credential is also present in the environment.
+    if openai_compat::has_configured_value("OPENAI_BASE_URL")
+        && looks_like_local_openai_model(model)
+    {
+        return ProviderKind::OpenAi;
     }
     // When OPENAI_BASE_URL is set, the user explicitly configured an
     // OpenAI-compatible endpoint. Prefer it over the Anthropic fallback
@@ -522,6 +539,19 @@ pub fn provider_capabilities_for_model(model: &str) -> ProviderCapabilityReport 
             ProviderFeatureSupport::Supported,
         ),
         ProviderKind::OpenAi => (
+            ProviderWireProtocol::OpenAiChatCompletions,
+            ProviderFeatureSupport::Supported,
+            ProviderFeatureSupport::Unsupported,
+            ProviderFeatureSupport::Supported,
+            ProviderFeatureSupport::Supported,
+            if openai_compat::model_requires_reasoning_content_in_history(model) {
+                ProviderFeatureSupport::Supported
+            } else {
+                ProviderFeatureSupport::Unsupported
+            },
+            ProviderFeatureSupport::Supported,
+        ),
+        ProviderKind::NvidiaNim => (
             ProviderWireProtocol::OpenAiChatCompletions,
             ProviderFeatureSupport::Supported,
             ProviderFeatureSupport::Unsupported,
@@ -641,6 +671,12 @@ fn metadata_for_provider_kind(provider: ProviderKind) -> ProviderMetadata {
             base_url_env: "OPENAI_BASE_URL",
             default_base_url: openai_compat::DEFAULT_OPENAI_BASE_URL,
         },
+        ProviderKind::NvidiaNim => ProviderMetadata {
+            provider,
+            auth_env: "NVIDIA_API_KEY",
+            base_url_env: "NVIDIA_BASE_URL",
+            default_base_url: openai_compat::DEFAULT_NVIDIA_NIM_BASE_URL,
+        },
     }
 }
 
@@ -650,6 +686,7 @@ const fn provider_label(provider: ProviderKind) -> &'static str {
         ProviderKind::Anthropic => "Anthropic",
         ProviderKind::Xai => "xAI",
         ProviderKind::OpenAi => "OpenAI-compatible",
+        ProviderKind::NvidiaNim => "NVIDIA NIM",
     }
 }
 

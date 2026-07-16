@@ -506,21 +506,157 @@ impl ConfigLoader {
         build_runtime_config(merged, loaded_entries, mcp)
     }
 
-        let feature_config = RuntimeFeatureConfig {
-            hooks: parse_optional_hooks_config(&merged_value)?,
-            plugins: parse_optional_plugin_config(&merged_value)?,
-            memory: parse_optional_memory_config(&merged_value)?,
-            mcp: McpConfigCollection {
-                servers: mcp_servers,
-            },
-            oauth: parse_optional_oauth_config(&merged_value, "merged settings.oauth")?,
-            model: parse_optional_model(&merged_value),
-            aliases: parse_optional_aliases(&merged_value)?,
-            permission_mode: parse_optional_permission_mode(&merged_value)?,
-            permission_rules: parse_optional_permission_rules(&merged_value)?,
-            sandbox: parse_optional_sandbox_config(&merged_value)?,
-            provider_fallbacks: parse_optional_provider_fallbacks(&merged_value)?,
-            trusted_roots: parse_optional_trusted_roots(&merged_value)?,
+    /// Like [`load`] but also returns validation warnings without emitting them
+    /// to stderr. This is used by structured-output callers.
+    pub fn load_collecting_warnings(&self) -> Result<(RuntimeConfig, Vec<String>), ConfigError> {
+        let mut merged = BTreeMap::new();
+        let mut loaded_entries = Vec::new();
+        let mut mcp = McpConfigCollection::default();
+        let mut warnings = Vec::new();
+
+        for entry in self.discover() {
+            crate::config_validate::check_unsupported_format(&entry.path)?;
+            let OptionalConfigFile::Loaded(parsed) = read_optional_json_object(&entry.path)? else {
+                continue;
+            };
+            let validation = crate::config_validate::validate_config_file(
+                &parsed.object,
+                &parsed.source,
+                &entry.path,
+            );
+            if !validation.is_ok() {
+                let first_error = &validation.errors[0];
+                return Err(ConfigError::Parse(first_error.to_string()));
+            }
+            warnings.extend(validation.warnings.iter().map(ToString::to_string));
+            validate_optional_hooks_config(&parsed.object, &entry.path)?;
+            merge_mcp_servers(&mut mcp, entry.source, &parsed.object, &entry.path)?;
+            deep_merge_objects(&mut merged, &parsed.object);
+            loaded_entries.push(entry);
+        }
+
+        let config = build_runtime_config(merged, loaded_entries, mcp)?;
+        Ok((config, warnings))
+    }
+
+    /// Inspect every discovered config path and return per-file status details.
+    /// Invalid files are reported and skipped so structured callers can show
+    /// the complete discovery picture.
+    #[must_use]
+    pub fn inspect_collecting_warnings(&self) -> ConfigInspection {
+        let mut merged = BTreeMap::new();
+        let mut loaded_entries = Vec::new();
+        let mut mcp = McpConfigCollection::default();
+        let mut warnings = Vec::new();
+        let mut files = Vec::new();
+        let mut load_error = None;
+
+        for (index, entry) in self.discover().into_iter().enumerate() {
+            let precedence_rank = index + 1;
+            if let Err(error) = crate::config_validate::check_unsupported_format(&entry.path) {
+                let detail = error.to_string();
+                load_error.get_or_insert_with(|| detail.clone());
+                files.push(ConfigFileReport::load_error(
+                    entry,
+                    precedence_rank,
+                    "unsupported_format",
+                    detail,
+                ));
+                continue;
+            }
+
+            let parsed = match read_optional_json_object(&entry.path) {
+                Ok(OptionalConfigFile::Loaded(parsed)) => parsed,
+                Ok(OptionalConfigFile::NotFound) => {
+                    files.push(ConfigFileReport::not_found(entry, precedence_rank));
+                    continue;
+                }
+                Ok(OptionalConfigFile::Skipped { reason, detail }) => {
+                    files.push(ConfigFileReport::skipped(
+                        entry,
+                        precedence_rank,
+                        reason,
+                        detail,
+                    ));
+                    continue;
+                }
+                Err(error) => {
+                    let reason = config_error_reason(&error).to_string();
+                    let detail = error.to_string();
+                    load_error.get_or_insert_with(|| detail.clone());
+                    files.push(ConfigFileReport::load_error(
+                        entry,
+                        precedence_rank,
+                        reason,
+                        detail,
+                    ));
+                    continue;
+                }
+            };
+
+            let validation = crate::config_validate::validate_config_file(
+                &parsed.object,
+                &parsed.source,
+                &entry.path,
+            );
+            if !validation.is_ok() {
+                let detail = validation.errors[0].to_string();
+                load_error.get_or_insert_with(|| detail.clone());
+                files.push(ConfigFileReport::load_error(
+                    entry,
+                    precedence_rank,
+                    "validation_error",
+                    detail,
+                ));
+                continue;
+            }
+            warnings.extend(
+                validation
+                    .warnings
+                    .iter()
+                    .map(ToString::to_string),
+            );
+
+            if let Err(error) = validate_optional_hooks_config(&parsed.object, &entry.path) {
+                let detail = error.to_string();
+                load_error.get_or_insert_with(|| detail.clone());
+                files.push(ConfigFileReport::load_error(
+                    entry,
+                    precedence_rank,
+                    "validation_error",
+                    detail,
+                ));
+                continue;
+            }
+
+            if let Err(error) =
+                merge_mcp_servers(&mut mcp, entry.source, &parsed.object, &entry.path)
+            {
+                let detail = error.to_string();
+                load_error.get_or_insert_with(|| detail.clone());
+                files.push(ConfigFileReport::load_error(
+                    entry,
+                    precedence_rank,
+                    "parse_error",
+                    detail,
+                ));
+                continue;
+            }
+
+            let key_paths = collect_config_key_paths(&parsed.object);
+            deep_merge_objects(&mut merged, &parsed.object);
+            loaded_entries.push(entry.clone());
+            files.push(ConfigFileReport::loaded(entry, precedence_rank, key_paths));
+        }
+
+        annotate_config_file_precedence(&mut files);
+
+        let runtime_config = match build_runtime_config(merged, loaded_entries, mcp) {
+            Ok(config) => Some(config),
+            Err(error) => {
+                load_error.get_or_insert_with(|| error.to_string());
+                None
+            }
         };
 
         ConfigInspection {
@@ -658,6 +794,7 @@ fn build_runtime_config(
     let feature_config = RuntimeFeatureConfig {
         hooks: parse_optional_hooks_config(&merged_value)?,
         plugins: parse_optional_plugin_config(&merged_value)?,
+        memory: parse_optional_memory_config(&merged_value)?,
         mcp,
         oauth: parse_optional_oauth_config(&merged_value, "merged settings.oauth")?,
         model: parse_optional_model(&merged_value),

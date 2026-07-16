@@ -3,7 +3,7 @@ use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use crate::config::{ConfigError, ConfigLoader, RuntimeConfig};
+use crate::config::{ConfigError, ConfigLoader, RulesImportConfig, RuntimeConfig};
 use crate::dreamer::DreamerError;
 use crate::git_context::GitContext;
 use crate::MemoryManager;
@@ -69,6 +69,25 @@ Use terse, high-signal language in every reply. This style is active from the fi
 - Use complete, unambiguous prose for security warnings, irreversible actions, confirmations, multi-step procedures, and situations where compression could cause a mistake.
 - Never announce or label this style, and never provide a normal answer followed by a style recap.
 - If the user asks for normal mode, more detail, or clarification, follow that request for the relevant response; resume concise style afterward unless they ask to keep it off.
+"#;
+
+/// Always-on software-development workflow rules adapted from Jesse Vincent's
+/// Superpowers methodology. This lives in the shared prompt so it is active
+/// even when no project-local skill files or plugins are installed.
+pub const SUPERPOWERS_SYSTEM_PROMPT: &str = r#"# Always-on development workflow
+
+Apply this workflow automatically; no skill or plugin invocation is required. User instructions and safety constraints take precedence.
+
+- For requests that change, build, debug, or review software, first understand the goal, constraints, relevant instructions, existing code, and current state before editing.
+- For ambiguous or non-trivial feature work, brainstorm briefly: refine intent, identify meaningful options and trade-offs, state a design, and get confirmation when a choice materially changes scope. If the request is already clear, keep this step short and proceed.
+- Once direction is clear, make a small concrete plan with file paths, behavior, tests, and verification. Keep tasks independently checkable. Use YAGNI; avoid speculative abstractions and unrelated cleanup.
+- Implement with red-green-refactor where practical: write a focused failing test, confirm it fails for the intended reason, make the smallest change, then refactor only while tests stay green.
+- Debug systematically: reproduce, isolate, trace to root cause, fix the cause, then add regression coverage. Do not patch symptoms blindly.
+- Select relevant workflow stages automatically: brainstorming, planning, TDD, systematic debugging, review, and finishing. Use parallel or subagent workflows only when tools support them and the work can be safely isolated.
+- Do not create branches or worktrees, alter external systems, or discard user changes without authorization. Preserve unrelated work in a dirty workspace.
+- Before claiming completion, inspect the diff and run the narrowest relevant tests, build, or lint checks. Report exact verification results and any failures or skipped checks.
+- Scale ceremony to risk: explanations, read-only requests, and trivial edits need concise handling, but code changes still require proportionate tests and verification.
+- Keep process guidance internal. Show users only useful questions, decisions, progress, evidence, and results.
 "#;
 
 /// Neutral identity for the model family line in generated prompts.
@@ -246,6 +265,7 @@ impl SystemPromptBuilder {
         let mut sections = Vec::new();
         sections.push(get_simple_intro_section(self.output_style_name.is_some()));
         sections.push(CAVEMAN_SYSTEM_PROMPT.to_string());
+        sections.push(SUPERPOWERS_SYSTEM_PROMPT.to_string());
         if let (Some(name), Some(prompt)) = (&self.output_style_name, &self.output_style_prompt) {
             sections.push(format!("# Output Style: {name}\n{prompt}"));
         }
@@ -679,12 +699,14 @@ pub fn load_system_prompt_with_context(
 ) -> Result<(Vec<String>, ProjectContext), PromptBuildError> {
     let cwd = cwd.into();
     let config = ConfigLoader::default_for(&cwd).load()?;
+    let project_context =
+        discover_with_git_and_rules_import(&cwd, current_date.into(), config.rules_import())?;
     let memory_prompt =
         MemoryManager::new(cwd.clone(), config.memory().clone()).load_memory_prompt()?;
-    Ok(SystemPromptBuilder::new()
+    let sections = SystemPromptBuilder::new()
         .with_os(os_name, os_version)
         .with_model_family(model_family)
-        .with_project_context(project_context)
+        .with_project_context(project_context.clone())
         .with_memory_prompt(memory_prompt)
         .with_runtime_config(config)
         .build();
@@ -1412,6 +1434,25 @@ mod tests {
         assert!(prompt.contains("active from the first turn"));
         assert!(prompt.contains("Keep code blocks unchanged."));
         assert!(prompt.contains("Use complete, unambiguous prose"));
+    }
+
+    #[test]
+    fn embeds_always_on_development_workflow() {
+        let project_context = ProjectContext {
+            cwd: PathBuf::from("/tmp/project"),
+            current_date: "2026-03-31".to_string(),
+            ..ProjectContext::default()
+        };
+
+        let prompt = SystemPromptBuilder::new()
+            .with_os("linux", "6.8")
+            .with_project_context(project_context)
+            .render();
+
+        assert!(prompt.contains("# Always-on development workflow"));
+        assert!(prompt.contains("no skill or plugin invocation is required"));
+        assert!(prompt.contains("red-green-refactor"));
+        assert!(prompt.contains("Before claiming completion"));
     }
 
     #[test]

@@ -1009,6 +1009,7 @@ fn should_preserve_routing_prefix(model: &str, config: OpenAiCompatConfig, base_
 
     config.provider_name == "OpenAI"
         && normalized_base_url != DEFAULT_OPENAI_BASE_URL
+        && !is_local_openai_compatible_base_url(base_url)
         && model.starts_with("openai/")
 }
 
@@ -1109,6 +1110,16 @@ fn wire_model_for_base_url<'a>(
 #[must_use]
 pub fn estimate_request_body_size(request: &MessageRequest, config: OpenAiCompatConfig) -> usize {
     let payload = build_chat_completion_request(request, config);
+    serde_json::to_vec(&payload).map_or(0, |v| v.len())
+}
+
+#[must_use]
+fn estimate_request_body_size_for_base_url(
+    request: &MessageRequest,
+    config: OpenAiCompatConfig,
+    base_url: &str,
+) -> usize {
+    let payload = build_chat_completion_request_for_base_url(request, config, base_url);
     serde_json::to_vec(&payload).map_or(0, |v| v.len())
 }
 
@@ -3052,7 +3063,11 @@ mod tests {
     #[test]
     fn local_routing_prefix_strips_only_escape_hatch() {
         assert_eq!(
-            super::strip_routing_prefix("local/Qwen/Qwen3.6-27B-FP8"),
+            super::strip_routing_prefix(
+                "local/Qwen/Qwen3.6-27B-FP8",
+                OpenAiCompatConfig::openai(),
+                "http://127.0.0.1:8000/v1",
+            ),
             "Qwen/Qwen3.6-27B-FP8"
         );
         assert_eq!(

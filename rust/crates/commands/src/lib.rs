@@ -2770,7 +2770,7 @@ pub fn handle_skills_slash_command(args: Option<&str>, cwd: &Path) -> std::io::R
                 || args.starts_with("info ")
                 || args.starts_with("describe ") =>
         {
-            let name = args
+            let name_raw = args
                 .split_once(' ')
                 .map(|x| x.1)
                 .unwrap_or_default()
@@ -2919,7 +2919,7 @@ pub fn handle_skills_slash_command_json(args: Option<&str>, cwd: &Path) -> std::
                 || args.starts_with("info ")
                 || args.starts_with("describe ") =>
         {
-            let name = args
+            let name_raw = args
                 .split_once(' ')
                 .map(|x| x.1)
                 .unwrap_or_default()
@@ -3210,10 +3210,10 @@ fn render_mcp_report_for(
             match loader.load() {
                 Ok(runtime_config) => Ok(render_mcp_summary_report(
                     cwd,
-                    runtime_config.mcp().servers(),
+                    runtime_config.mcp(),
                 )),
                 Err(err) => {
-                    let empty = std::collections::BTreeMap::new();
+                    let empty = McpConfigCollection::default();
                     Ok(format!(
                         "Config load error\n  Status           fail\n  Summary          runtime config failed to load; reporting partial MCP view\n  Details          {err}\n  Hint             `clawcli doctor` classifies config parse errors; fix the listed field and rerun\n\n{}",
                         render_mcp_summary_report(cwd, &empty)
@@ -4961,6 +4961,7 @@ fn render_skills_usage(unexpected: Option<&str>) -> String {
         "  Usage            /skills [list|show <name>|install [--project] <path>|uninstall <name>|help|<skill> [args]]".to_string(),
         "  Alias            /skill".to_string(),
         "  Direct CLI       clawcli skills [list|install <path>|help|<skill> [args]]".to_string(),
+        "  Lifecycle        install <path>, uninstall <name>".to_string(),
         "  Invoke           /skills help overview -> $help overview".to_string(),
         "  Install root     $CLAW_CONFIG_HOME/skills or ~/.claw/skills (use --project for .claw/skills)".to_string(),
         "  Sources          .claw/skills, .omc/skills, .agents/skills, .codex/skills, .claude/skills, ~/.claw/skills, ~/.omc/skills, ~/.claude/skills/omc-learned, ~/.codex/skills, ~/.claude/skills, legacy /commands".to_string(),
@@ -4981,6 +4982,7 @@ fn render_skills_usage_json(unexpected: Option<&str>) -> Value {
             "slash_command": "/skills [list|show <name>|install <path>|uninstall <name>|help|<skill> [args]]",
             "aliases": ["/skill"],
             "direct_cli": "clawcli skills [list|install <path>|help|<skill> [args]]",
+            "lifecycle": ["install <path>", "uninstall <name>"],
             "invoke": "/skills help overview -> $help overview",
             "install_root": "$CLAW_CONFIG_HOME/skills or ~/.claw/skills",
             "sources": [
@@ -6051,7 +6053,7 @@ mod tests {
         assert!(help.contains("aliases: /skill"));
         assert!(help.contains("/login"));
         assert!(!help.contains("/logout"));
-        assert_eq!(slash_command_specs().len(), 141);
+        assert_eq!(slash_command_specs().len(), 142);
         assert!(resume_supported_slash_commands().len() >= 39);
     }
 
