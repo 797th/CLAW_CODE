@@ -18786,7 +18786,8 @@ mod tests {
             },
         );
 
-        assert!(prompt.contains('•'));
+        // The input prompt is now a shaded chip (chevron), not a bare dot.
+        assert!(prompt.contains('›'));
         assert!(!prompt.contains("custom-model"));
         assert!(!prompt.contains('\n'));
         assert!(footer.contains("custom-model"));
@@ -18795,6 +18796,25 @@ mod tests {
         assert!(footer.contains("bypass"));
         assert!(footer.contains('•'));
         assert!(!footer.contains('\n'));
+    }
+
+    #[test]
+    fn repl_footer_counters_and_plan_mode_label() {
+        // Live token + dollar counters climb with cumulative usage and the
+        // plan posture (read-only) renders its own label in the footer.
+        let footer = format_repl_footer(
+            "custom-model",
+            PermissionMode::ReadOnly,
+            runtime::TokenUsage {
+                input_tokens: 1000,
+                output_tokens: 500,
+                ..Default::default()
+            },
+        );
+        assert!(footer.contains("1500 tok"));
+        assert!(footer.contains("$"));
+        assert!(footer.contains("plan"));
+        assert!(!footer.contains("read-only"));
     }
 
     #[test]
