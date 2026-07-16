@@ -14,6 +14,7 @@
     clippy::unnecessary_wraps,
     clippy::unused_self
 )]
+mod harness_templates;
 mod init;
 mod input;
 mod mao;
@@ -67,6 +68,7 @@ use runtime::{
     RuntimeError, RuntimeInvalidHookConfig, Session, TokenUsage, ToolError, ToolExecutor,
     TurnSummary, UsageTracker,
 };
+use runtime::{GateCheck, GateEvidence, WorkflowState};
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
 use tools::{
@@ -1594,7 +1596,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
         CliAction::SessionList { output_format } => run_session_list(output_format)?,
         CliAction::State { output_format } => run_worker_state(output_format)?,
-        CliAction::Init { output_format } => run_init(output_format)?,
+        CliAction::Init {
+            output_format,
+            harness,
+        } => run_init(output_format, harness)?,
         CliAction::Setup { output_format: _ } => run_setup()?,
         // #146: dispatch pure-local introspection. Text mode uses existing
         // render_config_report/render_diff_report; JSON mode uses the
@@ -1654,16 +1659,21 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             manager_model,
             worker_model,
             output_format,
-        } => match mao::run_orchestrate(&manager_model, &worker_model, &prompt) {
-            Ok(result) => match output_format {
-                CliOutputFormat::Json => println!("{}", result.render_json()),
-                CliOutputFormat::Text => println!("{}", result.render_text()),
-            },
-            Err(e) => {
-                eprintln!("orchestration error: {e}");
-                std::process::exit(1);
+        } => {
+            let assets =
+                runtime::harness_assets::discover(&env::current_dir().unwrap_or_default());
+            let personas = mao::load_personas(&assets);
+            match mao::run_orchestrate(&manager_model, &worker_model, &prompt, personas) {
+                Ok(result) => match output_format {
+                    CliOutputFormat::Json => println!("{}", result.render_json()),
+                    CliOutputFormat::Text => println!("{}", result.render_text()),
+                },
+                Err(e) => {
+                    eprintln!("orchestration error: {e}");
+                    std::process::exit(1);
+                }
             }
-        },
+        }
         CliAction::HelpTopic {
             topic,
             output_format,
@@ -1753,6 +1763,7 @@ enum CliAction {
     },
     Init {
         output_format: CliOutputFormat,
+        harness: bool,
     },
     Setup {
         output_format: CliOutputFormat,
@@ -2651,7 +2662,27 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
         "acp" => parse_acp_args(&rest[1..], output_format),
         "login" => Err(removed_auth_surface_error(rest[0].as_str())),
         "logout" => Err(removed_auth_surface_error(rest[0].as_str())),
-        "init" => Ok(CliAction::Init { output_format }),
+        "init" => {
+            let unexpected: Vec<&String> = rest[1..]
+                .iter()
+                .filter(|arg| arg.as_str() != "--harness")
+                .collect();
+            if !unexpected.is_empty() {
+                return Err(format!(
+                    "unexpected extra arguments after `claw init`: {}\nUsage: claw init [--harness] [--output-format json]",
+                    unexpected
+                        .iter()
+                        .map(|s| s.as_str())
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                ));
+            }
+            let harness = rest[1..].iter().any(|arg| arg == "--harness");
+            Ok(CliAction::Init {
+                output_format,
+                harness,
+            })
+        }
         "export" => parse_export_args(&rest[1..], output_format),
         "orchestrate" => {
             // Usage: clawcli orchestrate [--worker-model <model>] <prompt…>
@@ -3697,6 +3728,100 @@ fn config_model_for_current_dir() -> Option<String> {
     let cwd = env::current_dir().ok()?;
     let loader = ConfigLoader::default_for(&cwd);
     loader.load().ok()?.model().map(ToOwned::to_owned)
+}
+
+/// Reserved alias names that map to built-in models and must not be overwritten
+/// by user-added aliases. Mirrors the arms of [`resolve_model_alias`].
+fn reserved_model_alias(alias: &str) -> bool {
+    let lower = alias.to_ascii_lowercase();
+    matches!(
+        lower.as_str(),
+        "opus" | "sonnet" | "haiku" | "gpt-oss" | "gptoss" | "gpt-oss-120b" | "gpt-oss-20b"
+    ) || matches!(
+        alias,
+        "add" | "remove" | "list" // reserved /model subcommands
+    )
+}
+
+/// Register a model alias without any prompting. Shared by the resume/one-shot
+/// path and the REPL `/model add` handler when both arguments are supplied.
+/// Returns `(text_message, json_payload)`.
+fn apply_headless_model_add(
+    alias: Option<&str>,
+    model: Option<&str>,
+) -> Result<(String, serde_json::Value), Box<dyn std::error::Error>> {
+    let (Some(alias), Some(model)) = (alias, model) else {
+        return Err(
+            "model add needs both an alias and a model in non-interactive mode.\n\
+             Usage: /model add <alias> <provider/model>  (or run /model add in the REPL)"
+                .into(),
+        );
+    };
+    let alias = alias.trim();
+    let model = model.trim();
+    if alias.is_empty() {
+        return Err("alias cannot be empty.".into());
+    }
+    if reserved_model_alias(alias) {
+        return Err(format!(
+            "'{alias}' is a reserved model name; choose a different alias."
+        )
+        .into());
+    }
+    // Validate the target syntax (provider/model or a configured alias).
+    if let Err(message) = validate_model_syntax(model) {
+        return Err(message.into());
+    }
+    let resolved = resolve_model_alias_with_config(model);
+    let path = runtime::save_user_model_alias(alias, &resolved)
+        .map_err(|e| format!("failed to save model alias: {e}"))?;
+
+    let message = format!(
+        "Model alias added\n  Alias            {alias}\n  Resolves to      {resolved}\n  Saved to         {}",
+        path.display()
+    );
+    let json = serde_json::json!({
+        "kind": "models",
+        "action": "add",
+        "status": "ok",
+        "alias": alias,
+        "model": resolved,
+        "path": path.to_string_lossy(),
+    });
+    Ok((message, json))
+}
+
+/// Remove a model alias without any prompting. Shared by the resume/one-shot
+/// path and the REPL `/model remove` handler when the alias is supplied.
+fn apply_headless_model_remove(
+    alias: Option<&str>,
+) -> Result<(String, serde_json::Value), Box<dyn std::error::Error>> {
+    let Some(alias) = alias else {
+        return Err(
+            "model remove needs an alias in non-interactive mode.\n\
+             Usage: /model remove <alias>  (or run /model remove in the REPL)"
+                .into(),
+        );
+    };
+    let alias = alias.trim();
+    if alias.is_empty() {
+        return Err("alias cannot be empty.".into());
+    }
+    let removed = runtime::remove_user_model_alias(alias)
+        .map_err(|e| format!("failed to remove model alias: {e}"))?;
+    let message = if removed {
+        format!("Model alias removed\n  Alias            {alias}")
+    } else {
+        format!("Model alias not found\n  Alias            {alias}")
+    };
+    let json = serde_json::json!({
+        "kind": "models",
+        "action": "remove",
+        "status": if removed { "ok" } else { "not_found" },
+        "alias": alias,
+        "removed": removed,
+    });
+    Ok((message, json))
 }
 
 fn resolve_repl_model(cli_model: String) -> Result<String, String> {
@@ -7151,13 +7276,23 @@ fn run_resume_command(
     };
 
     match command {
-        SlashCommand::Help => Ok(ResumeCommandOutcome {
-            session: session.clone(),
-            message: Some(render_repl_help()),
-            json: Some(
-                serde_json::json!({ "kind": "help", "action": "help", "status": "ok", "message": render_repl_help() }),
-            ),
-        }),
+        SlashCommand::Help => {
+            // One-shot (non-interactive `--resume ... /help`) invocation:
+            // always discover fresh, there's no dispatch snapshot to stay
+            // consistent with here.
+            let (custom_commands, _warnings) = commands::resolve_custom_commands(
+                runtime::harness_assets::discover(&env::current_dir().unwrap_or_default())
+                    .commands,
+            );
+            let help_text = render_repl_help(&custom_commands);
+            Ok(ResumeCommandOutcome {
+                session: session.clone(),
+                json: Some(
+                    serde_json::json!({ "kind": "help", "action": "help", "status": "ok", "message": help_text.clone() }),
+                ),
+                message: Some(help_text),
+            })
+        }
         SlashCommand::Compact => {
             let result = runtime::trident::trident_compact_session(
                 session,
@@ -7518,12 +7653,23 @@ fn run_resume_command(
             let resolved_config_model = configured_model
                 .as_deref()
                 .map(resolve_model_alias_with_config);
+            let configured_aliases = runtime::load_user_model_aliases().unwrap_or_default();
+            let aliases_text = if configured_aliases.is_empty() {
+                "<none>".to_string()
+            } else {
+                configured_aliases
+                    .iter()
+                    .map(|(alias, target)| format!("{alias} → {target}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
             Ok(ResumeCommandOutcome {
                 session: session.clone(),
                 message: Some(format!(
-                    "Models\n  Default          {}\n  Config model     {}",
+                    "Models\n  Default          {}\n  Config model     {}\n  Aliases          {}\n\nUsage\n  Inspect current model with /model\n  Switch models with /model <name>\n  Add a model with /model add [alias] [provider/model]\n  Remove with /model remove <alias>",
                     DEFAULT_MODEL,
-                    configured_model.as_deref().unwrap_or("<unset>")
+                    configured_model.as_deref().unwrap_or("<unset>"),
+                    aliases_text,
                 )),
                 json: Some(serde_json::json!({
                     "kind": "models",
@@ -7532,9 +7678,31 @@ fn run_resume_command(
                     "default_model": DEFAULT_MODEL,
                     "configured_model": configured_model,
                     "resolved_model": resolved_config_model,
+                    "configured_aliases": serde_json::Value::Object(
+                        configured_aliases
+                            .into_iter()
+                            .map(|(k, v)| (k, serde_json::Value::String(v)))
+                            .collect(),
+                    ),
                     "requested_model": model,
                 })),
             })
+        }
+        SlashCommand::ModelAdd { alias, model } => {
+            apply_headless_model_add(alias.as_deref(), model.as_deref())
+                .map(|(message, json)| ResumeCommandOutcome {
+                    session: session.clone(),
+                    message: Some(message),
+                    json: Some(json),
+                })
+        }
+        SlashCommand::ModelRemove { alias } => {
+            apply_headless_model_remove(alias.as_deref())
+                .map(|(message, json)| ResumeCommandOutcome {
+                    session: session.clone(),
+                    message: Some(message),
+                    json: Some(json),
+                })
         }
         SlashCommand::Bughunter { .. }
         | SlashCommand::Commit { .. }
@@ -7584,7 +7752,9 @@ fn run_resume_command(
         | SlashCommand::OutputStyle { .. }
         | SlashCommand::AddDir { .. }
         | SlashCommand::Team { .. }
-        | SlashCommand::Setup => Err("unsupported resumed slash command".into()),
+        | SlashCommand::Setup
+        | SlashCommand::Custom { .. }
+        | SlashCommand::Workflow { .. } => Err("unsupported resumed slash command".into()),
     }
 }
 
@@ -7753,7 +7923,30 @@ fn run_repl(
                     cli.persist_session()?;
                     break;
                 }
-                match SlashCommand::parse(&trimmed) {
+                // Re-discover `.claw/commands/*.md` fresh for every slash
+                // command (rather than once at boot): a bounded, shallow
+                // directory walk, cheap enough to redo per input, and it
+                // keeps dispatch and `/help` from disagreeing about which
+                // custom commands exist mid-session (a file added after
+                // boot would otherwise show in `/help` but fail to parse).
+                // Built-in commands always win name conflicts; a
+                // conflicting custom command is dropped and its warning
+                // surfaced here instead of failing dispatch.
+                let custom_commands = if trimmed.starts_with('/') {
+                    let (kept, warnings) = commands::resolve_custom_commands(
+                        runtime::harness_assets::discover(
+                            &env::current_dir().unwrap_or_default(),
+                        )
+                        .commands,
+                    );
+                    for warning in &warnings {
+                        eprintln!("{warning}");
+                    }
+                    kept
+                } else {
+                    Vec::new()
+                };
+                match SlashCommand::parse_with_commands(&trimmed, &custom_commands) {
                     Ok(Some(command)) => {
                         if let Some(prompt) = repl_command_model_prompt(&command) {
                             editor.push_history(input);
@@ -7763,10 +7956,8 @@ fn run_repl(
                                 print_superpowers_checklist();
                             }
                             cli.run_turn(&prompt)?;
-                        } else {
-                            if cli.handle_repl_command(command)? {
-                                cli.persist_session()?;
-                            }
+                        } else if cli.handle_repl_command(command, &custom_commands)? {
+                            cli.persist_session()?;
                         }
                         continue;
                     }
@@ -8516,16 +8707,31 @@ impl LiveCli {
         ))
     }
 
+    /// Task 9: the one-line workflow phase banner appended to the system
+    /// prompt when a workflow is active and gates are not `Off`. Loads the
+    /// gate mode from config; returns `None` on any config error (banner is
+    /// best-effort and must never fail a turn).
+    fn workflow_status_banner(&self) -> Option<String> {
+        let phase = self.runtime.session().workflow.as_ref()?.phase;
+        let cwd = env::current_dir().ok()?;
+        let config = ConfigLoader::default_for(&cwd).load().ok()?;
+        runtime::render_workflow_status(phase, config.workflow_gates())
+    }
+
     fn prepare_turn_runtime(
         &self,
         emit_output: bool,
     ) -> Result<(BuiltRuntime, HookAbortMonitor), Box<dyn std::error::Error>> {
         let hook_abort_signal = runtime::HookAbortSignal::new();
+        let mut system_prompt = self.system_prompt.clone();
+        if let Some(banner) = self.workflow_status_banner() {
+            system_prompt.push(banner);
+        }
         let runtime = build_runtime(
             self.runtime.session().clone(),
             &self.session.id,
             self.model.clone(),
-            self.system_prompt.clone(),
+            system_prompt,
             true,
             emit_output,
             self.allowed_tools.clone(),
@@ -8717,6 +8923,7 @@ impl LiveCli {
                     );
                 }
                 print_lifecycle_warnings(&summary);
+                print_gate_audit(&summary);
                 self.persist_session()?;
                 self.append_turn_log(input, &summary);
                 self.maybe_auto_dream_after_success();
@@ -8885,6 +9092,7 @@ impl LiveCli {
                                     );
                                 }
                                 print_lifecycle_warnings(&summary);
+                                print_gate_audit(&summary);
                                 self.persist_session()?;
                                 return Ok(());
                             }
@@ -8963,6 +9171,7 @@ impl LiveCli {
         hook_abort_monitor.stop();
         let summary = result?;
         print_lifecycle_warnings(&summary);
+        print_gate_audit(&summary);
         self.replace_runtime(runtime)?;
         self.persist_session()?;
         let final_text = final_assistant_text(&summary);
@@ -8985,6 +9194,7 @@ impl LiveCli {
                 "message": final_assistant_text(&summary),
                 "compact": true,
                 "model": self.model,
+                "gate_events": collect_gate_events(&summary),
                 "usage": {
                     "input_tokens": summary.usage.input_tokens,
                     "output_tokens": summary.usage.output_tokens,
@@ -9017,6 +9227,7 @@ impl LiveCli {
                 })),
                 "tool_uses": collect_tool_uses(&summary),
                 "tool_results": collect_tool_results(&summary),
+                "gate_events": collect_gate_events(&summary),
                 "prompt_cache_events": collect_prompt_cache_events(&summary),
                 "usage": {
                     "input_tokens": summary.usage.input_tokens,
@@ -9039,10 +9250,11 @@ impl LiveCli {
     fn handle_repl_command(
         &mut self,
         command: SlashCommand,
+        custom_commands: &[runtime::harness_assets::CommandMeta],
     ) -> Result<bool, Box<dyn std::error::Error>> {
         Ok(match command {
             SlashCommand::Help => {
-                println!("{}", render_repl_help());
+                println!("{}", render_repl_help(custom_commands));
                 false
             }
             SlashCommand::Status => {
@@ -9087,6 +9299,8 @@ impl LiveCli {
             }
             SlashCommand::Model { model: Some(model) } => self.set_model(Some(model))?,
             SlashCommand::Model { model: None } => self.choose_model_interactively()?,
+            SlashCommand::ModelAdd { alias, model } => self.add_model(alias, model)?,
+            SlashCommand::ModelRemove { alias } => self.remove_model(alias)?,
             SlashCommand::Permissions { mode } => self.set_permissions(mode)?,
             SlashCommand::Clear { confirm } => self.clear_session(confirm)?,
             SlashCommand::Cost => {
@@ -9117,7 +9331,7 @@ impl LiveCli {
                 false
             }
             SlashCommand::Init => {
-                run_init(CliOutputFormat::Text)?;
+                run_init(CliOutputFormat::Text, false)?;
                 false
             }
             SlashCommand::Diff => {
@@ -9138,6 +9352,7 @@ impl LiveCli {
             SlashCommand::Plugins { action, target } => {
                 self.handle_plugins_command(action.as_deref(), target.as_deref())?
             }
+            SlashCommand::Workflow { action } => self.handle_workflow_command(action.as_deref())?,
             SlashCommand::Agents { args } => {
                 if let Err(error) = Self::print_agents(args.as_deref(), CliOutputFormat::Text) {
                     eprintln!("{error}");
@@ -9239,6 +9454,10 @@ impl LiveCli {
             }
             SlashCommand::Unknown(name) => {
                 eprintln!("{}", format_unknown_slash_command(&name));
+                false
+            }
+            SlashCommand::Custom { body, .. } => {
+                self.run_turn(&body)?;
                 false
             }
         })
@@ -9425,6 +9644,78 @@ impl LiveCli {
             format_model_switch_report(&previous, &model, message_count)
         );
         Ok(true)
+    }
+
+    /// `/model add [alias] [provider/model]`. When both args are present it
+    /// runs headless via [`apply_headless_model_add`]; otherwise it prompts
+    /// interactively (REPL only). Persists the alias to user config so the new
+    /// model is immediately usable via `/model <alias>`. Does not switch the
+    /// active model.
+    fn add_model(
+        &mut self,
+        alias: Option<String>,
+        model: Option<String>,
+    ) -> Result<bool, Box<dyn std::error::Error>> {
+        // Headless fast path: both arguments supplied.
+        if let (Some(alias), Some(model)) = (alias.as_deref(), model.as_deref()) {
+            match apply_headless_model_add(Some(alias), Some(model)) {
+                Ok((message, _json)) => println!("{message}"),
+                Err(error) => println!("{error}"),
+            }
+            return Ok(false);
+        }
+
+        println!("Add a model alias — a short name that resolves to a provider/model.");
+        println!("  Examples: openai/gpt-4.1-mini, anthropic/claude-opus-4-6, qwen/qwen-plus");
+
+        let alias = match alias {
+            Some(alias) => alias,
+            None => {
+                let raw = prompt_text("Alias (e.g. mini)", None)?;
+                if reserved_model_alias(&raw) {
+                    println!("'{raw}' is a reserved model name; choose a different alias.");
+                    return Ok(false);
+                }
+                raw
+            }
+        };
+        let model = match model {
+            Some(model) => model,
+            None => prompt_text("Model (provider/model)", None)?,
+        };
+
+        match apply_headless_model_add(Some(&alias), Some(&model)) {
+            Ok((message, _json)) => println!("{message}"),
+            Err(error) => println!("{error}"),
+        }
+        Ok(false)
+    }
+
+    /// `/model remove [alias]`. Headless when the alias is supplied, otherwise
+    /// prompts interactively (REPL only).
+    fn remove_model(
+        &mut self,
+        alias: Option<String>,
+    ) -> Result<bool, Box<dyn std::error::Error>> {
+        let alias = match alias {
+            Some(alias) => alias,
+            None => {
+                let existing = runtime::load_user_model_aliases().unwrap_or_default();
+                if existing.is_empty() {
+                    println!("No user-defined model aliases to remove.");
+                    return Ok(false);
+                }
+                let names: Vec<&str> = existing.keys().map(String::as_str).collect();
+                println!("Existing aliases: {}", names.join(", "));
+                prompt_text("Alias to remove", None)?
+            }
+        };
+
+        match apply_headless_model_remove(Some(&alias)) {
+            Ok((message, _json)) => println!("{message}"),
+            Err(error) => println!("{error}"),
+        }
+        Ok(false)
     }
 
     fn set_permissions(
@@ -10005,6 +10296,102 @@ impl LiveCli {
         Ok(false)
     }
 
+    /// Dispatch `/workflow [status|start <task-ref>|advance|gate <kind> <detail...>]`.
+    /// Task 8: pure command-layer plumbing for the SAW-style workflow gate
+    /// (`runtime::workflow::WorkflowState`, Task 7). No enforcement of
+    /// `workflow_gates` config mode happens here yet -- that's Task 9; this
+    /// only lets the model/user inspect and drive the state machine.
+    fn handle_workflow_command(
+        &mut self,
+        action: Option<&str>,
+    ) -> Result<bool, Box<dyn std::error::Error>> {
+        let mut tokens = action.unwrap_or_default().split_whitespace();
+        let subcommand = tokens.next();
+
+        match subcommand {
+            Some("status") => {
+                let workflow = self.runtime.session().workflow.clone().unwrap_or_default();
+                println!("{}", render_workflow_status(&workflow));
+                Ok(false)
+            }
+            Some("start") => {
+                let Some(task_ref) = tokens.next() else {
+                    println!("Usage: /workflow start <task-ref>");
+                    return Ok(false);
+                };
+                let workflow = self
+                    .runtime
+                    .session_mut()
+                    .workflow
+                    .get_or_insert_with(WorkflowState::default);
+                workflow.start(task_ref);
+                let phase = workflow.phase;
+                self.persist_session()?;
+                println!("Workflow started\n  Task             {task_ref}\n  Phase            {phase:?}");
+                Ok(false)
+            }
+            Some("advance") => {
+                let already_existed = self.runtime.session().workflow.is_some();
+                let workflow = self
+                    .runtime
+                    .session_mut()
+                    .workflow
+                    .get_or_insert_with(WorkflowState::default);
+                let result = workflow.try_advance();
+                let phase = workflow.phase;
+                // Skip the write when nothing changed: a pre-existing
+                // workflow that stayed Blocked mutated no persisted state.
+                // (A brand-new default WorkflowState is still worth
+                // persisting so /workflow status reflects Idle immediately.)
+                let state_unchanged =
+                    already_existed && matches!(result, GateCheck::Blocked { .. });
+                if !state_unchanged {
+                    self.persist_session()?;
+                }
+                match result {
+                    GateCheck::Pass => println!("Workflow advanced\n  Phase            {phase:?}"),
+                    GateCheck::Blocked { reason } => {
+                        println!("Workflow blocked\n  Phase            {phase:?}\n  Reason           {reason}");
+                    }
+                }
+                Ok(false)
+            }
+            Some("gate") => {
+                let Some(kind) = tokens.next() else {
+                    println!("Usage: /workflow gate <kind> <detail>");
+                    return Ok(false);
+                };
+                let detail = tokens.collect::<Vec<_>>().join(" ");
+                if detail.trim().is_empty() {
+                    println!("Usage: /workflow gate <kind> <detail>");
+                    return Ok(false);
+                }
+                let workflow = self
+                    .runtime
+                    .session_mut()
+                    .workflow
+                    .get_or_insert_with(WorkflowState::default);
+                let gate = workflow.phase;
+                workflow.record_evidence(GateEvidence {
+                    gate,
+                    kind: kind.to_string(),
+                    detail: detail.clone(),
+                });
+                self.persist_session()?;
+                println!(
+                    "Evidence recorded\n  Gate             {gate:?}\n  Kind             {kind}\n  Detail           {detail}"
+                );
+                Ok(false)
+            }
+            _ => {
+                println!(
+                    "Usage: /workflow [status|start <task-ref>|advance|gate <kind> <detail>]"
+                );
+                Ok(false)
+            }
+        }
+    }
+
     fn reload_runtime_features(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         let runtime = build_runtime(
             self.runtime.session().clone(),
@@ -10455,6 +10842,39 @@ fn render_session_list(active_session_id: &str) -> Result<String, Box<dyn std::e
     Ok(lines.join("\n"))
 }
 
+/// Render `/workflow status`: phase, task ref, acceptance criteria, and
+/// recorded gate evidence for a `WorkflowState` (Task 8).
+fn render_workflow_status(workflow: &WorkflowState) -> String {
+    let mut lines = vec![
+        "Workflow".to_string(),
+        format!("  Phase            {:?}", workflow.phase),
+        format!(
+            "  Task             {}",
+            workflow.task_ref.as_deref().unwrap_or("<none>")
+        ),
+    ];
+    if workflow.acceptance_criteria.is_empty() {
+        lines.push("  Acceptance       <none recorded>".to_string());
+    } else {
+        lines.push("  Acceptance".to_string());
+        for ac in &workflow.acceptance_criteria {
+            lines.push(format!("    - {ac}"));
+        }
+    }
+    if workflow.evidence.is_empty() {
+        lines.push("  Evidence         <none recorded>".to_string());
+    } else {
+        lines.push("  Evidence".to_string());
+        for evidence in &workflow.evidence {
+            lines.push(format!(
+                "    - gate={:?} kind={} detail={}",
+                evidence.gate, evidence.kind, evidence.detail
+            ));
+        }
+    }
+    lines.join("\n")
+}
+
 /// #449: credentials-free session list that works without API keys.
 /// `claw session list --output-format json` should work in CI/offline.
 fn run_session_list(output_format: CliOutputFormat) -> Result<(), Box<dyn std::error::Error>> {
@@ -10522,8 +10942,18 @@ fn session_clear_backup_path(session_path: &Path) -> PathBuf {
     session_path.with_file_name(format!("{file_name}.before-clear-{timestamp}.bak"))
 }
 
-fn render_repl_help() -> String {
-    [
+/// Render the REPL's `/help` text. `custom_commands` is the caller's
+/// already-resolved `.claw/commands/*.md` registry (see
+/// `commands::resolve_custom_commands`) — this function only formats it, it
+/// never discovers on its own, so callers control freshness. This keeps the
+/// REPL's dispatch (`SlashCommand::parse_with_commands`) and `/help` output
+/// consistent: both are handed the exact same snapshot for a given input
+/// (see `run_repl`), rather than `/help` silently re-discovering a possibly
+/// different registry than the one dispatch is using.
+fn render_repl_help(custom_commands: &[runtime::harness_assets::CommandMeta]) -> String {
+    let project_commands_help = commands::render_project_commands_help(custom_commands);
+
+    let mut sections = vec![
         "REPL".to_string(),
         "  /exit                Quit the REPL".to_string(),
         "  /quit                Quit the REPL".to_string(),
@@ -10540,8 +10970,13 @@ fn render_repl_help() -> String {
         "  Show prompt history  /history [count]".to_string(),
         String::new(),
         render_slash_command_help_filtered(STUB_COMMANDS),
-    ]
-    .join(
+    ];
+    if !project_commands_help.is_empty() {
+        sections.push(String::new());
+        sections.push(project_commands_help);
+    }
+
+    sections.join(
         "
 ",
     )
@@ -12127,9 +12562,16 @@ fn init_claude_md() -> Result<String, Box<dyn std::error::Error>> {
     Ok(initialize_repo(&cwd)?.render())
 }
 
-fn run_init(output_format: CliOutputFormat) -> Result<(), Box<dyn std::error::Error>> {
+fn run_init(
+    output_format: CliOutputFormat,
+    harness: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
     let cwd = env::current_dir()?;
-    let report = initialize_repo(&cwd)?;
+    let mut report = initialize_repo(&cwd)?;
+    if harness {
+        let harness_report = crate::init::initialize_harness(&cwd)?;
+        report.artifacts.extend(harness_report.artifacts);
+    }
     let message = report.render();
     match output_format {
         CliOutputFormat::Text => println!("{message}"),
@@ -14275,6 +14717,47 @@ fn collect_tool_results(summary: &runtime::TurnSummary) -> Vec<serde_json::Value
         .collect()
 }
 
+/// Task 9 audit sink (JSON modes): serializes each `gate_check` decision to its
+/// canonical wire form (schema `claw.gate_check.v1`; see `runtime::GateCheckEvent`).
+/// `GateCheckEvent` derives `Serialize`, so this is a straight projection.
+fn collect_gate_events(summary: &runtime::TurnSummary) -> Vec<serde_json::Value> {
+    summary
+        .gate_events
+        .iter()
+        .map(|event| serde_json::to_value(event).unwrap_or_else(|_| json!({})))
+        .collect()
+}
+
+/// Task 9 audit sink (text/interactive modes): emits a concise one-line stderr
+/// notice for each BLOCKED gate decision. Advisory decisions already reach the
+/// user through `lifecycle_warnings`, so they are intentionally not duplicated
+/// here. The `gate_check:` prefix keeps these distinguishable from lifecycle
+/// `warning:` lines. No verbose/debug flag exists in this CLI, so blocked
+/// audit lines always print (blocks are rare and operationally significant).
+fn print_gate_audit(summary: &runtime::TurnSummary) {
+    for line in gate_audit_lines(summary) {
+        eprintln!("{line}");
+    }
+}
+
+/// Builds the concise audit lines for BLOCKED gate decisions (see
+/// [`print_gate_audit`]). Advisory decisions are intentionally excluded — they
+/// already reach the user through `lifecycle_warnings`.
+fn gate_audit_lines(summary: &runtime::TurnSummary) -> Vec<String> {
+    summary
+        .gate_events
+        .iter()
+        .filter(|event| event.decision == runtime::GateDecision::Block)
+        .map(|event| {
+            let phase = serde_json::to_value(event.phase)
+                .ok()
+                .and_then(|value| value.as_str().map(String::from))
+                .unwrap_or_else(|| format!("{:?}", event.phase));
+            format!("gate_check: {} block ({phase})", event.rule)
+        })
+        .collect()
+}
+
 fn collect_prompt_cache_events(summary: &runtime::TurnSummary) -> Vec<serde_json::Value> {
     summary
         .prompt_cache_events
@@ -15479,7 +15962,8 @@ fn print_help(output_format: CliOutputFormat) -> Result<(), Box<dyn std::error::
 mod tests {
     use super::{
         acp_status_json, build_runtime_plugin_state_with_loader, build_runtime_with_plugin_state,
-        classify_error_kind, classify_session_lifecycle_from_panes, collect_session_prompt_history,
+        classify_error_kind, classify_session_lifecycle_from_panes, collect_gate_events,
+        collect_session_prompt_history, gate_audit_lines,
         create_managed_session_handle, describe_tool_progress, filter_tool_specs,
         format_bughunter_report, format_commit_preflight_report, format_commit_skipped_report,
         format_compact_report, format_connected_line, format_cost_report, format_history_timestamp,
@@ -15526,6 +16010,64 @@ mod tests {
     use std::thread;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
     use tools::GlobalToolRegistry;
+
+    fn gate_event(
+        rule: &str,
+        decision: runtime::GateDecision,
+        phase: runtime::WorkflowPhase,
+    ) -> runtime::GateCheckEvent {
+        runtime::GateCheckEvent {
+            schema: runtime::GATE_CHECK_SCHEMA.to_string(),
+            event: runtime::GATE_CHECK_EVENT.to_string(),
+            phase,
+            rule: rule.to_string(),
+            decision,
+            reason: "reason".to_string(),
+        }
+    }
+
+    fn summary_with_gate_events(events: Vec<runtime::GateCheckEvent>) -> runtime::TurnSummary {
+        runtime::TurnSummary {
+            assistant_messages: Vec::new(),
+            tool_results: Vec::new(),
+            prompt_cache_events: Vec::new(),
+            iterations: 1,
+            usage: runtime::TokenUsage::default(),
+            auto_compaction: None,
+            lifecycle_warnings: Vec::new(),
+            gate_events: events,
+        }
+    }
+
+    /// Task 9 sink: JSON modes serialize gate events (schema-tagged), and the
+    /// text-mode audit emits a one-line notice for BLOCKED decisions only.
+    #[test]
+    fn gate_events_reach_json_and_text_sinks() {
+        let summary = summary_with_gate_events(vec![
+            gate_event(
+                "stop-the-line-spec",
+                runtime::GateDecision::Block,
+                runtime::WorkflowPhase::Spec,
+            ),
+            gate_event(
+                "stop-the-line-spec",
+                runtime::GateDecision::Advisory,
+                runtime::WorkflowPhase::Spec,
+            ),
+        ]);
+
+        // JSON sink: both events serialized, schema-tagged.
+        let json = collect_gate_events(&summary);
+        assert_eq!(json.len(), 2);
+        assert_eq!(json[0]["schema"], "claw.gate_check.v1");
+        assert_eq!(json[0]["event"], "gate_check");
+        assert_eq!(json[0]["decision"], "block");
+        assert_eq!(json[1]["decision"], "advisory");
+
+        // Text sink: only the BLOCKED decision produces an audit line.
+        let lines = gate_audit_lines(&summary);
+        assert_eq!(lines, vec!["gate_check: stop-the-line-spec block (spec)".to_string()]);
+    }
 
     fn registry_with_plugin_tool() -> GlobalToolRegistry {
         GlobalToolRegistry::with_plugin_tools(vec![PluginTool::new(
@@ -16661,6 +17203,15 @@ mod tests {
             parse_args(&["init".to_string()]).expect("init should parse"),
             CliAction::Init {
                 output_format: CliOutputFormat::Text,
+                harness: false,
+            }
+        );
+        assert_eq!(
+            parse_args(&["init".to_string(), "--harness".to_string()])
+                .expect("init --harness should parse"),
+            CliAction::Init {
+                output_format: CliOutputFormat::Text,
+                harness: true,
             }
         );
         assert_eq!(
@@ -18693,13 +19244,13 @@ mod tests {
 
     #[test]
     fn repl_help_includes_shared_commands_and_exit() {
-        let help = render_repl_help();
+        let help = render_repl_help(&[]);
         assert!(help.contains("REPL"));
         assert!(help.contains("/help"));
         assert!(help.contains("Complete commands, modes, and recent sessions"));
         assert!(help.contains("/status"));
         assert!(help.contains("/sandbox"));
-        assert!(help.contains("/model [model]"));
+        assert!(help.contains("/model [model | add | remove <alias>]"));
         assert!(help.contains("/permissions [read-only|workspace-write|danger-full-access]"));
         assert!(help.contains("/clear [--confirm]"));
         assert!(help.contains("/cost"));
@@ -18770,6 +19321,92 @@ mod tests {
         assert!(banner.contains("Shift+Tab permission mode"));
         assert!(!banner.contains("╭─"));
         assert!(!banner.contains("╰─"));
+
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+        std::env::remove_var("ANTHROPIC_API_KEY");
+    }
+
+    #[test]
+    fn workflow_command_start_advance_gate_status_mutate_and_persist_session() {
+        // Task 8: /workflow start/advance/gate/status against a real LiveCli,
+        // asserting the session-owned WorkflowState is mutated and persisted
+        // to disk (not just held in memory) after each subcommand.
+        let _guard = env_lock();
+        std::env::set_var("ANTHROPIC_API_KEY", "test-dummy-key-for-workflow-test");
+        let root = temp_dir();
+        fs::create_dir_all(&root).expect("root dir");
+
+        with_current_dir(&root, || {
+            let mut cli = LiveCli::new(
+                "anthropic/claude-sonnet-4-6".to_string(),
+                true,
+                None,
+                PermissionMode::DangerFullAccess,
+            )
+            .expect("cli should initialize");
+
+            // bare /workflow status before start: Idle, no task, no evidence.
+            cli.handle_workflow_command(Some("status"))
+                .expect("status should not error");
+            assert!(cli.runtime.session().workflow.is_none());
+
+            // /workflow start TASK-8
+            cli.handle_workflow_command(Some("start TASK-8"))
+                .expect("start should not error");
+            let workflow = cli
+                .runtime
+                .session()
+                .workflow
+                .clone()
+                .expect("start should create workflow state");
+            assert_eq!(workflow.phase, runtime::WorkflowPhase::Spec);
+            assert_eq!(workflow.task_ref.as_deref(), Some("TASK-8"));
+
+            // Persisted to disk, not just in memory.
+            let reloaded = Session::load_from_path(&cli.session.path)
+                .expect("session should load from disk after start");
+            assert_eq!(
+                reloaded.workflow.expect("persisted workflow").task_ref,
+                Some("TASK-8".to_string())
+            );
+
+            // /workflow advance is blocked without acceptance criteria.
+            cli.handle_workflow_command(Some("advance"))
+                .expect("advance should not error");
+            assert_eq!(
+                cli.runtime.session().workflow.as_ref().unwrap().phase,
+                runtime::WorkflowPhase::Spec,
+                "advance without acceptance criteria must not move past Spec"
+            );
+
+            // /workflow gate records evidence against the current (Spec) gate.
+            cli.handle_workflow_command(Some("gate test_run cargo test passed"))
+                .expect("gate should not error");
+            let workflow = cli.runtime.session().workflow.clone().unwrap();
+            assert_eq!(workflow.evidence.len(), 1);
+            assert_eq!(workflow.evidence[0].kind, "test_run");
+            assert_eq!(workflow.evidence[0].detail, "cargo test passed");
+            assert_eq!(workflow.evidence[0].gate, runtime::WorkflowPhase::Spec);
+
+            // Unknown/bare subcommands don't panic or mutate state.
+            cli.handle_workflow_command(None)
+                .expect("bare /workflow should render usage, not error");
+            cli.handle_workflow_command(Some("frobnicate"))
+                .expect("unknown subcommand should render usage, not error");
+            assert_eq!(cli.runtime.session().workflow.clone().unwrap(), workflow);
+
+            // /workflow gate <kind> with no detail must print usage and
+            // record no evidence -- a whitespace-only detail is otherwise
+            // silently ignored by Task 7's Verify->Review gate, so accepting
+            // it here would create useless evidence records.
+            cli.handle_workflow_command(Some("gate test_run"))
+                .expect("gate without detail should render usage, not error");
+            assert_eq!(
+                cli.runtime.session().workflow.clone().unwrap(),
+                workflow,
+                "gate with missing detail must not record evidence"
+            );
+        });
 
         fs::remove_dir_all(root).expect("cleanup temp dir");
         std::env::remove_var("ANTHROPIC_API_KEY");
@@ -20219,7 +20856,7 @@ UU conflicted.rs",
     }
     #[test]
     fn repl_help_mentions_history_completion_and_multiline() {
-        let help = render_repl_help();
+        let help = render_repl_help(&[]);
         assert!(help.contains("Up/Down"));
         assert!(help.contains("Tab"));
         assert!(help.contains("Shift+Tab"));

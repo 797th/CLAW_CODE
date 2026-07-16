@@ -164,6 +164,7 @@ pub struct RuntimeFeatureConfig {
     api_timeout: ApiTimeoutConfig,
     rules_import: RulesImportConfig,
     provider: RuntimeProviderConfig,
+    workflow_gates: WorkflowGateMode,
 }
 
 /// Controls which external AI coding framework rules are imported into the system prompt.
@@ -189,6 +190,21 @@ impl RulesImportConfig {
                 .any(|candidate| candidate.eq_ignore_ascii_case(framework)),
         }
     }
+}
+
+/// Controls whether the SAW-style workflow gate ([`crate::workflow::WorkflowState`])
+/// is enforced when advancing phases. `Off` (default) and `Advisory` do not
+/// block anything yet -- enforcement lands in a later task (#Task 9); this
+/// is plumbing only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum WorkflowGateMode {
+    /// Workflow gates are not consulted at all.
+    #[default]
+    Off,
+    /// Gate failures are surfaced but do not block progress.
+    Advisory,
+    /// Gate failures block progress (enforcement behavior added in Task 9).
+    Enforced,
 }
 
 /// Stored provider configuration from the setup wizard.
@@ -812,6 +828,7 @@ fn build_runtime_config(
         api_timeout: parse_optional_api_timeout_config(&merged_value)?,
         rules_import: parse_optional_rules_import(&merged_value)?,
         provider: parse_optional_provider_config(&merged_value)?,
+        workflow_gates: parse_optional_workflow_gate_mode(&merged_value),
     };
 
     Ok(RuntimeConfig {
@@ -936,6 +953,11 @@ impl RuntimeConfig {
         &self.feature_config.provider
     }
 
+    #[must_use]
+    pub fn workflow_gates(&self) -> WorkflowGateMode {
+        self.feature_config.workflow_gates
+    }
+
     /// Merge config-level default trusted roots with per-call roots.
     ///
     /// Config roots are defaults and are kept first; per-call roots extend the
@@ -971,6 +993,14 @@ impl RuntimeFeatureConfig {
     #[must_use]
     pub fn with_memory(mut self, memory: MemoryConfig) -> Self {
         self.memory = memory;
+        self
+    }
+
+    /// Override the workflow gate mode. Primarily a test/wiring seam; the
+    /// production value is parsed from `settings.workflow_gates`.
+    #[must_use]
+    pub fn with_workflow_gates(mut self, workflow_gates: WorkflowGateMode) -> Self {
+        self.workflow_gates = workflow_gates;
         self
     }
 
@@ -1037,6 +1067,11 @@ impl RuntimeFeatureConfig {
     #[must_use]
     pub fn rules_import(&self) -> &RulesImportConfig {
         &self.rules_import
+    }
+
+    #[must_use]
+    pub fn workflow_gates(&self) -> WorkflowGateMode {
+        self.workflow_gates
     }
 
     /// Merge this config's default trusted roots with per-call roots.
@@ -1207,6 +1242,139 @@ pub fn clear_user_provider_settings() -> Result<(), ConfigError> {
     write_settings_root(&settings_path, &root)?;
 
     Ok(())
+}
+
+/// Persist a named model alias to the user-level `~/.claw/settings.json`.
+///
+/// The alias is stored under `aliases.<alias> = <model>` so it is resolved by
+/// the normal config alias pipeline (`RuntimeConfig::aliases`). Re-adding an
+/// existing alias overwrites it. Returns the path that was written so callers
+/// can report it to the user.
+pub fn save_user_model_alias(alias: &str, model: &str) -> Result<PathBuf, ConfigError> {
+    save_user_model_alias_in_home(alias, model, &default_config_home())
+}
+
+/// Testable core of [`save_user_model_alias`] that writes to an explicit
+/// config-home directory instead of resolving one from the environment.
+pub fn save_user_model_alias_in_home(
+    alias: &str,
+    model: &str,
+    config_home: &Path,
+) -> Result<PathBuf, ConfigError> {
+    let trimmed_alias = alias.trim();
+    let trimmed_model = model.trim();
+    if trimmed_alias.is_empty() {
+        return Err(ConfigError::Parse(
+            "model alias cannot be empty".to_string(),
+        ));
+    }
+    if trimmed_model.is_empty() {
+        return Err(ConfigError::Parse(
+            "model value cannot be empty".to_string(),
+        ));
+    }
+
+    fs::create_dir_all(config_home).map_err(ConfigError::Io)?;
+    let settings_path = config_home.join("settings.json");
+
+    let mut root = read_settings_root(&settings_path);
+    let mut aliases = take_aliases_object(&mut root);
+    aliases.insert(
+        trimmed_alias.to_string(),
+        serde_json::Value::String(trimmed_model.to_string()),
+    );
+    root.insert("aliases".to_string(), serde_json::Value::Object(aliases));
+
+    write_settings_root(&settings_path, &root)?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let perms = std::fs::Permissions::from_mode(0o600);
+        fs::set_permissions(&settings_path, perms).map_err(ConfigError::Io)?;
+    }
+
+    Ok(settings_path)
+}
+
+/// Remove a named model alias from the user-level `~/.claw/settings.json`.
+///
+/// Returns `true` when the alias existed and was removed, `false` when the
+/// file or alias was absent (no-op).
+pub fn remove_user_model_alias(alias: &str) -> Result<bool, ConfigError> {
+    remove_user_model_alias_in_home(alias, &default_config_home())
+}
+
+/// Testable core of [`remove_user_model_alias`] that targets an explicit
+/// config-home directory.
+pub fn remove_user_model_alias_in_home(
+    alias: &str,
+    config_home: &Path,
+) -> Result<bool, ConfigError> {
+    let trimmed_alias = alias.trim();
+    if trimmed_alias.is_empty() {
+        return Err(ConfigError::Parse(
+            "model alias cannot be empty".to_string(),
+        ));
+    }
+
+    let settings_path = config_home.join("settings.json");
+    if !settings_path.exists() {
+        return Ok(false);
+    }
+
+    let mut root = read_settings_root(&settings_path);
+    let Some(aliases_value) = root.get_mut("aliases") else {
+        return Ok(false);
+    };
+    let Some(aliases) = aliases_value.as_object_mut() else {
+        return Ok(false);
+    };
+    let existed = aliases.remove(trimmed_alias).is_some();
+    if !existed {
+        return Ok(false);
+    }
+    write_settings_root(&settings_path, &root)?;
+    Ok(true)
+}
+
+/// Read the `aliases` map from the user-level `~/.claw/settings.json`.
+///
+/// Missing file or missing `aliases` object yield an empty map. Malformed
+/// entries (non-string values) are skipped.
+pub fn load_user_model_aliases() -> Result<BTreeMap<String, String>, ConfigError> {
+    load_user_model_aliases_in_home(&default_config_home())
+}
+
+/// Testable core of [`load_user_model_aliases`] that reads from an explicit
+/// config-home directory.
+pub fn load_user_model_aliases_in_home(
+    config_home: &Path,
+) -> Result<BTreeMap<String, String>, ConfigError> {
+    let settings_path = config_home.join("settings.json");
+    let root = read_settings_root(&settings_path);
+    let Some(aliases_value) = root.get("aliases") else {
+        return Ok(BTreeMap::new());
+    };
+    let Some(aliases) = aliases_value.as_object() else {
+        return Ok(BTreeMap::new());
+    };
+    let mut out = BTreeMap::new();
+    for (key, value) in aliases {
+        if let Some(model) = value.as_str() {
+            out.insert(key.clone(), model.to_string());
+        }
+    }
+    Ok(out)
+}
+
+/// Extract a mutable copy of the `aliases` object from `root`, or return an
+/// empty object when absent. Non-object `aliases` values are replaced.
+fn take_aliases_object(root: &mut serde_json::Map<String, serde_json::Value>) -> serde_json::Map<String, serde_json::Value> {
+    match root.remove("aliases") {
+        Some(serde_json::Value::Object(map)) => map,
+        _ => serde_json::Map::new(),
+    }
 }
 
 fn read_settings_root(path: &Path) -> serde_json::Map<String, serde_json::Value> {
@@ -2353,6 +2521,34 @@ fn parse_optional_rules_import(root: &JsonValue) -> Result<RulesImportConfig, Co
     }
 }
 
+/// Parse the `workflow_gates` config key ("off" | "advisory" | "enforced",
+/// case-insensitive). Unlike most enum-ish config values, an invalid mode
+/// does not fail config load: it emits a warning and falls back to `Off`,
+/// since the workflow gate is best-effort tooling, not a hard setting.
+fn parse_optional_workflow_gate_mode(root: &JsonValue) -> WorkflowGateMode {
+    let Some(object) = root.as_object() else {
+        return WorkflowGateMode::Off;
+    };
+    let Some(value) = object.get("workflow_gates").and_then(JsonValue::as_str) else {
+        return WorkflowGateMode::Off;
+    };
+    parse_workflow_gate_mode_label(value)
+}
+
+fn parse_workflow_gate_mode_label(value: &str) -> WorkflowGateMode {
+    match value.to_ascii_lowercase().as_str() {
+        "off" => WorkflowGateMode::Off,
+        "advisory" => WorkflowGateMode::Advisory,
+        "enforced" => WorkflowGateMode::Enforced,
+        _ => {
+            emit_config_warning_once(&format!(
+                "merged settings.workflow_gates: unsupported workflow gate mode \"{value}\"; using \"off\""
+            ));
+            WorkflowGateMode::Off
+        }
+    }
+}
+
 fn parse_optional_provider_config(root: &JsonValue) -> Result<RuntimeProviderConfig, ConfigError> {
     let Some(provider_value) = root.as_object().and_then(|object| object.get("provider")) else {
         return Ok(RuntimeProviderConfig::default());
@@ -2784,9 +2980,12 @@ fn deep_merge_objects(
 #[cfg(test)]
 mod tests {
     use super::{
-        deep_merge_objects, parse_permission_mode_label, ConfigFileStatus, ConfigLoader,
-        ConfigSource, McpServerConfig, McpTransport, ResolvedPermissionMode, RuntimeFeatureConfig,
-        RuntimeHookCommand, RuntimeHookConfig, RuntimePluginConfig, CLAW_SETTINGS_SCHEMA_NAME,
+        deep_merge_objects, load_user_model_aliases_in_home, parse_permission_mode_label,
+        parse_workflow_gate_mode_label, remove_user_model_alias_in_home,
+        save_user_model_alias_in_home, ConfigFileStatus, ConfigLoader, ConfigSource,
+        McpServerConfig, McpTransport, ResolvedPermissionMode, RuntimeFeatureConfig,
+        RuntimeHookCommand, RuntimeHookConfig, RuntimePluginConfig, WorkflowGateMode,
+        CLAW_SETTINGS_SCHEMA_NAME,
     };
     use crate::json::JsonValue;
     use crate::sandbox::FilesystemIsolationMode;
@@ -3659,6 +3858,107 @@ mod tests {
     }
 
     #[test]
+    fn save_user_model_alias_writes_and_reloads() {
+        let root = temp_dir();
+        let home = root.join("home").join(".claw");
+
+        let path = save_user_model_alias_in_home("mini", "openai/gpt-4.1-mini", &home)
+            .expect("save should succeed");
+        assert_eq!(path, home.join("settings.json"));
+
+        // The alias round-trips through the loader.
+        let loaded = ConfigLoader::new(root.join("cwd"), &home)
+            .load()
+            .expect("config should load");
+        assert_eq!(
+            loaded.aliases().get("mini").map(String::as_str),
+            Some("openai/gpt-4.1-mini")
+        );
+
+        // Re-adding overwrites the existing value.
+        save_user_model_alias_in_home("mini", "openai/gpt-4.1-mini-2024", &home)
+            .expect("overwrite should succeed");
+        let reloaded = load_user_model_aliases_in_home(&home).expect("load aliases");
+        assert_eq!(
+            reloaded.get("mini").map(String::as_str),
+            Some("openai/gpt-4.1-mini-2024")
+        );
+
+        // load_user_model_aliases_in_home tolerates a missing file.
+        let empty = load_user_model_aliases_in_home(&root.join("nope")).expect("missing is ok");
+        assert!(empty.is_empty());
+
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn save_user_model_alias_preserves_other_keys() {
+        let root = temp_dir();
+        let home = root.join("home").join(".claw");
+        fs::create_dir_all(&home).expect("home dir");
+        // Pre-existing top-level keys must survive an alias write.
+        fs::write(
+            home.join("settings.json"),
+            r#"{"model":"opus","env":{"A":"1"}}"#,
+        )
+        .expect("seed settings");
+
+        save_user_model_alias_in_home("fast", "claude-haiku-4-5-20251213", &home)
+            .expect("save should succeed");
+
+        let raw = fs::read_to_string(home.join("settings.json")).expect("read back");
+        let v: serde_json::Value = serde_json::from_str(&raw).expect("valid json");
+        assert_eq!(v["model"], serde_json::json!("opus"));
+        assert_eq!(v["env"]["A"], serde_json::json!("1"));
+        assert_eq!(v["aliases"]["fast"], serde_json::json!("claude-haiku-4-5-20251213"));
+
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn remove_user_model_alias_reports_existence() {
+        let root = temp_dir();
+        let home = root.join("home").join(".claw");
+
+        save_user_model_alias_in_home("mini", "openai/gpt-4.1-mini", &home)
+            .expect("save should succeed");
+        save_user_model_alias_in_home("smart", "claude-opus-4-6", &home)
+            .expect("save second alias");
+
+        // Removing an existing alias returns true and drops only that key.
+        let removed = remove_user_model_alias_in_home("mini", &home).expect("remove");
+        assert!(removed);
+        let remaining = load_user_model_aliases_in_home(&home).expect("load");
+        assert!(remaining.get("mini").is_none());
+        assert_eq!(
+            remaining.get("smart").map(String::as_str),
+            Some("claude-opus-4-6")
+        );
+
+        // Removing an absent alias returns false (no error).
+        let again = remove_user_model_alias_in_home("mini", &home).expect("remove again");
+        assert!(!again);
+
+        // Removing from a nonexistent config home returns false (no error).
+        let missing = remove_user_model_alias_in_home("mini", &root.join("nope")).expect("no home");
+        assert!(!missing);
+
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn save_and_remove_user_model_alias_reject_empty() {
+        let root = temp_dir();
+        let home = root.join("home").join(".claw");
+        assert!(save_user_model_alias_in_home("", "openai/gpt-4.1-mini", &home).is_err());
+        assert!(save_user_model_alias_in_home("mini", "   ", &home).is_err());
+        assert!(remove_user_model_alias_in_home("", &home).is_err());
+        // All calls above reject before touching the filesystem, so there may
+        // be nothing to clean up.
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn empty_settings_file_loads_defaults() {
         // given
         let root = temp_dir();
@@ -4084,6 +4384,77 @@ mod tests {
             rendered.contains("model"),
             "warning should suggest the closest known key, got: {rendered}"
         );
+
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn workflow_gate_mode_defaults_to_off_when_unset() {
+        let root = temp_dir();
+        let cwd = root.join("project");
+        let home = root.join("home").join(".claw");
+        fs::create_dir_all(&home).expect("home config dir");
+        fs::create_dir_all(&cwd).expect("project dir");
+
+        let loaded = ConfigLoader::new(&cwd, &home)
+            .load()
+            .expect("empty config should load");
+
+        assert_eq!(loaded.workflow_gates(), WorkflowGateMode::Off);
+
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn workflow_gate_mode_parses_advisory_and_enforced_case_insensitively() {
+        let root = temp_dir();
+        let cwd = root.join("project");
+        let home = root.join("home").join(".claw");
+        fs::create_dir_all(&home).expect("home config dir");
+        fs::create_dir_all(&cwd).expect("project dir");
+        fs::write(
+            cwd.join(".claw.json"),
+            r#"{"workflow_gates":"Advisory"}"#,
+        )
+        .expect("write project config");
+
+        let loaded = ConfigLoader::new(&cwd, &home)
+            .load()
+            .expect("config should load");
+
+        assert_eq!(loaded.workflow_gates(), WorkflowGateMode::Advisory);
+        assert_eq!(
+            parse_workflow_gate_mode_label("enforced"),
+            WorkflowGateMode::Enforced
+        );
+        assert_eq!(
+            parse_workflow_gate_mode_label("ENFORCED"),
+            WorkflowGateMode::Enforced
+        );
+
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn workflow_gate_mode_falls_back_to_off_on_invalid_value() {
+        assert_eq!(
+            parse_workflow_gate_mode_label("bogus"),
+            WorkflowGateMode::Off
+        );
+
+        let root = temp_dir();
+        let cwd = root.join("project");
+        let home = root.join("home").join(".claw");
+        fs::create_dir_all(&home).expect("home config dir");
+        fs::create_dir_all(&cwd).expect("project dir");
+        fs::write(cwd.join(".claw.json"), r#"{"workflow_gates":"bogus"}"#)
+            .expect("write project config");
+
+        let loaded = ConfigLoader::new(&cwd, &home)
+            .load()
+            .expect("config with invalid workflow_gates should still load");
+
+        assert_eq!(loaded.workflow_gates(), WorkflowGateMode::Off);
 
         fs::remove_dir_all(root).expect("cleanup temp dir");
     }

@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::env;
 use std::fmt;
@@ -5,6 +6,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use plugins::{PluginError, PluginLoadFailure, PluginManager, PluginSummary};
+use runtime::harness_assets::CommandMeta;
 use runtime::{
     compact_session, CompactionConfig, ConfigLoader, ConfigSource, McpConfigCollection,
     McpInvalidServerConfig, McpOAuthConfig, McpServerConfig, RuntimeConfig, ScopedMcpServerConfig,
@@ -89,8 +91,8 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
     SlashCommandSpec {
         name: "model",
         aliases: &[],
-        summary: "Show or switch the active model",
-        argument_hint: Some("[model]"),
+        summary: "Show, switch, add, or remove a model",
+        argument_hint: Some("[model | add | remove <alias>]"),
         resume_supported: false,
     },
     SlashCommandSpec {
@@ -714,6 +716,13 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
         resume_supported: true,
     },
     SlashCommandSpec {
+        name: "workflow",
+        aliases: &[],
+        summary: "Inspect or advance the SAW-style workflow gate (Spec/Implement/Verify/Review/Done)",
+        argument_hint: Some("[status|start <task-ref>|advance|gate <kind> <detail>]"),
+        resume_supported: false,
+    },
+    SlashCommandSpec {
         name: "tokens",
         aliases: &[],
         summary: "Show token count for the current conversation",
@@ -1084,6 +1093,17 @@ pub enum SlashCommand {
     Model {
         model: Option<String>,
     },
+    /// Register (or prompt for) a named model alias persisted to user config.
+    /// When both fields are `None` the REPL opens an interactive prompt; when
+    /// both are supplied it runs headless.
+    ModelAdd {
+        alias: Option<String>,
+        model: Option<String>,
+    },
+    /// Remove a named model alias from user config.
+    ModelRemove {
+        alias: Option<String>,
+    },
     Permissions {
         mode: Option<String>,
     },
@@ -1205,9 +1225,30 @@ pub enum SlashCommand {
     History {
         count: Option<String>,
     },
+    /// SAW-style workflow gate command (Task 8). `action` is the raw
+    /// remainder after `/workflow` (e.g. `"status"`, `"start TASK-1"`,
+    /// `"advance"`, `"gate test_run pytest passed"`), unparsed -- the
+    /// dispatcher (see `rusty-claude-cli::main`) tokenizes it further since
+    /// it needs to mutate session-owned `WorkflowState`, which this crate
+    /// does not have access to. `None` (bare `/workflow`) and unrecognized
+    /// first tokens both render usage help at dispatch time.
+    Workflow {
+        action: Option<String>,
+    },
     Unknown(String),
     Team {
         action: Option<String>,
+    },
+    /// A user-defined markdown slash command discovered under
+    /// `.claw/commands/*.md` (see `runtime::harness_assets`). `body` is the
+    /// command's markdown file contents, minus the frontmatter block, with
+    /// every `$ARGUMENTS` occurrence substituted for the verbatim argument
+    /// string (empty when the command was invoked with no arguments).
+    /// Dispatched into the agent loop as a user turn — see
+    /// `SlashCommand::parse_with_commands`.
+    Custom {
+        name: String,
+        body: String,
     },
 }
 
@@ -1237,83 +1278,116 @@ impl SlashCommand {
         validate_slash_command_input(input)
     }
 
+    /// Parse slash-command input the same way as [`Self::parse`], but also
+    /// resolves user-defined markdown commands discovered under
+    /// `.claw/commands/` (`registry`, typically produced by
+    /// `runtime::harness_assets::discover` and filtered through
+    /// [`resolve_custom_commands`]). Built-in commands always win name
+    /// conflicts: `validate_slash_command_input`'s built-in match arms run
+    /// first, so a project command is only reachable when its name doesn't
+    /// match any built-in command or alias, which is exactly the case where
+    /// plain parsing would otherwise produce `Unknown`.
+    pub fn parse_with_commands(
+        input: &str,
+        registry: &[CommandMeta],
+    ) -> Result<Option<Self>, SlashCommandParseError> {
+        match validate_slash_command_input(input)? {
+            Some(SlashCommand::Unknown(name)) => {
+                match registry.iter().find(|candidate| candidate.name == name) {
+                    Some(meta) => {
+                        let arguments =
+                            remainder_after_command(input.trim(), &name).unwrap_or_default();
+                        let body = custom_command_body(meta, &arguments);
+                        Ok(Some(SlashCommand::Custom { name, body }))
+                    }
+                    None => Ok(Some(SlashCommand::Unknown(name))),
+                }
+            }
+            other => Ok(other),
+        }
+    }
+
     /// Returns the canonical slash-command name (e.g. `"/branch"`) for use in
     /// error messages and logging. Derived from the spec table so it always
     /// matches what the user would have typed.
     #[must_use]
-    pub fn slash_name(&self) -> &'static str {
+    pub fn slash_name(&self) -> Cow<'static, str> {
         match self {
-            Self::Help => "/help",
-            Self::Clear { .. } => "/clear",
-            Self::Compact { .. } => "/compact",
-            Self::Cost => "/cost",
-            Self::Doctor => "/doctor",
-            Self::Setup => "/setup",
-            Self::Config { .. } => "/config",
-            Self::Memory { .. } => "/memory",
-            Self::Dream { .. } => "/dream",
-            Self::History { .. } => "/history",
-            Self::Diff => "/diff",
-            Self::Status => "/status",
-            Self::Stats => "/stats",
-            Self::Version => "/version",
-            Self::Commit { .. } => "/commit",
-            Self::Pr { .. } => "/pr",
-            Self::Issue { .. } => "/issue",
-            Self::Init => "/init",
-            Self::Bughunter { .. } => "/bughunter",
-            Self::Ultraplan { .. } => "/ultraplan",
-            Self::Teleport { .. } => "/teleport",
-            Self::DebugToolCall { .. } => "/debug-tool-call",
-            Self::Resume { .. } => "/resume",
-            Self::Model { .. } => "/model",
-            Self::Permissions { .. } => "/permissions",
-            Self::Session { .. } => "/session",
-            Self::Plugins { .. } => "/plugins",
-            Self::Login => "/login",
-            Self::Logout => "/logout",
-            Self::Vim => "/vim",
-            Self::Upgrade => "/upgrade",
-            Self::Share => "/share",
-            Self::Feedback => "/feedback",
-            Self::Files => "/files",
-            Self::Fast => "/fast",
-            Self::Exit => "/exit",
-            Self::Summary => "/summary",
-            Self::Desktop => "/desktop",
-            Self::Brief => "/brief",
-            Self::Advisor => "/advisor",
-            Self::Stickers => "/stickers",
-            Self::Insights => "/insights",
-            Self::Thinkback => "/thinkback",
-            Self::ReleaseNotes => "/release-notes",
-            Self::SecurityReview => "/security-review",
-            Self::Keybindings => "/keybindings",
-            Self::PrivacySettings => "/privacy-settings",
-            Self::Plan { .. } => "/plan",
-            Self::Review { .. } => "/review",
-            Self::Tasks { .. } => "/tasks",
-            Self::Theme { .. } => "/theme",
-            Self::Voice { .. } => "/voice",
-            Self::Usage { .. } => "/usage",
-            Self::Rename { .. } => "/rename",
-            Self::Copy { .. } => "/copy",
-            Self::Hooks { .. } => "/hooks",
-            Self::Context { .. } => "/context",
-            Self::Color { .. } => "/color",
-            Self::Effort { .. } => "/effort",
-            Self::Branch { .. } => "/branch",
-            Self::Rewind { .. } => "/rewind",
-            Self::Ide { .. } => "/ide",
-            Self::Tag { .. } => "/tag",
-            Self::OutputStyle { .. } => "/output-style",
-            Self::AddDir { .. } => "/add-dir",
-            Self::Team { .. } => "/team",
-            Self::Sandbox => "/sandbox",
-            Self::Mcp { .. } => "/mcp",
-            Self::Export { .. } => "/export",
+            Self::Help => Cow::Borrowed("/help"),
+            Self::Clear { .. } => Cow::Borrowed("/clear"),
+            Self::Compact { .. } => Cow::Borrowed("/compact"),
+            Self::Cost => Cow::Borrowed("/cost"),
+            Self::Doctor => Cow::Borrowed("/doctor"),
+            Self::Setup => Cow::Borrowed("/setup"),
+            Self::Config { .. } => Cow::Borrowed("/config"),
+            Self::Memory { .. } => Cow::Borrowed("/memory"),
+            Self::Dream { .. } => Cow::Borrowed("/dream"),
+            Self::History { .. } => Cow::Borrowed("/history"),
+            Self::Diff => Cow::Borrowed("/diff"),
+            Self::Status => Cow::Borrowed("/status"),
+            Self::Stats => Cow::Borrowed("/stats"),
+            Self::Version => Cow::Borrowed("/version"),
+            Self::Commit { .. } => Cow::Borrowed("/commit"),
+            Self::Pr { .. } => Cow::Borrowed("/pr"),
+            Self::Issue { .. } => Cow::Borrowed("/issue"),
+            Self::Init => Cow::Borrowed("/init"),
+            Self::Bughunter { .. } => Cow::Borrowed("/bughunter"),
+            Self::Ultraplan { .. } => Cow::Borrowed("/ultraplan"),
+            Self::Teleport { .. } => Cow::Borrowed("/teleport"),
+            Self::DebugToolCall { .. } => Cow::Borrowed("/debug-tool-call"),
+            Self::Resume { .. } => Cow::Borrowed("/resume"),
+            Self::Model { .. } => Cow::Borrowed("/model"),
+            Self::ModelAdd { .. } => Cow::Borrowed("/model"),
+            Self::ModelRemove { .. } => Cow::Borrowed("/model"),
+            Self::Permissions { .. } => Cow::Borrowed("/permissions"),
+            Self::Session { .. } => Cow::Borrowed("/session"),
+            Self::Plugins { .. } => Cow::Borrowed("/plugins"),
+            Self::Login => Cow::Borrowed("/login"),
+            Self::Logout => Cow::Borrowed("/logout"),
+            Self::Vim => Cow::Borrowed("/vim"),
+            Self::Upgrade => Cow::Borrowed("/upgrade"),
+            Self::Share => Cow::Borrowed("/share"),
+            Self::Feedback => Cow::Borrowed("/feedback"),
+            Self::Files => Cow::Borrowed("/files"),
+            Self::Fast => Cow::Borrowed("/fast"),
+            Self::Exit => Cow::Borrowed("/exit"),
+            Self::Summary => Cow::Borrowed("/summary"),
+            Self::Desktop => Cow::Borrowed("/desktop"),
+            Self::Brief => Cow::Borrowed("/brief"),
+            Self::Advisor => Cow::Borrowed("/advisor"),
+            Self::Stickers => Cow::Borrowed("/stickers"),
+            Self::Insights => Cow::Borrowed("/insights"),
+            Self::Thinkback => Cow::Borrowed("/thinkback"),
+            Self::ReleaseNotes => Cow::Borrowed("/release-notes"),
+            Self::SecurityReview => Cow::Borrowed("/security-review"),
+            Self::Keybindings => Cow::Borrowed("/keybindings"),
+            Self::PrivacySettings => Cow::Borrowed("/privacy-settings"),
+            Self::Plan { .. } => Cow::Borrowed("/plan"),
+            Self::Review { .. } => Cow::Borrowed("/review"),
+            Self::Tasks { .. } => Cow::Borrowed("/tasks"),
+            Self::Theme { .. } => Cow::Borrowed("/theme"),
+            Self::Voice { .. } => Cow::Borrowed("/voice"),
+            Self::Usage { .. } => Cow::Borrowed("/usage"),
+            Self::Rename { .. } => Cow::Borrowed("/rename"),
+            Self::Copy { .. } => Cow::Borrowed("/copy"),
+            Self::Hooks { .. } => Cow::Borrowed("/hooks"),
+            Self::Context { .. } => Cow::Borrowed("/context"),
+            Self::Color { .. } => Cow::Borrowed("/color"),
+            Self::Effort { .. } => Cow::Borrowed("/effort"),
+            Self::Branch { .. } => Cow::Borrowed("/branch"),
+            Self::Rewind { .. } => Cow::Borrowed("/rewind"),
+            Self::Ide { .. } => Cow::Borrowed("/ide"),
+            Self::Tag { .. } => Cow::Borrowed("/tag"),
+            Self::OutputStyle { .. } => Cow::Borrowed("/output-style"),
+            Self::AddDir { .. } => Cow::Borrowed("/add-dir"),
+            Self::Team { .. } => Cow::Borrowed("/team"),
+            Self::Workflow { .. } => Cow::Borrowed("/workflow"),
+            Self::Sandbox => Cow::Borrowed("/sandbox"),
+            Self::Mcp { .. } => Cow::Borrowed("/mcp"),
+            Self::Export { .. } => Cow::Borrowed("/export"),
+            Self::Custom { name, .. } => Cow::Owned(format!("/{name}")),
             #[allow(unreachable_patterns)]
-            _ => "/unknown",
+            _ => Cow::Borrowed("/unknown"),
         }
     }
 }
@@ -1370,9 +1444,7 @@ pub fn validate_slash_command_input(
             validate_no_args(command, &args)?;
             SlashCommand::DebugToolCall
         }
-        "model" => SlashCommand::Model {
-            model: optional_single_arg(command, &args, "[model]")?,
-        },
+        "model" => parse_model_command(&args)?,
         "permissions" => SlashCommand::Permissions {
             mode: parse_permissions_mode(&args)?,
         },
@@ -1527,9 +1599,103 @@ pub fn validate_slash_command_input(
         "history" => SlashCommand::History {
             count: optional_single_arg(command, &args, "[count]")?,
         },
+        "workflow" => SlashCommand::Workflow { action: remainder },
         other => SlashCommand::Unknown(other.to_string()),
     }))
 }
+
+/// Returns `true` when `name` matches a built-in slash command name or one
+/// of its aliases. Used to make built-in commands always win name conflicts
+/// against user-defined `.claw/commands/*.md` project commands.
+#[must_use]
+pub fn is_builtin_command_name(name: &str) -> bool {
+    find_slash_command_spec(name).is_some()
+}
+
+/// Filter a discovered custom-command registry down to entries that don't
+/// collide with a built-in command name. Built-in commands always win: any
+/// conflicting entry is dropped and a human-readable warning is returned for
+/// it instead, so callers can surface the warning without failing discovery.
+#[must_use]
+pub fn resolve_custom_commands(discovered: Vec<CommandMeta>) -> (Vec<CommandMeta>, Vec<String>) {
+    let mut kept = Vec::new();
+    let mut warnings = Vec::new();
+    for meta in discovered {
+        if is_builtin_command_name(&meta.name) {
+            warnings.push(format!(
+                "skipping custom command \"/{}\": conflicts with a built-in command",
+                meta.name
+            ));
+        } else {
+            kept.push(meta);
+        }
+    }
+    (kept, warnings)
+}
+
+/// Build the markdown body for a resolved custom command: the file's
+/// contents with the leading frontmatter block stripped and every
+/// `$ARGUMENTS` occurrence substituted with `arguments` (already the
+/// verbatim, trimmed remainder after the command name; empty when the
+/// command was invoked with no arguments).
+fn custom_command_body(meta: &CommandMeta, arguments: &str) -> String {
+    let contents = fs::read_to_string(&meta.path).unwrap_or_default();
+    strip_frontmatter_block(&contents).replace("$ARGUMENTS", arguments)
+}
+
+/// Strip a leading `---`-delimited frontmatter block, returning the
+/// remaining body content, trimmed. Contents without a well-formed
+/// frontmatter block are returned unchanged (trimmed) — discovery already
+/// skips files that fail this check, so this is a defensive fallback only.
+fn strip_frontmatter_block(contents: &str) -> String {
+    let mut lines = contents.lines();
+    if lines.next().map(str::trim) != Some("---") {
+        return contents.trim().to_string();
+    }
+
+    let mut body_lines = Vec::new();
+    let mut closed = false;
+    for line in lines {
+        if !closed && line.trim() == "---" {
+            closed = true;
+            continue;
+        }
+        if closed {
+            body_lines.push(line);
+        }
+    }
+
+    if !closed {
+        return contents.trim().to_string();
+    }
+
+    body_lines.join("\n").trim().to_string()
+}
+
+/// Render the "Project commands" `/help` section listing user-defined
+/// `.claw/commands/*.md` commands and their frontmatter descriptions. Empty
+/// string when `registry` is empty, so callers can skip the section
+/// entirely rather than emitting an empty heading.
+#[must_use]
+pub fn render_project_commands_help(registry: &[CommandMeta]) -> String {
+    if registry.is_empty() {
+        return String::new();
+    }
+
+    let mut sorted: Vec<&CommandMeta> = registry.iter().collect();
+    sorted.sort_by(|a, b| a.name.cmp(&b.name));
+
+    let mut lines = vec!["Project commands".to_string()];
+    for meta in sorted {
+        let usage = match &meta.argument_hint {
+            Some(hint) => format!("/{} {hint}", meta.name),
+            None => format!("/{}", meta.name),
+        };
+        lines.push(format!("  {usage:<66} {}", meta.description));
+    }
+    lines.join("\n")
+}
+
 fn validate_no_args(command: &str, args: &[&str]) -> Result<(), SlashCommandParseError> {
     if args.is_empty() {
         return Ok(());
@@ -1560,6 +1726,57 @@ fn require_remainder(
     argument_hint: &str,
 ) -> Result<String, SlashCommandParseError> {
     remainder.ok_or_else(|| usage_error(command, argument_hint))
+}
+
+/// Dispatch `/model` into switch/add/remove. The reserved subcommands
+/// (`add`, `remove`, `list`) are only recognized when they are the first
+/// argument; everything else is treated as a model id to switch to. Reserved
+/// subcommand arms are listed before the generic single-token switch arm so
+/// they are reachable.
+fn parse_model_command(args: &[&str]) -> Result<SlashCommand, SlashCommandParseError> {
+    match args {
+        // /model list       → show current model (alias for the bare command)
+        ["list"] => Ok(SlashCommand::Model { model: None }),
+        // /model add                         → interactive prompt
+        // /model add <alias>                 → prompt only for the model
+        // /model add <alias> <model>         → headless registration
+        ["add"] => Ok(SlashCommand::ModelAdd {
+            alias: None,
+            model: None,
+        }),
+        ["add", alias] => Ok(SlashCommand::ModelAdd {
+            alias: Some((*alias).to_string()),
+            model: None,
+        }),
+        ["add", alias, model] => Ok(SlashCommand::ModelAdd {
+            alias: Some((*alias).to_string()),
+            model: Some((*model).to_string()),
+        }),
+        ["add", ..] => Err(command_error(
+            "Usage: /model add [alias] [provider/model]. Provide at most an alias and a model.",
+            "model",
+            "/model add [alias] [provider/model]",
+        )),
+        // /model remove            → interactive prompt for the alias
+        // /model remove <alias>    → headless removal
+        ["remove"] => Ok(SlashCommand::ModelRemove { alias: None }),
+        ["remove", alias] => Ok(SlashCommand::ModelRemove {
+            alias: Some((*alias).to_string()),
+        }),
+        ["remove", ..] => Err(command_error(
+            "Usage: /model remove <alias>. Remove takes a single alias name.",
+            "model",
+            "/model remove <alias>",
+        )),
+        // /model            → show current model
+        // /model <name>     → switch active model (any single non-reserved token)
+        [] | [_] => Ok(SlashCommand::Model {
+            model: optional_single_arg("model", args, "[model | add | remove <alias>]")?,
+        }),
+        // Model ids never contain whitespace (see validate_model_syntax), so a
+        // multi-token argument is malformed.
+        _ => Err(usage_error("model", "[model | add | remove <alias>]")),
+    }
 }
 
 fn parse_permissions_mode(args: &[&str]) -> Result<Option<String>, SlashCommandParseError> {
@@ -5371,6 +5588,8 @@ pub fn handle_slash_command(
         | SlashCommand::DebugToolCall
         | SlashCommand::Sandbox
         | SlashCommand::Model { .. }
+        | SlashCommand::ModelAdd { .. }
+        | SlashCommand::ModelRemove { .. }
         | SlashCommand::Permissions { .. }
         | SlashCommand::Clear { .. }
         | SlashCommand::Cost
@@ -5430,6 +5649,8 @@ pub fn handle_slash_command(
         | SlashCommand::History { .. }
         | SlashCommand::Team { .. }
         | SlashCommand::Setup
+        | SlashCommand::Custom { .. }
+        | SlashCommand::Workflow { .. }
         | SlashCommand::Unknown(_) => None,
     }
 }
@@ -5654,6 +5875,50 @@ mod tests {
             SlashCommand::parse("/model"),
             Ok(Some(SlashCommand::Model { model: None }))
         );
+        // /model add and /model remove subcommands
+        assert_eq!(
+            SlashCommand::parse("/model add"),
+            Ok(Some(SlashCommand::ModelAdd {
+                alias: None,
+                model: None,
+            }))
+        );
+        assert_eq!(
+            SlashCommand::parse("/model add mini"),
+            Ok(Some(SlashCommand::ModelAdd {
+                alias: Some("mini".to_string()),
+                model: None,
+            }))
+        );
+        assert_eq!(
+            SlashCommand::parse("/model add mini openai/gpt-4.1-mini"),
+            Ok(Some(SlashCommand::ModelAdd {
+                alias: Some("mini".to_string()),
+                model: Some("openai/gpt-4.1-mini".to_string()),
+            }))
+        );
+        assert_eq!(
+            SlashCommand::parse("/model remove"),
+            Ok(Some(SlashCommand::ModelRemove { alias: None }))
+        );
+        assert_eq!(
+            SlashCommand::parse("/model remove mini"),
+            Ok(Some(SlashCommand::ModelRemove {
+                alias: Some("mini".to_string()),
+            }))
+        );
+        // /model list behaves like the bare listing command
+        assert_eq!(
+            SlashCommand::parse("/model list"),
+            Ok(Some(SlashCommand::Model { model: None }))
+        );
+        // A single non-reserved token still switches the active model
+        assert_eq!(
+            SlashCommand::parse("/model opus"),
+            Ok(Some(SlashCommand::Model {
+                model: Some("opus".to_string()),
+            }))
+        );
         assert_eq!(
             SlashCommand::parse("/permissions read-only"),
             Ok(Some(SlashCommand::Permissions {
@@ -5815,6 +6080,22 @@ mod tests {
 
         // then
         assert!(error.contains("Usage: /history [count]"));
+    }
+
+    #[test]
+    fn rejects_model_add_with_too_many_arguments() {
+        assert!(
+            parse_error_message("/model add mini openai/gpt-4.1-mini extra")
+                .contains("Usage: /model add [alias] [provider/model]")
+        );
+    }
+
+    #[test]
+    fn rejects_model_remove_with_too_many_arguments() {
+        assert!(
+            parse_error_message("/model remove mini extra")
+                .contains("Usage: /model remove <alias>")
+        );
     }
 
     #[test]
@@ -6027,7 +6308,7 @@ mod tests {
         assert!(help.contains("/ultraplan [task]"));
         assert!(help.contains("/teleport <symbol-or-path>"));
         assert!(help.contains("/debug-tool-call"));
-        assert!(help.contains("/model [model]"));
+        assert!(help.contains("/model [model | add | remove <alias>]"));
         assert!(help.contains("/permissions [read-only|workspace-write|danger-full-access]"));
         assert!(help.contains("/clear [--confirm]"));
         assert!(help.contains("/cost"));
@@ -6053,7 +6334,7 @@ mod tests {
         assert!(help.contains("aliases: /skill"));
         assert!(help.contains("/login"));
         assert!(!help.contains("/logout"));
-        assert_eq!(slash_command_specs().len(), 142);
+        assert_eq!(slash_command_specs().len(), 143);
         assert!(resume_supported_slash_commands().len() >= 39);
     }
 
@@ -6147,6 +6428,89 @@ mod tests {
         assert!(session_error.contains("  Usage            /session switch <session-id>"));
         assert!(plugin_error.contains("Unexpected arguments for /plugin enable."));
         assert!(plugin_error.contains("  Usage            /plugin enable <name>"));
+    }
+
+    #[test]
+    fn parses_bare_workflow_command_with_no_action() {
+        let parsed = SlashCommand::parse("/workflow")
+            .expect("parse should succeed")
+            .expect("should produce a command");
+        assert_eq!(parsed, SlashCommand::Workflow { action: None });
+    }
+
+    #[test]
+    fn parses_workflow_status_subcommand() {
+        let parsed = SlashCommand::parse("/workflow status")
+            .expect("parse should succeed")
+            .expect("should produce a command");
+        assert_eq!(
+            parsed,
+            SlashCommand::Workflow {
+                action: Some("status".to_string())
+            }
+        );
+    }
+
+    #[test]
+    fn parses_workflow_start_subcommand_with_task_ref() {
+        let parsed = SlashCommand::parse("/workflow start TASK-8")
+            .expect("parse should succeed")
+            .expect("should produce a command");
+        assert_eq!(
+            parsed,
+            SlashCommand::Workflow {
+                action: Some("start TASK-8".to_string())
+            }
+        );
+    }
+
+    #[test]
+    fn parses_workflow_advance_subcommand() {
+        let parsed = SlashCommand::parse("/workflow advance")
+            .expect("parse should succeed")
+            .expect("should produce a command");
+        assert_eq!(
+            parsed,
+            SlashCommand::Workflow {
+                action: Some("advance".to_string())
+            }
+        );
+    }
+
+    #[test]
+    fn parses_workflow_gate_subcommand_with_kind_and_multiword_detail() {
+        let parsed = SlashCommand::parse("/workflow gate test_run pytest -k foo passed")
+            .expect("parse should succeed")
+            .expect("should produce a command");
+        assert_eq!(
+            parsed,
+            SlashCommand::Workflow {
+                action: Some("gate test_run pytest -k foo passed".to_string())
+            }
+        );
+    }
+
+    #[test]
+    fn parses_workflow_unknown_subcommand_verbatim_for_dispatch_time_usage_fallback() {
+        // Unknown subcommands are not rejected at parse time -- the raw
+        // remainder is captured so the dispatcher (main.rs) can render
+        // usage help, matching the "bare or unknown -> usage help"
+        // requirement rather than a hard parse error.
+        let parsed = SlashCommand::parse("/workflow frobnicate")
+            .expect("parse should succeed")
+            .expect("should produce a command");
+        assert_eq!(
+            parsed,
+            SlashCommand::Workflow {
+                action: Some("frobnicate".to_string())
+            }
+        );
+    }
+
+    #[test]
+    fn workflow_slash_name_is_stable() {
+        let parsed = SlashCommand::Workflow { action: None };
+        assert_eq!(parsed.slash_name(), "/workflow");
     }
 
     #[test]

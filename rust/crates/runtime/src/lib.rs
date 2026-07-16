@@ -55,6 +55,8 @@ mod trust_resolver;
 mod turn_service;
 mod usage;
 pub mod worker_boot;
+pub mod workflow;
+pub mod workflow_gates;
 
 pub use approval_tokens::{
     ApprovalDelegationHop, ApprovalScope, ApprovalTokenAudit, ApprovalTokenError,
@@ -69,14 +71,16 @@ pub use compact::{
     DEFAULT_COMPACTION_KEEP_RECENT_TOKENS,
 };
 pub use config::{
-    save_user_provider_settings, suppress_config_warnings_for_json_mode, ConfigEntry, ConfigError,
-    ConfigFileReport, ConfigFileStatus, ConfigInspection, ConfigLoader, ConfigSource,
-    McpConfigCollection, McpInvalidServerConfig, McpManagedProxyServerConfig, McpOAuthConfig,
-    McpRemoteServerConfig, McpSdkServerConfig, McpServerConfig, McpStdioServerConfig, McpTransport,
-    McpWebSocketServerConfig, MemoryConfig, OAuthConfig, ProviderFallbackConfig,
-    ResolvedPermissionMode, RuntimeConfig, RuntimeFeatureConfig, RuntimeHookConfig,
-    RuntimeInvalidHookConfig, RuntimePermissionRuleConfig, RuntimePluginConfig,
-    RuntimeProviderConfig, ScopedMcpServerConfig, CLAW_SETTINGS_SCHEMA_NAME,
+    ConfigEntry, ConfigError, ConfigFileReport, ConfigFileStatus, ConfigInspection, ConfigLoader,
+    ConfigSource, McpConfigCollection, McpInvalidServerConfig,
+    McpManagedProxyServerConfig, McpOAuthConfig, McpRemoteServerConfig, McpSdkServerConfig,
+    McpServerConfig, McpStdioServerConfig, McpTransport, McpWebSocketServerConfig, MemoryConfig,
+    OAuthConfig, ProviderFallbackConfig, ResolvedPermissionMode, RuntimeConfig,
+    RuntimeFeatureConfig, RuntimeHookConfig, RuntimeInvalidHookConfig, RuntimePermissionRuleConfig,
+    RuntimePluginConfig, RuntimeProviderConfig, ScopedMcpServerConfig, WorkflowGateMode,
+    load_user_model_aliases, load_user_model_aliases_in_home, remove_user_model_alias,
+    remove_user_model_alias_in_home, save_user_model_alias, save_user_model_alias_in_home,
+    save_user_provider_settings, suppress_config_warnings_for_json_mode, CLAW_SETTINGS_SCHEMA_NAME,
 };
 pub use config_validate::{
     check_unsupported_format, format_diagnostics, validate_config_file, ConfigDiagnostic,
@@ -155,8 +159,8 @@ pub use policy_engine::{
     PolicyEvaluation, PolicyRule, ReconcileReason, ReviewStatus,
 };
 pub use prompt::{
-    load_system_prompt, load_system_prompt_with_context, prepend_bullets, ContextFile,
-    ModelFamilyIdentity, ProjectContext, PromptBuildError, SystemPromptBuilder,
+    load_system_prompt, load_system_prompt_with_context, prepend_bullets, render_workflow_status,
+    ContextFile, ModelFamilyIdentity, ProjectContext, PromptBuildError, SystemPromptBuilder,
     CAVEMAN_SYSTEM_PROMPT, FRONTIER_MODEL_NAME, SUPERPOWERS_SYSTEM_PROMPT,
     SYSTEM_PROMPT_DYNAMIC_BOUNDARY,
 };
@@ -209,6 +213,12 @@ pub use usage::{
 pub use worker_boot::{
     Worker, WorkerEvent, WorkerEventKind, WorkerEventPayload, WorkerFailure, WorkerFailureKind,
     WorkerPromptTarget, WorkerReadySnapshot, WorkerRegistry, WorkerStatus, WorkerTrustResolution,
+};
+pub use workflow::{GateCheck, GateEvidence, WorkflowPhase, WorkflowState};
+pub use workflow_gates::{
+    evaluate_pre_tool_use_gate, evaluate_stop_gate, is_file_writing_tool, GateCheckEvent,
+    GateDecision, GateOutcome, GATE_CHECK_EVENT, GATE_CHECK_SCHEMA, QAS_GATE_REASON,
+    STOP_THE_LINE_REASON,
 };
 
 #[cfg(test)]
