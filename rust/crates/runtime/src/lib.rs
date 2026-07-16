@@ -18,6 +18,7 @@ mod file_ops;
 pub mod g004_conformance;
 mod git_context;
 pub mod green_contract;
+pub mod harness_assets;
 mod hooks;
 mod json;
 mod lane_events;
@@ -67,14 +68,14 @@ pub use compact::{
     get_compact_continuation_message, should_compact, CompactionConfig, CompactionResult,
 };
 pub use config::{
-    ConfigEntry, ConfigError, ConfigFileReport, ConfigFileStatus, ConfigInspection, ConfigLoader,
-    ConfigSource, McpConfigCollection, McpInvalidServerConfig,
-    McpManagedProxyServerConfig, McpOAuthConfig, McpRemoteServerConfig, McpSdkServerConfig,
-    McpServerConfig, McpStdioServerConfig, McpTransport, McpWebSocketServerConfig, MemoryConfig,
-    OAuthConfig, ProviderFallbackConfig, ResolvedPermissionMode, RuntimeConfig,
-    RuntimeFeatureConfig, RuntimeHookConfig, RuntimeInvalidHookConfig, RuntimePermissionRuleConfig,
-    RuntimePluginConfig, RuntimeProviderConfig, ScopedMcpServerConfig,
-    save_user_provider_settings, suppress_config_warnings_for_json_mode, CLAW_SETTINGS_SCHEMA_NAME,
+    save_user_provider_settings, suppress_config_warnings_for_json_mode, ConfigEntry, ConfigError,
+    ConfigFileReport, ConfigFileStatus, ConfigInspection, ConfigLoader, ConfigSource,
+    McpConfigCollection, McpInvalidServerConfig, McpManagedProxyServerConfig, McpOAuthConfig,
+    McpRemoteServerConfig, McpSdkServerConfig, McpServerConfig, McpStdioServerConfig, McpTransport,
+    McpWebSocketServerConfig, MemoryConfig, OAuthConfig, ProviderFallbackConfig,
+    ResolvedPermissionMode, RuntimeConfig, RuntimeFeatureConfig, RuntimeHookConfig,
+    RuntimeInvalidHookConfig, RuntimePermissionRuleConfig, RuntimePluginConfig,
+    RuntimeProviderConfig, ScopedMcpServerConfig, CLAW_SETTINGS_SCHEMA_NAME,
 };
 pub use config_validate::{
     check_unsupported_format, format_diagnostics, validate_config_file, ConfigDiagnostic,
@@ -154,9 +155,9 @@ pub use policy_engine::{
 };
 pub use prompt::{
     load_system_prompt, load_system_prompt_with_context, prepend_bullets, ContextFile,
-    ModelFamilyIdentity, ProjectContext,
-    PromptBuildError, SystemPromptBuilder, CAVEMAN_SYSTEM_PROMPT, FRONTIER_MODEL_NAME,
-    SUPERPOWERS_SYSTEM_PROMPT, SYSTEM_PROMPT_DYNAMIC_BOUNDARY,
+    ModelFamilyIdentity, ProjectContext, PromptBuildError, SystemPromptBuilder,
+    CAVEMAN_SYSTEM_PROMPT, FRONTIER_MODEL_NAME, SUPERPOWERS_SYSTEM_PROMPT,
+    SYSTEM_PROMPT_DYNAMIC_BOUNDARY,
 };
 pub use recovery_recipes::{
     attempt_recovery, recipe_for, EscalationPolicy, FailureScenario, RecoveryAttemptState,
