@@ -3735,23 +3735,8 @@ fn style_ui(text: &str, color: Color, bold: bool) -> String {
     }
 }
 
-fn repl_permission_label(permission_mode: PermissionMode) -> &'static str {
-    match permission_mode {
-        PermissionMode::DangerFullAccess => "bypass",
-        PermissionMode::WorkspaceWrite => "workspace",
-        PermissionMode::ReadOnly => "read-only",
-        PermissionMode::Prompt => "ask",
-        PermissionMode::Allow => "allow",
-    }
-}
-
 fn format_repl_prompt(_model: &str, _permission_mode: PermissionMode) -> String {
-    let muted = Color::Rgb {
-        r: 148,
-        g: 163,
-        b: 184,
-    };
-    format!("{} ", style_ui("•", muted, false))
+    input::styled_input_chip()
 }
 
 fn format_repl_footer(
@@ -3783,7 +3768,7 @@ fn format_repl_footer(
         style_ui(&format!("{} tok", usage.total_tokens()), muted, false),
         style_ui("·", muted, false),
         style_ui(&cost, muted, false),
-        style_ui(&format!("· {}", repl_permission_label(permission_mode)), muted, false),
+        input::styled_permission_segment(permission_mode.as_str()),
     )
 }
 
