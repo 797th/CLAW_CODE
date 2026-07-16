@@ -109,6 +109,12 @@ pub struct GateOutcome {
 
 /// File-writing tools that the stop-the-line gate guards. Matches both the
 /// canonical registry names and the capitalized aliases the model emits.
+///
+/// `Bash`/`bash` is treated as file-writing wholesale — even a read-only shell
+/// command is gated in `Spec`. This is intentional: `Bash` is an opaque
+/// mutation surface (it can write files, run `git`, etc.) and the gate cannot
+/// cheaply prove a command is side-effect-free, so it fails closed until
+/// acceptance criteria are confirmed.
 #[must_use]
 pub fn is_file_writing_tool(tool_name: &str) -> bool {
     matches!(

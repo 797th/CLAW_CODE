@@ -456,8 +456,10 @@ fn enforced_stop_gate_reprompts_in_verify_without_evidence() {
         })
         .count();
     assert_eq!(reprompts, 3, "QAS gate should re-prompt exactly 3 times");
-    assert!(!summary.gate_events.is_empty());
-    assert!(summary.gate_events.iter().all(|event| event.rule == "qas-verify-evidence"));
+    // Dedupe: byte-identical QAS events across the capped loop collapse to one
+    // audit record per turn.
+    assert_eq!(summary.gate_events.len(), 1);
+    assert_eq!(summary.gate_events[0].rule, "qas-verify-evidence");
 }
 
 #[test]

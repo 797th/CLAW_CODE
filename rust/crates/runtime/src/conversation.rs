@@ -515,7 +515,15 @@ where
                     evaluate_stop_gate(workflow_gate_mode, self.session.workflow.as_ref());
                 let mut gate_block_reason = None;
                 if let Some(outcome) = gate_outcome {
-                    gate_events.push(outcome.event);
+                    // Dedupe: the capped Stop re-prompt loop re-evaluates this
+                    // gate every iteration and would otherwise record N
+                    // byte-identical `gate_check` events per turn. Suppress a
+                    // consecutive duplicate so the audit trail carries one
+                    // record per distinct decision (the forced-stop-after-cap
+                    // is separately recorded in `lifecycle_warnings`).
+                    if gate_events.last() != Some(&outcome.event) {
+                        gate_events.push(outcome.event.clone());
+                    }
                     if outcome.blocking {
                         gate_block_reason = Some(outcome.reason);
                     } else {

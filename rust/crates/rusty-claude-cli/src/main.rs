@@ -8766,6 +8766,7 @@ impl LiveCli {
                     );
                 }
                 print_lifecycle_warnings(&summary);
+                print_gate_audit(&summary);
                 self.persist_session()?;
                 self.append_turn_log(input, &summary);
                 self.maybe_auto_dream_after_success();
@@ -8934,6 +8935,7 @@ impl LiveCli {
                                     );
                                 }
                                 print_lifecycle_warnings(&summary);
+                                print_gate_audit(&summary);
                                 self.persist_session()?;
                                 return Ok(());
                             }
@@ -9012,6 +9014,7 @@ impl LiveCli {
         hook_abort_monitor.stop();
         let summary = result?;
         print_lifecycle_warnings(&summary);
+        print_gate_audit(&summary);
         self.replace_runtime(runtime)?;
         self.persist_session()?;
         let final_text = final_assistant_text(&summary);
@@ -9034,6 +9037,7 @@ impl LiveCli {
                 "message": final_assistant_text(&summary),
                 "compact": true,
                 "model": self.model,
+                "gate_events": collect_gate_events(&summary),
                 "usage": {
                     "input_tokens": summary.usage.input_tokens,
                     "output_tokens": summary.usage.output_tokens,
@@ -9066,6 +9070,7 @@ impl LiveCli {
                 })),
                 "tool_uses": collect_tool_uses(&summary),
                 "tool_results": collect_tool_results(&summary),
+                "gate_events": collect_gate_events(&summary),
                 "prompt_cache_events": collect_prompt_cache_events(&summary),
                 "usage": {
                     "input_tokens": summary.usage.input_tokens,
@@ -14474,6 +14479,47 @@ fn collect_tool_results(summary: &runtime::TurnSummary) -> Vec<serde_json::Value
         .collect()
 }
 
+/// Task 9 audit sink (JSON modes): serializes each `gate_check` decision to its
+/// canonical wire form (schema `claw.gate_check.v1`; see `runtime::GateCheckEvent`).
+/// `GateCheckEvent` derives `Serialize`, so this is a straight projection.
+fn collect_gate_events(summary: &runtime::TurnSummary) -> Vec<serde_json::Value> {
+    summary
+        .gate_events
+        .iter()
+        .map(|event| serde_json::to_value(event).unwrap_or_else(|_| json!({})))
+        .collect()
+}
+
+/// Task 9 audit sink (text/interactive modes): emits a concise one-line stderr
+/// notice for each BLOCKED gate decision. Advisory decisions already reach the
+/// user through `lifecycle_warnings`, so they are intentionally not duplicated
+/// here. The `gate_check:` prefix keeps these distinguishable from lifecycle
+/// `warning:` lines. No verbose/debug flag exists in this CLI, so blocked
+/// audit lines always print (blocks are rare and operationally significant).
+fn print_gate_audit(summary: &runtime::TurnSummary) {
+    for line in gate_audit_lines(summary) {
+        eprintln!("{line}");
+    }
+}
+
+/// Builds the concise audit lines for BLOCKED gate decisions (see
+/// [`print_gate_audit`]). Advisory decisions are intentionally excluded — they
+/// already reach the user through `lifecycle_warnings`.
+fn gate_audit_lines(summary: &runtime::TurnSummary) -> Vec<String> {
+    summary
+        .gate_events
+        .iter()
+        .filter(|event| event.decision == runtime::GateDecision::Block)
+        .map(|event| {
+            let phase = serde_json::to_value(event.phase)
+                .ok()
+                .and_then(|value| value.as_str().map(String::from))
+                .unwrap_or_else(|| format!("{:?}", event.phase));
+            format!("gate_check: {} block ({phase})", event.rule)
+        })
+        .collect()
+}
+
 fn collect_prompt_cache_events(summary: &runtime::TurnSummary) -> Vec<serde_json::Value> {
     summary
         .prompt_cache_events
@@ -15678,7 +15724,8 @@ fn print_help(output_format: CliOutputFormat) -> Result<(), Box<dyn std::error::
 mod tests {
     use super::{
         acp_status_json, build_runtime_plugin_state_with_loader, build_runtime_with_plugin_state,
-        classify_error_kind, classify_session_lifecycle_from_panes, collect_session_prompt_history,
+        classify_error_kind, classify_session_lifecycle_from_panes, collect_gate_events,
+        collect_session_prompt_history, gate_audit_lines,
         create_managed_session_handle, describe_tool_progress, filter_tool_specs,
         format_bughunter_report, format_commit_preflight_report, format_commit_skipped_report,
         format_compact_report, format_connected_line, format_cost_report, format_history_timestamp,
@@ -15725,6 +15772,64 @@ mod tests {
     use std::thread;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
     use tools::GlobalToolRegistry;
+
+    fn gate_event(
+        rule: &str,
+        decision: runtime::GateDecision,
+        phase: runtime::WorkflowPhase,
+    ) -> runtime::GateCheckEvent {
+        runtime::GateCheckEvent {
+            schema: runtime::GATE_CHECK_SCHEMA.to_string(),
+            event: runtime::GATE_CHECK_EVENT.to_string(),
+            phase,
+            rule: rule.to_string(),
+            decision,
+            reason: "reason".to_string(),
+        }
+    }
+
+    fn summary_with_gate_events(events: Vec<runtime::GateCheckEvent>) -> runtime::TurnSummary {
+        runtime::TurnSummary {
+            assistant_messages: Vec::new(),
+            tool_results: Vec::new(),
+            prompt_cache_events: Vec::new(),
+            iterations: 1,
+            usage: runtime::TokenUsage::default(),
+            auto_compaction: None,
+            lifecycle_warnings: Vec::new(),
+            gate_events: events,
+        }
+    }
+
+    /// Task 9 sink: JSON modes serialize gate events (schema-tagged), and the
+    /// text-mode audit emits a one-line notice for BLOCKED decisions only.
+    #[test]
+    fn gate_events_reach_json_and_text_sinks() {
+        let summary = summary_with_gate_events(vec![
+            gate_event(
+                "stop-the-line-spec",
+                runtime::GateDecision::Block,
+                runtime::WorkflowPhase::Spec,
+            ),
+            gate_event(
+                "stop-the-line-spec",
+                runtime::GateDecision::Advisory,
+                runtime::WorkflowPhase::Spec,
+            ),
+        ]);
+
+        // JSON sink: both events serialized, schema-tagged.
+        let json = collect_gate_events(&summary);
+        assert_eq!(json.len(), 2);
+        assert_eq!(json[0]["schema"], "claw.gate_check.v1");
+        assert_eq!(json[0]["event"], "gate_check");
+        assert_eq!(json[0]["decision"], "block");
+        assert_eq!(json[1]["decision"], "advisory");
+
+        // Text sink: only the BLOCKED decision produces an audit line.
+        let lines = gate_audit_lines(&summary);
+        assert_eq!(lines, vec!["gate_check: stop-the-line-spec block (spec)".to_string()]);
+    }
 
     fn registry_with_plugin_tool() -> GlobalToolRegistry {
         GlobalToolRegistry::with_plugin_tools(vec![PluginTool::new(

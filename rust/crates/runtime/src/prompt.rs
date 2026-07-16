@@ -1675,10 +1675,22 @@ mod tests {
 
     #[test]
     fn build_splices_workflow_banner_after_skill_index() {
-        let prompt = SystemPromptBuilder::new()
+        let sections = SystemPromptBuilder::new()
+            .with_skills(vec![skill("deploy-sop", "How to deploy")])
             .with_workflow_status(WorkflowPhase::Spec, WorkflowGateMode::Enforced)
-            .render();
-        assert!(prompt.contains("Workflow phase: spec — gates: enforced"));
+            .build();
+        let banner_idx = sections
+            .iter()
+            .position(|section| section.contains("Workflow phase: spec — gates: enforced"))
+            .expect("banner section present");
+        let skills_idx = sections
+            .iter()
+            .position(|section| section.starts_with("# Available skills"))
+            .expect("skill index section present");
+        assert!(
+            banner_idx > skills_idx,
+            "banner must render after the skill index (skills={skills_idx}, banner={banner_idx})"
+        );
     }
 
     fn skill(name: &str, description: &str) -> SkillMeta {
