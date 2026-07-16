@@ -55,6 +55,7 @@ mod trust_resolver;
 mod turn_service;
 mod usage;
 pub mod worker_boot;
+pub mod workflow;
 
 pub use approval_tokens::{
     ApprovalDelegationHop, ApprovalScope, ApprovalTokenAudit, ApprovalTokenError,
@@ -209,6 +210,7 @@ pub use worker_boot::{
     Worker, WorkerEvent, WorkerEventKind, WorkerEventPayload, WorkerFailure, WorkerFailureKind,
     WorkerPromptTarget, WorkerReadySnapshot, WorkerRegistry, WorkerStatus, WorkerTrustResolution,
 };
+pub use workflow::{GateCheck, GateEvidence, WorkflowPhase, WorkflowState};
 
 #[cfg(test)]
 pub(crate) fn test_env_lock() -> std::sync::MutexGuard<'static, ()> {

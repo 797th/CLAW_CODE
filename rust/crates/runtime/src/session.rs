@@ -8,6 +8,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::json::{JsonError, JsonValue};
 use crate::usage::TokenUsage;
+use crate::workflow::WorkflowState;
 use serde::{Deserialize, Serialize};
 
 const SESSION_VERSION: u32 = 1;
@@ -129,6 +130,10 @@ pub struct Session {
     /// Timestamp of last successful health check (ROADMAP #38)
     pub last_health_check_ms: Option<u64>,
     pub model: Option<String>,
+    /// SAW-style workflow gate state (Task 7). Optional so existing sessions
+    /// without a workflow in progress deserialize with `phase: Idle` and no
+    /// evidence recorded. Restored on `/resume` so gate progress survives.
+    pub workflow: Option<WorkflowState>,
     persistence: Option<SessionPersistence>,
 }
 
@@ -197,6 +202,7 @@ impl Session {
             prompt_history: Vec::new(),
             last_health_check_ms: None,
             model: None,
+            workflow: None,
             persistence: None,
         }
     }
@@ -353,6 +359,7 @@ impl Session {
             prompt_history: self.prompt_history.clone(),
             last_health_check_ms: self.last_health_check_ms,
             model: self.model.clone(),
+            workflow: self.workflow.clone(),
             persistence: None,
         }
     }
@@ -406,6 +413,9 @@ impl Session {
                         .collect(),
                 ),
             );
+        }
+        if let Some(workflow) = &self.workflow {
+            object.insert("workflow".to_string(), workflow_to_json(workflow)?);
         }
         Ok(JsonValue::Object(object))
     }
@@ -466,6 +476,7 @@ impl Session {
             .get("model")
             .and_then(JsonValue::as_str)
             .map(String::from);
+        let workflow = object.get("workflow").map(workflow_from_json).transpose()?;
         Ok(Self {
             version,
             session_id,
@@ -478,6 +489,7 @@ impl Session {
             prompt_history,
             last_health_check_ms: None,
             model,
+            workflow,
             persistence: None,
         })
     }
@@ -492,6 +504,7 @@ impl Session {
         let mut fork = None;
         let mut workspace_root = None;
         let mut model = None;
+        let mut workflow = None;
         let mut prompt_history = Vec::new();
 
         for (line_number, raw_line) in contents.lines().enumerate() {
@@ -538,6 +551,7 @@ impl Session {
                         .get("model")
                         .and_then(JsonValue::as_str)
                         .map(String::from);
+                    workflow = object.get("workflow").map(workflow_from_json).transpose()?;
                 }
                 "message" => {
                     let message_value = object.get("message").ok_or_else(|| {
@@ -586,6 +600,7 @@ impl Session {
             prompt_history,
             last_health_check_ms: None,
             model,
+            workflow,
             persistence: None,
         })
     }
@@ -704,6 +719,9 @@ impl Session {
         }
         if let Some(model) = &self.model {
             object.insert("model".to_string(), JsonValue::String(model.clone()));
+        }
+        if let Some(workflow) = &self.workflow {
+            object.insert("workflow".to_string(), workflow_to_json(workflow)?);
         }
         Ok(JsonValue::Object(object))
     }
@@ -1205,6 +1223,22 @@ fn redact_after_marker(value: &str, marker: &str) -> String {
     output
 }
 
+/// Bridge a [`WorkflowState`] (standard `serde`) into this module's custom
+/// [`JsonValue`] representation by round-tripping through a JSON string.
+/// `WorkflowState` is a small, flat structure so this is cheap and avoids
+/// hand-writing a second serializer for it.
+fn workflow_to_json(workflow: &WorkflowState) -> Result<JsonValue, SessionError> {
+    let rendered = serde_json::to_string(workflow)
+        .map_err(|error| SessionError::Format(format!("workflow serialize failed: {error}")))?;
+    JsonValue::parse(&rendered).map_err(SessionError::from)
+}
+
+fn workflow_from_json(value: &JsonValue) -> Result<WorkflowState, SessionError> {
+    let rendered = value.render();
+    serde_json::from_str(&rendered)
+        .map_err(|error| SessionError::Format(format!("workflow deserialize failed: {error}")))
+}
+
 fn usage_to_json(usage: TokenUsage) -> JsonValue {
     let mut object = BTreeMap::new();
     object.insert(
@@ -1552,6 +1586,51 @@ mod tests {
             ConversationMessage::user_text("legacy")
         );
         assert!(!restored.session_id.is_empty());
+    }
+
+    #[test]
+    fn loads_old_session_jsonl_without_workflow_field_as_none() {
+        // given: a session_meta record predating the workflow field (Task 7)
+        let path = temp_session_path("no-workflow-field");
+        fs::write(
+            &path,
+            r#"{"type":"session_meta","version":1,"session_id":"session-1743724800123-0","created_at_ms":1743724800123,"updated_at_ms":1743724800123}
+"#,
+        )
+        .expect("legacy jsonl without workflow should write");
+
+        // when
+        let restored =
+            Session::load_from_path(&path).expect("session without workflow field should load");
+        fs::remove_file(&path).expect("temp file should be removable");
+
+        // then
+        assert!(restored.workflow.is_none());
+    }
+
+    #[test]
+    fn persists_workflow_state_round_trip_through_jsonl() {
+        // given
+        let path = temp_session_path("workflow-round-trip");
+        let mut session = Session::new();
+        let mut workflow = crate::workflow::WorkflowState::default();
+        workflow.start("TASK-7");
+        workflow.acceptance_criteria.push("AC1".to_string());
+        session.workflow = Some(workflow);
+
+        // when
+        session.save_to_path(&path).expect("session should save");
+        let restored = Session::load_from_path(&path).expect("session should load");
+        fs::remove_file(&path).expect("temp file should be removable");
+
+        // then
+        let restored_workflow = restored.workflow.expect("workflow should round-trip");
+        assert_eq!(
+            restored_workflow.phase,
+            crate::workflow::WorkflowPhase::Spec
+        );
+        assert_eq!(restored_workflow.task_ref.as_deref(), Some("TASK-7"));
+        assert_eq!(restored_workflow.acceptance_criteria, vec!["AC1".to_string()]);
     }
 
     #[test]
