@@ -17,6 +17,7 @@
 mod init;
 mod input;
 mod mao;
+mod picker;
 mod render;
 mod setup_wizard;
 
@@ -3735,23 +3736,8 @@ fn style_ui(text: &str, color: Color, bold: bool) -> String {
     }
 }
 
-fn repl_permission_label(permission_mode: PermissionMode) -> &'static str {
-    match permission_mode {
-        PermissionMode::DangerFullAccess => "bypass",
-        PermissionMode::WorkspaceWrite => "workspace",
-        PermissionMode::ReadOnly => "read-only",
-        PermissionMode::Prompt => "ask",
-        PermissionMode::Allow => "allow",
-    }
-}
-
 fn format_repl_prompt(_model: &str, _permission_mode: PermissionMode) -> String {
-    let muted = Color::Rgb {
-        r: 148,
-        g: 163,
-        b: 184,
-    };
-    format!("{} ", style_ui("•", muted, false))
+    input::styled_input_chip()
 }
 
 fn format_repl_footer(
@@ -3783,7 +3769,7 @@ fn format_repl_footer(
         style_ui(&format!("{} tok", usage.total_tokens()), muted, false),
         style_ui("·", muted, false),
         style_ui(&cost, muted, false),
-        style_ui(&format!("· {}", repl_permission_label(permission_mode)), muted, false),
+        input::styled_permission_segment(permission_mode.as_str()),
     )
 }
 
@@ -9342,22 +9328,47 @@ impl LiveCli {
     }
 
     fn choose_model_interactively(&mut self) -> Result<bool, Box<dyn std::error::Error>> {
+        const ALIASES: [&str; 4] = ["opus", "sonnet", "haiku", "gpt-oss"];
+
+        let mut items: Vec<picker::PickerItem> = ALIASES
+            .iter()
+            .map(|alias| picker::PickerItem::new(*alias, resolve_model_alias_with_config(alias)))
+            .collect();
+        items.push(picker::PickerItem::new("custom…", "type a provider/model"));
+
+        let initial = ALIASES
+            .iter()
+            .position(|alias| resolve_model_alias_with_config(alias) == self.model)
+            .unwrap_or(0);
+
         println!();
-        println!("Model selection");
-        println!("  Current          {}", self.model);
-        println!("  Aliases          opus · sonnet · haiku · gpt-oss");
-        print!("  Provider/model   ");
-        io::stdout().flush()?;
+        match picker::select_from_list("Select model", &items, initial)? {
+            picker::PickerOutcome::Cancelled => {
+                println!("Model unchanged.");
+                Ok(false)
+            }
+            picker::PickerOutcome::Selected(index) if index < ALIASES.len() => {
+                self.set_model(Some(ALIASES[index].to_string()))
+            }
+            // The "custom…" row, or a non-interactive session (piped stdin):
+            // fall back to a typed provider/model prompt.
+            picker::PickerOutcome::Selected(_) | picker::PickerOutcome::NotInteractive => {
+                println!("Model selection");
+                println!("  Current          {}", self.model);
+                println!("  Aliases          opus · sonnet · haiku · gpt-oss");
+                print!("  Provider/model   ");
+                io::stdout().flush()?;
 
-        let mut input = String::new();
-        io::stdin().read_line(&mut input)?;
-        let model = input.trim();
-        if model.is_empty() {
-            println!("Model unchanged.");
-            return Ok(false);
+                let mut input = String::new();
+                io::stdin().read_line(&mut input)?;
+                let model = input.trim();
+                if model.is_empty() {
+                    println!("Model unchanged.");
+                    return Ok(false);
+                }
+                self.set_model(Some(model.to_string()))
+            }
         }
-
-        self.set_model(Some(model.to_string()))
     }
 
     fn set_model(&mut self, model: Option<String>) -> Result<bool, Box<dyn std::error::Error>> {
@@ -18775,7 +18786,8 @@ mod tests {
             },
         );
 
-        assert!(prompt.contains('•'));
+        // The input prompt is now a shaded chip (chevron), not a bare dot.
+        assert!(prompt.contains('›'));
         assert!(!prompt.contains("custom-model"));
         assert!(!prompt.contains('\n'));
         assert!(footer.contains("custom-model"));
@@ -18784,6 +18796,25 @@ mod tests {
         assert!(footer.contains("bypass"));
         assert!(footer.contains('•'));
         assert!(!footer.contains('\n'));
+    }
+
+    #[test]
+    fn repl_footer_counters_and_plan_mode_label() {
+        // Live token + dollar counters climb with cumulative usage and the
+        // plan posture (read-only) renders its own label in the footer.
+        let footer = format_repl_footer(
+            "custom-model",
+            PermissionMode::ReadOnly,
+            runtime::TokenUsage {
+                input_tokens: 1000,
+                output_tokens: 500,
+                ..Default::default()
+            },
+        );
+        assert!(footer.contains("1500 tok"));
+        assert!(footer.contains("$"));
+        assert!(footer.contains("plan"));
+        assert!(!footer.contains("read-only"));
     }
 
     #[test]

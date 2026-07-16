@@ -29,7 +29,7 @@ fn repl_keeps_working_indicator_above_composer_and_model_footer() {
     let reserved_output = &terminal_output[working_region..];
     let composer = working_region
         + reserved_output
-            .find("• ")
+            .find("> ")
             .expect("working state should redraw the composer");
     let model_footer = terminal_output
         .rfind("• anthropic/claude-sonnet-4-6")
