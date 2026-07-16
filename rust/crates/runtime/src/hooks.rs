@@ -530,7 +530,7 @@ impl HookRunner {
                 if let HookDecision::Block { .. } = &outcome.decision {
                     parsed.deny = true;
                     if event == HookEvent::PreToolUse && parsed.permission_override.is_none() {
-                        parsed.permission_override = Some(PermissionOverride::Deny);
+                        parsed.permission_override = outcome.permission_override_for_pre_tool_use();
                     }
                 }
                 if let Some(context) = outcome.additional_context.as_deref() {
@@ -549,27 +549,52 @@ impl HookRunner {
                         }
                     }
                     Some(2) => HookCommandOutcome::Deny {
-                        parsed: parsed.with_fallback_message(if stderr.is_empty() {
-                            format!("{} hook denied tool `{tool_name}`", event.as_str())
+                        parsed: parsed
+                            .with_fallback_message(deny_fallback_message(event, tool_name, &stderr)),
+                    },
+                    // Any other exit code (or a signal-terminated process,
+                    // below) is a non-blocking failure *unless* the hook's
+                    // stdout already carried an explicit JSON block decision
+                    // (`parsed.deny`, set above from `outcome.decision`) — the
+                    // JSON stdout decision wins over exit-code inference
+                    // unconditionally, so a hook that emits
+                    // `{"decision":"block",...}` but happens to exit 1 (or is
+                    // killed) must still deny, not report a generic failure.
+                    Some(code) => {
+                        if parsed.deny {
+                            HookCommandOutcome::Deny {
+                                parsed: parsed.with_fallback_message(deny_fallback_message(
+                                    event, tool_name, &stderr,
+                                )),
+                            }
                         } else {
-                            stderr.clone()
-                        }),
-                    },
-                    Some(code) => HookCommandOutcome::Failed {
-                        parsed: parsed.with_fallback_message(format_hook_failure(
-                            command,
-                            code,
-                            primary_message.as_deref(),
-                            stderr.as_str(),
-                        )),
-                    },
-                    None => HookCommandOutcome::Failed {
-                        parsed: parsed.with_fallback_message(format!(
-                            "{} hook `{command}` terminated by signal while handling `{}`",
-                            event.as_str(),
-                            tool_name
-                        )),
-                    },
+                            HookCommandOutcome::Failed {
+                                parsed: parsed.with_fallback_message(format_hook_failure(
+                                    command,
+                                    code,
+                                    primary_message.as_deref(),
+                                    stderr.as_str(),
+                                )),
+                            }
+                        }
+                    }
+                    None => {
+                        if parsed.deny {
+                            HookCommandOutcome::Deny {
+                                parsed: parsed.with_fallback_message(deny_fallback_message(
+                                    event, tool_name, &stderr,
+                                )),
+                            }
+                        } else {
+                            HookCommandOutcome::Failed {
+                                parsed: parsed.with_fallback_message(format!(
+                                    "{} hook `{command}` terminated by signal while handling `{}`",
+                                    event.as_str(),
+                                    tool_name
+                                )),
+                            }
+                        }
+                    }
                 }
             }
             Ok(CommandExecution::Cancelled) => HookCommandOutcome::Cancelled {
@@ -1001,6 +1026,18 @@ fn looks_like_json_attempt(value: &str) -> bool {
     matches!(value.trim_start().chars().next(), Some('{' | '['))
 }
 
+/// Fallback deny reason used when a hook's own messages don't already supply
+/// one (`ParsedHookOutput::with_fallback_message` only applies it if
+/// `messages` is empty): prefers `stderr`, matching the exit-2 contract, and
+/// otherwise falls back to a generic denial message.
+fn deny_fallback_message(event: HookEvent, tool_name: &str, stderr: &str) -> String {
+    if stderr.is_empty() {
+        format!("{} hook denied tool `{tool_name}`", event.as_str())
+    } else {
+        stderr.to_string()
+    }
+}
+
 fn format_hook_failure(command: &str, code: i32, stdout: Option<&str>, stderr: &str) -> String {
     let mut message = format!("Hook `{command}` exited with status {code}");
     if let Some(stdout) = stdout.filter(|stdout| !stdout.is_empty()) {
@@ -1183,6 +1220,35 @@ mod tests {
 
         assert!(result.is_denied());
         assert_eq!(result.messages(), &["blocked by hook".to_string()]);
+    }
+
+    #[test]
+    fn json_block_decision_wins_over_non_blocking_exit_code_in_real_runner() {
+        // Exercises HookRunner::run_command (the real PreToolUse execution
+        // path, not the standalone run_hook_command), covering the case where
+        // a hook exits 1 (normally a non-blocking `Failed`) but its stdout
+        // carries an explicit JSON block decision. Per the protocol contract,
+        // JSON stdout wins over exit-code inference unconditionally.
+        let runner = HookRunner::new(RuntimeHookConfig::new(
+            vec![shell_snippet(
+                r#"printf '%s' '{"decision":"block","reason":"custom"}'; exit 1"#,
+            )],
+            Vec::new(),
+            Vec::new(),
+        ));
+
+        let result = runner.run_pre_tool_use("Bash", r#"{"command":"pwd"}"#);
+
+        assert!(result.is_denied());
+        assert!(!result.is_failed());
+        assert_eq!(
+            result.permission_override(),
+            Some(PermissionOverride::Deny)
+        );
+        assert!(result
+            .messages()
+            .iter()
+            .any(|message| message == "custom"));
     }
 
     #[test]
