@@ -66,6 +66,7 @@ pub use branch_lock::{detect_branch_lock_collisions, BranchLockCollision, Branch
 pub use compact::{
     compact_session, compact_session_to_target, estimate_session_tokens, format_compact_summary,
     get_compact_continuation_message, should_compact, CompactionConfig, CompactionResult,
+    DEFAULT_COMPACTION_KEEP_RECENT_TOKENS,
 };
 pub use config::{
     save_user_provider_settings, suppress_config_warnings_for_json_mode, ConfigEntry, ConfigError,
@@ -183,8 +184,8 @@ pub use sandbox::{
     SandboxRequest, SandboxStatus,
 };
 pub use session::{
-    ContentBlock, ConversationMessage, MessageRole, Session, SessionCompaction, SessionError,
-    SessionFork, SessionHeartbeat, SessionLiveness, SessionPromptEntry,
+    CompactionDetails, ContentBlock, ConversationMessage, MessageRole, Session, SessionCompaction,
+    SessionError, SessionFork, SessionHeartbeat, SessionLiveness, SessionPromptEntry,
 };
 pub use sse::{IncrementalSseParser, SseEvent};
 pub use stale_base::{

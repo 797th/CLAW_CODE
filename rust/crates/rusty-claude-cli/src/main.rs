@@ -268,14 +268,14 @@ fn env_model_for_runtime() -> Option<EnvModel> {
         "ANTHROPIC_MODEL",
         "ANTHROPIC_DEFAULT_MODEL",
     ]
-        .into_iter()
-        .find_map(|name| {
-            env::var(name)
-                .ok()
-                .map(|value| value.trim().to_string())
-                .filter(|value| !value.is_empty())
-                .map(|value| EnvModel { name, value })
-        })
+    .into_iter()
+    .find_map(|name| {
+        env::var(name)
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .map(|value| EnvModel { name, value })
+    })
 }
 
 fn max_tokens_for_model(model: &str) -> u32 {
@@ -1069,8 +1069,7 @@ fn credentials_present_for_model(model: &str) -> bool {
         ProviderKind::Xai => api::has_api_key("XAI_API_KEY"),
         ProviderKind::NvidiaNim => api::has_api_key("NVIDIA_API_KEY"),
         ProviderKind::OpenAi => {
-            let credential_env = if api::configured_provider_kind() == Some(ProviderKind::OpenAi)
-            {
+            let credential_env = if api::configured_provider_kind() == Some(ProviderKind::OpenAi) {
                 "OPENAI_API_KEY"
             } else {
                 let canonical = api::resolve_model_alias(model).to_ascii_lowercase();
@@ -1117,9 +1116,7 @@ fn prompt_for_provider_setup(preferred_model: &str) -> io::Result<ProviderSetup>
     println!();
     println!("No API credentials were detected for the selected model.");
     println!("Choose a connection type:");
-    println!(
-        "  1) OpenAI-compatible (recommended) — custom URL plus API key"
-    );
+    println!("  1) OpenAI-compatible (recommended) — custom URL plus API key");
     println!("  2) Anthropic-compatible — custom URL plus API key");
 
     let protocol = loop {
@@ -1283,8 +1280,7 @@ fn setup_default_model(protocol: EndpointProtocol, preferred_model: &str) -> Str
             .unwrap_or(preferred_model),
     };
     if normalized.is_empty()
-        || (protocol == EndpointProtocol::OpenAiCompatible
-            && normalized.starts_with("claude"))
+        || (protocol == EndpointProtocol::OpenAiCompatible && normalized.starts_with("claude"))
         || (protocol == EndpointProtocol::AnthropicCompatible
             && (normalized.starts_with("gpt-") || normalized.starts_with("gpt_")))
     {
@@ -1297,10 +1293,9 @@ fn setup_default_model(protocol: EndpointProtocol, preferred_model: &str) -> Str
 fn normalize_setup_model(protocol: EndpointProtocol, value: &str) -> String {
     let value = value.trim();
     match protocol {
-        EndpointProtocol::OpenAiCompatible => value
-            .strip_prefix("openai/")
-            .unwrap_or(value)
-            .to_string(),
+        EndpointProtocol::OpenAiCompatible => {
+            value.strip_prefix("openai/").unwrap_or(value).to_string()
+        }
         EndpointProtocol::AnthropicCompatible => value
             .strip_prefix("anthropic/")
             .unwrap_or(value)
@@ -3099,12 +3094,10 @@ fn try_resolve_bare_skill_prompt(cwd: &Path, trimmed: &str) -> Option<String> {
 
 fn repl_command_model_prompt(command: &SlashCommand) -> Option<String> {
     match command {
-        SlashCommand::Skills { args } => {
-            match classify_skills_slash_command(args.as_deref()) {
-                SkillSlashDispatch::Invoke(prompt) => Some(prompt),
-                SkillSlashDispatch::Local => None,
-            }
-        }
+        SlashCommand::Skills { args } => match classify_skills_slash_command(args.as_deref()) {
+            SkillSlashDispatch::Invoke(prompt) => Some(prompt),
+            SkillSlashDispatch::Local => None,
+        },
         _ => None,
     }
 }
@@ -3740,11 +3733,7 @@ fn format_repl_prompt(_model: &str, _permission_mode: PermissionMode) -> String 
     input::styled_input_chip()
 }
 
-fn format_repl_footer(
-    model: &str,
-    permission_mode: PermissionMode,
-    usage: TokenUsage,
-) -> String {
+fn format_repl_footer(model: &str, permission_mode: PermissionMode, usage: TokenUsage) -> String {
     let accent = Color::Rgb {
         r: 129,
         g: 140,
@@ -8735,11 +8724,6 @@ impl LiveCli {
             }
             Err(error) => {
                 runtime.shutdown_plugins()?;
-                activity.fail(
-                    "Request failed",
-                    renderer.color_theme(),
-                    &mut stdout,
-                )?;
 
                 // ============================================================================
                 // Auto-compact retry on context window errors
@@ -8784,38 +8768,49 @@ impl LiveCli {
                     || error_str.contains("error decoding response body");
 
                 if is_context_window || is_no_content {
+                    // Keep automatic recovery out of the interactive transcript. The
+                    // activity row is replaced by the eventual response (or one final
+                    // failure), rather than exposing each internal retry round.
+                    activity.clear(&mut stdout)?;
+
                     // If the error tells us the server's actual context window, adapt our
                     // auto-compaction threshold so future auto-compact-trigger checks are accurate.
                     if let Some(window) = extract_context_window_tokens_from_error(&error_str) {
-                        // Set threshold at 70% of the reported window to leave headroom.
-                        let threshold: u32 = (window as f64 * 0.7).round() as u32;
-                        println!(
-                            "  Server context window: {} tokens — setting auto-compaction threshold to {}",
-                            window, threshold
-                        );
+                        // Trigger before the provider's hard limit. Keeping a
+                        // 25% reserve absorbs the system prompt, tool schemas,
+                        // and the next assistant response.
+                        let threshold: u32 = (window as f64 * 0.75).round() as u32;
+                        if !clean_interactive_output {
+                            println!(
+                                "  Server context window: {} tokens — setting auto-compaction threshold to {}",
+                                window, threshold
+                            );
+                        }
                         runtime.set_auto_compaction_input_tokens_threshold(threshold);
                     }
 
-                    // A single compaction pass may not free enough context space.
-                    // Progressive retry: each round preserves fewer recent messages (4→2→1→0),
-                    // trading conversation continuity for a smaller payload until it fits.
-                    // Max 4 rounds before giving up and surfacing the error to the user.
+                    // A single compaction pass may not free enough context
+                    // space. Progressive retry reduces the target budget while
+                    // the compactor still protects recent turns by token
+                    // budget. Max 4 rounds prevents a retry loop.
                     let max_compact_rounds = 4;
-                    let target_schedule = [70usize, 55, 40, 25];
-                    let preferred_preserve_recent_messages = CompactionConfig::default()
-                        .preserve_recent_messages;
+                    let target_schedule = [60usize, 45, 30, 20];
+                    let preferred_preserve_recent_messages =
+                        CompactionConfig::default().preserve_recent_messages;
 
                     for round in 0..max_compact_rounds {
                         let target_estimated_tokens = overflow_compaction_target(
                             runtime.estimated_tokens(),
                             target_schedule[round],
                         );
-                        println!(
-                            "  Auto-compacting session (round {}/{}, target ~{} estimated tokens)...",
-                            round + 1,
-                            max_compact_rounds,
-                            target_estimated_tokens
-                        );
+                        if !clean_interactive_output {
+                            println!(
+                                "  Auto-compacting session (round {}/{}, target ~{} estimated tokens)...",
+                                round + 1,
+                                max_compact_rounds,
+                                target_estimated_tokens
+                            );
+                        }
 
                         // Run Trident pipeline then compact until the reduced
                         // session estimate fits the round's target budget.
@@ -8827,21 +8822,26 @@ impl LiveCli {
                         );
                         let removed = result.removed_message_count;
 
-                        if removed == 0 && round > 0 {
-                            // No more messages to compact — further rounds won't help
+                        let changed = removed > 0
+                            || result.compacted_session.messages != runtime.session().messages;
+                        if !changed {
+                            // No more messages or oversized tool payloads to
+                            // compact — further rounds cannot change the request.
                             println!("  No further compaction possible.");
                             break;
                         }
 
                         if removed > 0 {
-                            println!(
-                                "{}",
-                                format_compact_report(
-                                    removed,
-                                    result.compacted_session.messages.len(),
-                                    false
-                                )
-                            );
+                            if !clean_interactive_output {
+                                println!(
+                                    "{}",
+                                    format_compact_report(
+                                        removed,
+                                        result.compacted_session.messages.len(),
+                                        false
+                                    )
+                                );
+                            }
                         }
 
                         // Without this, prepare_turn_runtime() reads from self.runtime.session()
@@ -8910,7 +8910,7 @@ impl LiveCli {
                                     if let Some(window) =
                                         extract_context_window_tokens_from_error(&retry_str)
                                     {
-                                        let threshold: u32 = (window as f64 * 0.7).round() as u32;
+                                        let threshold: u32 = (window as f64 * 0.75).round() as u32;
                                         new_runtime
                                             .set_auto_compaction_input_tokens_threshold(threshold);
                                     }
@@ -8924,6 +8924,11 @@ impl LiveCli {
                                 }
 
                                 // Not a context window error, or out of rounds
+                                activity.fail(
+                                    "Request failed",
+                                    renderer.color_theme(),
+                                    &mut stdout,
+                                )?;
                                 return Err(Box::new(retry_error));
                             }
                         }
@@ -8931,6 +8936,7 @@ impl LiveCli {
                 }
 
                 // If not a context window error, return original error
+                activity.fail("Request failed", renderer.color_theme(), &mut stdout)?;
                 Err(Box::new(error))
             }
         }
@@ -15479,29 +15485,28 @@ mod tests {
         format_compact_report, format_connected_line, format_cost_report, format_history_timestamp,
         format_internal_prompt_progress_line, format_issue_report, format_model_report,
         format_model_switch_report, format_permissions_report, format_permissions_switch_report,
-        format_pr_report, format_resume_report, format_status_report, format_tool_call_start,
-        format_tool_result, format_ultraplan_report, format_unknown_slash_command,
-        format_unknown_slash_command_message, format_user_visible_api_error,
-        merge_prompt_with_stdin, normalize_permission_mode, parse_args, parse_export_args,
-        parse_git_status_branch, parse_git_status_metadata_for, parse_git_workspace_summary,
-        parse_history_count, permission_policy, print_help_to, push_output_block,
-        render_config_report, render_diff_report, render_diff_report_for, render_help_topic,
-        render_help_topic_json, render_memory_report, render_prompt_history_report,
-        render_repl_help, render_repl_response, render_resume_usage, render_session_list,
-        render_session_markdown, format_repl_footer, format_repl_prompt, resolve_model_alias,
-        resolve_model_alias_with_config, resolve_repl_model,
-        resolve_session_reference, response_to_events, resume_supported_slash_commands,
-        run_resume_command, short_tool_id, slash_command_completion_candidates_with_sessions,
+        format_pr_report, format_repl_footer, format_repl_prompt, format_resume_report,
+        format_status_report, format_tool_call_start, format_tool_result, format_ultraplan_report,
+        format_unknown_slash_command, format_unknown_slash_command_message,
+        format_user_visible_api_error, merge_prompt_with_stdin, normalize_permission_mode,
+        parse_args, parse_export_args, parse_git_status_branch, parse_git_status_metadata_for,
+        parse_git_workspace_summary, parse_history_count, permission_policy,
+        persist_provider_setup, print_help_to, push_output_block, render_config_report,
+        render_diff_report, render_diff_report_for, render_help_topic, render_help_topic_json,
+        render_memory_report, render_prompt_history_report, render_repl_help, render_repl_response,
+        render_resume_usage, render_session_list, render_session_markdown, resolve_model_alias,
+        resolve_model_alias_with_config, resolve_repl_model, resolve_session_reference,
+        response_to_events, resume_supported_slash_commands, run_resume_command,
+        setup_default_model, short_tool_id, slash_command_completion_candidates_with_sessions,
         split_error_hint, status_context, status_json_value, summarize_tool_payload_for_markdown,
         try_resolve_bare_skill_prompt, validate_endpoint_url, validate_no_args,
-        write_mcp_server_fixture, EndpointProtocol, ProviderSetup, CliAction, CliOutputFormat,
-        CliToolExecutor, GitWorkspaceSummary, InternalPromptProgressEvent,
-        InternalPromptProgressState, LiveCli, LocalHelpTopic, PromptHistoryEntry,
-        SessionLifecycleKind, SessionLifecycleSummary, SlashCommand, StatusUsage, TmuxPaneSnapshot,
-        DEFAULT_ANTHROPIC_COMPAT_BASE_URL, DEFAULT_ANTHROPIC_COMPAT_MODEL,
-        DEFAULT_MODEL, DEFAULT_OPENAI_COMPAT_BASE_URL, DEFAULT_OPENAI_COMPAT_MODEL,
-        GitOperation, LATEST_SESSION_REFERENCE, PermissionModeProvenance, persist_provider_setup,
-        setup_default_model, STUB_COMMANDS,
+        write_mcp_server_fixture, CliAction, CliOutputFormat, CliToolExecutor, EndpointProtocol,
+        GitOperation, GitWorkspaceSummary, InternalPromptProgressEvent,
+        InternalPromptProgressState, LiveCli, LocalHelpTopic, PermissionModeProvenance,
+        PromptHistoryEntry, ProviderSetup, SessionLifecycleKind, SessionLifecycleSummary,
+        SlashCommand, StatusUsage, TmuxPaneSnapshot, DEFAULT_ANTHROPIC_COMPAT_BASE_URL,
+        DEFAULT_ANTHROPIC_COMPAT_MODEL, DEFAULT_MODEL, DEFAULT_OPENAI_COMPAT_BASE_URL,
+        DEFAULT_OPENAI_COMPAT_MODEL, LATEST_SESSION_REFERENCE, STUB_COMMANDS,
     };
     use api::{ApiError, MessageResponse, OutputContentBlock, Usage};
     use plugins::{
@@ -16878,10 +16883,7 @@ mod tests {
                 model_flag_raw,
                 ..
             } => {
-                assert_eq!(
-                    model, "claude-sonnet-4-6",
-                    "sonnet alias should resolve"
-                );
+                assert_eq!(model, "claude-sonnet-4-6", "sonnet alias should resolve");
                 assert_eq!(
                     model_flag_raw.as_deref(),
                     Some("sonnet"),
@@ -18856,7 +18858,10 @@ mod tests {
             .expect("cli should initialize");
             assert!(cli.is_connected(), "seeded env should look connected");
             cli.run_logout().expect("logout should succeed");
-            assert!(!cli.is_connected(), "logout should rebuild disconnected runtime");
+            assert!(
+                !cli.is_connected(),
+                "logout should rebuild disconnected runtime"
+            );
             cli.disconnected_startup_banner()
         });
 
@@ -21328,10 +21333,7 @@ mod alias_resolution_tests {
     #[test]
     fn test_alias_resolution_builtin() {
         // Built-in aliases should resolve to their full IDs
-        assert_eq!(
-            resolve_model_alias_with_config("opus"),
-            "claude-opus-4-6"
-        );
+        assert_eq!(resolve_model_alias_with_config("opus"), "claude-opus-4-6");
         assert_eq!(
             resolve_model_alias_with_config("sonnet"),
             "claude-sonnet-4-6"

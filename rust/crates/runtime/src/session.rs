@@ -16,6 +16,7 @@ const MAX_ROTATED_FILES: usize = 3;
 const MAX_JSONL_FIELD_CHARS: usize = 16 * 1024;
 const JSONL_TRUNCATION_MARKER: &str = "… [truncated for session JSONL]";
 const JSONL_REDACTION_MARKER: &str = "[redacted]";
+const MAX_COMPACTION_DETAIL_ITEMS: usize = 128;
 static SESSION_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
 static LAST_TIMESTAMP_MS: AtomicU64 = AtomicU64::new(0);
 
@@ -59,12 +60,65 @@ pub struct ConversationMessage {
     pub usage: Option<TokenUsage>,
 }
 
+/// Structured state carried forward across compaction checkpoints.
+///
+/// The vectors are deliberately bounded and de-duplicated when a checkpoint is
+/// recorded. This keeps repeated compactions from turning the checkpoint into
+/// another unbounded transcript.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct CompactionDetails {
+    pub goals: Vec<String>,
+    pub constraints: Vec<String>,
+    pub progress_done: Vec<String>,
+    pub progress_in_progress: Vec<String>,
+    pub progress_blocked: Vec<String>,
+    pub decisions: Vec<String>,
+    pub next_steps: Vec<String>,
+    pub read_files: Vec<String>,
+    pub modified_files: Vec<String>,
+}
+
+impl CompactionDetails {
+    fn merge_cumulative(mut self, incoming: &Self) -> Self {
+        merge_detail_items(&mut self.goals, &incoming.goals);
+        merge_detail_items(&mut self.constraints, &incoming.constraints);
+        merge_detail_items(&mut self.progress_done, &incoming.progress_done);
+        merge_detail_items(
+            &mut self.progress_in_progress,
+            &incoming.progress_in_progress,
+        );
+        merge_detail_items(&mut self.progress_blocked, &incoming.progress_blocked);
+        merge_detail_items(&mut self.decisions, &incoming.decisions);
+        merge_detail_items(&mut self.next_steps, &incoming.next_steps);
+        merge_detail_items(&mut self.read_files, &incoming.read_files);
+        merge_detail_items(&mut self.modified_files, &incoming.modified_files);
+        self
+    }
+}
+
+fn merge_detail_items(target: &mut Vec<String>, incoming: &[String]) {
+    for item in incoming {
+        let item = item.trim();
+        if !item.is_empty() && !target.iter().any(|existing| existing == item) {
+            target.push(item.to_string());
+        }
+    }
+    if target.len() > MAX_COMPACTION_DETAIL_ITEMS {
+        let keep_from = target.len() - MAX_COMPACTION_DETAIL_ITEMS;
+        target.drain(..keep_from);
+    }
+}
+
 /// Metadata describing the latest compaction that summarized a session.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionCompaction {
     pub count: u32,
     pub removed_message_count: usize,
     pub summary: String,
+    pub tokens_before: usize,
+    pub tokens_after: usize,
+    pub first_kept_message_index: usize,
+    pub details: CompactionDetails,
 }
 
 /// Provenance recorded when a session is forked from another session.
@@ -326,12 +380,43 @@ impl Session {
     }
 
     pub fn record_compaction(&mut self, summary: impl Into<String>, removed_message_count: usize) {
+        self.record_compaction_with_details(
+            summary,
+            removed_message_count,
+            0,
+            0,
+            0,
+            CompactionDetails::default(),
+        );
+    }
+
+    /// Records a compaction checkpoint and merges structured state from all
+    /// previous checkpoints into the new one.
+    pub fn record_compaction_with_details(
+        &mut self,
+        summary: impl Into<String>,
+        removed_message_count: usize,
+        tokens_before: usize,
+        tokens_after: usize,
+        first_kept_message_index: usize,
+        details: CompactionDetails,
+    ) {
         self.touch();
         let count = self.compaction.as_ref().map_or(1, |value| value.count + 1);
+        let details = self
+            .compaction
+            .as_ref()
+            .map_or(details.clone(), |previous| {
+                previous.details.clone().merge_cumulative(&details)
+            });
         self.compaction = Some(SessionCompaction {
             count,
             removed_message_count,
             summary: summary.into(),
+            tokens_before,
+            tokens_after,
+            first_kept_message_index,
+            details,
         });
     }
 
@@ -943,6 +1028,25 @@ impl SessionCompaction {
             "summary".to_string(),
             JsonValue::String(self.summary.clone()),
         );
+        object.insert(
+            "tokens_before".to_string(),
+            JsonValue::Number(i64_from_usize(self.tokens_before, "tokens_before")?),
+        );
+        object.insert(
+            "tokens_after".to_string(),
+            JsonValue::Number(i64_from_usize(self.tokens_after, "tokens_after")?),
+        );
+        object.insert(
+            "first_kept_message_index".to_string(),
+            JsonValue::Number(i64_from_usize(
+                self.first_kept_message_index,
+                "first_kept_message_index",
+            )?),
+        );
+        object.insert(
+            "details".to_string(),
+            compaction_details_to_json(&self.details),
+        );
         Ok(JsonValue::Object(object))
     }
 
@@ -967,6 +1071,25 @@ impl SessionCompaction {
             "summary".to_string(),
             JsonValue::String(sanitize_jsonl_field(&self.summary)),
         );
+        object.insert(
+            "tokens_before".to_string(),
+            JsonValue::Number(i64_from_usize(self.tokens_before, "tokens_before")?),
+        );
+        object.insert(
+            "tokens_after".to_string(),
+            JsonValue::Number(i64_from_usize(self.tokens_after, "tokens_after")?),
+        );
+        object.insert(
+            "first_kept_message_index".to_string(),
+            JsonValue::Number(i64_from_usize(
+                self.first_kept_message_index,
+                "first_kept_message_index",
+            )?),
+        );
+        object.insert(
+            "details".to_string(),
+            compaction_details_to_jsonl(&self.details),
+        );
         Ok(JsonValue::Object(object))
     }
 
@@ -978,8 +1101,150 @@ impl SessionCompaction {
             count: required_u32(object, "count")?,
             removed_message_count: required_usize(object, "removed_message_count")?,
             summary: required_string(object, "summary")?,
+            tokens_before: optional_usize(object, "tokens_before")?,
+            tokens_after: optional_usize(object, "tokens_after")?,
+            first_kept_message_index: optional_usize(object, "first_kept_message_index")?,
+            details: object
+                .get("details")
+                .map(compaction_details_from_json)
+                .transpose()?
+                .unwrap_or_default(),
         })
     }
+}
+
+fn compaction_details_to_json(details: &CompactionDetails) -> JsonValue {
+    let mut progress = BTreeMap::new();
+    progress.insert(
+        "done".to_string(),
+        string_array_to_json(&details.progress_done),
+    );
+    progress.insert(
+        "in_progress".to_string(),
+        string_array_to_json(&details.progress_in_progress),
+    );
+    progress.insert(
+        "blocked".to_string(),
+        string_array_to_json(&details.progress_blocked),
+    );
+
+    let mut object = BTreeMap::new();
+    object.insert("goals".to_string(), string_array_to_json(&details.goals));
+    object.insert(
+        "constraints".to_string(),
+        string_array_to_json(&details.constraints),
+    );
+    object.insert("progress".to_string(), JsonValue::Object(progress));
+    object.insert(
+        "decisions".to_string(),
+        string_array_to_json(&details.decisions),
+    );
+    object.insert(
+        "next_steps".to_string(),
+        string_array_to_json(&details.next_steps),
+    );
+    object.insert(
+        "read_files".to_string(),
+        string_array_to_json(&details.read_files),
+    );
+    object.insert(
+        "modified_files".to_string(),
+        string_array_to_json(&details.modified_files),
+    );
+    JsonValue::Object(object)
+}
+
+fn compaction_details_to_jsonl(details: &CompactionDetails) -> JsonValue {
+    let sanitize = |items: &[String]| {
+        items
+            .iter()
+            .map(|item| sanitize_jsonl_field(item))
+            .collect::<Vec<_>>()
+    };
+    let sanitized = CompactionDetails {
+        goals: sanitize(&details.goals),
+        constraints: sanitize(&details.constraints),
+        progress_done: sanitize(&details.progress_done),
+        progress_in_progress: sanitize(&details.progress_in_progress),
+        progress_blocked: sanitize(&details.progress_blocked),
+        decisions: sanitize(&details.decisions),
+        next_steps: sanitize(&details.next_steps),
+        read_files: sanitize(&details.read_files),
+        modified_files: sanitize(&details.modified_files),
+    };
+    compaction_details_to_json(&sanitized)
+}
+
+fn compaction_details_from_json(value: &JsonValue) -> Result<CompactionDetails, SessionError> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| SessionError::Format("compaction details must be an object".to_string()))?;
+    let progress = object
+        .get("progress")
+        .map(|value| {
+            value.as_object().ok_or_else(|| {
+                SessionError::Format("compaction progress must be an object".to_string())
+            })
+        })
+        .transpose()?;
+
+    Ok(CompactionDetails {
+        goals: optional_string_array(object, "goals")?,
+        constraints: optional_string_array(object, "constraints")?,
+        progress_done: progress
+            .map(|value| optional_string_array(value, "done"))
+            .transpose()?
+            .unwrap_or_default(),
+        progress_in_progress: progress
+            .map(|value| optional_string_array(value, "in_progress"))
+            .transpose()?
+            .unwrap_or_default(),
+        progress_blocked: progress
+            .map(|value| optional_string_array(value, "blocked"))
+            .transpose()?
+            .unwrap_or_default(),
+        decisions: optional_string_array(object, "decisions")?,
+        next_steps: optional_string_array(object, "next_steps")?,
+        read_files: optional_string_array(object, "read_files")?,
+        modified_files: optional_string_array(object, "modified_files")?,
+    })
+}
+
+fn string_array_to_json(values: &[String]) -> JsonValue {
+    JsonValue::Array(
+        values
+            .iter()
+            .map(|value| JsonValue::String(value.clone()))
+            .collect(),
+    )
+}
+
+fn optional_string_array(
+    object: &BTreeMap<String, JsonValue>,
+    key: &str,
+) -> Result<Vec<String>, SessionError> {
+    let Some(value) = object.get(key) else {
+        return Ok(Vec::new());
+    };
+    let values = value
+        .as_array()
+        .ok_or_else(|| SessionError::Format(format!("{key} must be an array")))?;
+    values
+        .iter()
+        .map(|value| {
+            value
+                .as_str()
+                .map(ToOwned::to_owned)
+                .ok_or_else(|| SessionError::Format(format!("{key} must contain strings")))
+        })
+        .collect()
+}
+
+fn optional_usize(object: &BTreeMap<String, JsonValue>, key: &str) -> Result<usize, SessionError> {
+    object
+        .get(key)
+        .map(|_| required_usize(object, key))
+        .unwrap_or(Ok(0))
 }
 
 impl SessionFork {
@@ -1432,8 +1697,8 @@ fn cleanup_rotated_logs(path: &Path) -> Result<(), SessionError> {
 mod tests {
     use super::{
         cleanup_rotated_logs, current_time_millis, parse_created_at_ms_from_session_id,
-        rotate_session_file_if_needed, ContentBlock, ConversationMessage, MessageRole, Session,
-        SessionFork,
+        rotate_session_file_if_needed, CompactionDetails, ContentBlock, ConversationMessage,
+        MessageRole, Session, SessionFork,
     };
     use crate::json::JsonValue;
     use crate::usage::TokenUsage;
@@ -1680,6 +1945,47 @@ mod tests {
         assert_eq!(compaction.count, 1);
         assert_eq!(compaction.removed_message_count, 4);
         assert!(compaction.summary.contains("summarized"));
+    }
+
+    #[test]
+    fn persists_structured_compaction_details_and_token_accounting() {
+        let path = temp_session_path("structured-compaction");
+        let mut session = Session::new();
+        session.record_compaction_with_details(
+            "checkpoint",
+            3,
+            120_000,
+            24_000,
+            9,
+            CompactionDetails {
+                goals: vec!["finish the compactor".to_string()],
+                constraints: vec!["keep tool pairs valid".to_string()],
+                progress_done: vec!["added a token budget".to_string()],
+                progress_in_progress: vec!["running regression tests".to_string()],
+                progress_blocked: vec!["provider limit is unknown".to_string()],
+                decisions: vec!["preserve recent turns".to_string()],
+                next_steps: vec!["build the release binary".to_string()],
+                read_files: vec!["rust/crates/runtime/src/compact.rs".to_string()],
+                modified_files: vec!["rust/crates/runtime/src/session.rs".to_string()],
+            },
+        );
+        session.save_to_path(&path).expect("session should save");
+
+        let restored = Session::load_from_path(&path).expect("session should load");
+        fs::remove_file(&path).expect("temp file should be removable");
+
+        let compaction = restored.compaction.expect("compaction metadata");
+        assert_eq!(compaction.tokens_before, 120_000);
+        assert_eq!(compaction.tokens_after, 24_000);
+        assert_eq!(compaction.first_kept_message_index, 9);
+        assert_eq!(
+            compaction.details.modified_files,
+            vec!["rust/crates/runtime/src/session.rs".to_string()]
+        );
+        assert_eq!(
+            compaction.details.progress_done,
+            vec!["added a token budget".to_string()]
+        );
     }
 
     #[test]
