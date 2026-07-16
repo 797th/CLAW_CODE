@@ -45,6 +45,10 @@ fn compact_slash_command_in_repl_does_not_start_nested_tokio_runtime() {
             || plain_stdout.contains("Result           compacted"),
         "stdout should contain compact report output ({stdout:?})"
     );
+    assert!(
+        plain_stdout.contains("╭─") && plain_stdout.contains("╰─"),
+        "stdout should contain the modern model/input rails ({stdout:?})"
+    );
 
     fs::remove_dir_all(&workspace).expect("workspace cleanup should succeed");
 }

@@ -33,6 +33,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
+use crossterm::style::{Color, Stylize};
 use log::debug;
 
 use api::{
@@ -53,7 +54,7 @@ use commands::{
 };
 use init::initialize_repo;
 use plugins::{PluginHooks, PluginManager, PluginManagerConfig, PluginRegistry};
-use render::{MarkdownStreamState, Spinner, TerminalRenderer};
+use render::{ActivityIndicator, MarkdownStreamState, TerminalRenderer};
 use runtime::{
     check_base_commit, format_stale_base_warning, format_usd, load_oauth_credentials,
     load_system_prompt, load_system_prompt_with_context, pricing_for_model, resolve_expected_base,
@@ -3706,13 +3707,49 @@ fn provider_label(kind: ProviderKind) -> &'static str {
 
 fn format_connected_line(model: &str) -> String {
     let provider = provider_label(detect_provider_kind(model));
-    format!("Ready · {model} via {provider}")
+    format!("● Connected · {provider}")
+}
+
+fn style_ui(text: &str, color: Color, bold: bool) -> String {
+    if env::var_os("NO_COLOR").is_some() {
+        return text.to_string();
+    }
+
+    if bold {
+        format!("{}", text.bold().with(color))
+    } else {
+        format!("{}", text.with(color))
+    }
+}
+
+fn repl_permission_label(permission_mode: PermissionMode) -> &'static str {
+    match permission_mode {
+        PermissionMode::DangerFullAccess => "full access",
+        PermissionMode::WorkspaceWrite => "workspace write",
+        PermissionMode::ReadOnly => "read-only",
+        PermissionMode::Prompt => "ask before tools",
+        PermissionMode::Allow => "allow",
+    }
 }
 
 fn format_repl_prompt(model: &str, permission_mode: PermissionMode) -> String {
+    let accent = Color::Rgb {
+        r: 129,
+        g: 140,
+        b: 248,
+    };
+    let muted = Color::Rgb {
+        r: 148,
+        g: 163,
+        b: 184,
+    };
     format!(
-        "model: {model} · permissions: {}\n› ",
-        permission_mode.as_str()
+        "{} {} {} {}\n{} ",
+        style_ui("╭─", muted, false),
+        style_ui(model, accent, false),
+        style_ui("·", muted, false),
+        style_ui(repl_permission_label(permission_mode), muted, false),
+        style_ui("╰─", muted, false),
     )
 }
 
@@ -8347,9 +8384,28 @@ impl LiveCli {
     }
 
     fn startup_banner(&self) -> String {
+        let accent = Color::Rgb {
+            r: 129,
+            g: 140,
+            b: 248,
+        };
+        let muted = Color::Rgb {
+            r: 148,
+            g: 163,
+            b: 184,
+        };
+        let brand = style_ui("Claw Code", accent, true);
+        let top = style_ui("╭─", accent, false);
+        let bottom = style_ui("╰─", muted, false);
+        let help = style_ui("/help", accent, false);
+        let status = style_ui("/status", accent, false);
+        let resume = style_ui("/resume latest", accent, false);
+        let tab = style_ui("Tab", accent, true);
+        let shift_enter = style_ui("Shift+Enter", accent, true);
         format!(
-            "\x1b[1mClaw Code\x1b[0m\n\
-  \x1b[2m/help\x1b[0m commands · \x1b[2m/status\x1b[0m context · \x1b[2m/resume latest\x1b[0m restore · \x1b[2mTab\x1b[0m completes commands, models, sessions, and paths · \x1b[2mShift+Enter\x1b[0m newline",
+            "{top} {brand}\n\
+{bottom} {help} commands · {status} context · {resume} restore\n\
+   {tab} completes commands, models, sessions, and paths · {shift_enter} newline",
         )
     }
 
@@ -8537,12 +8593,12 @@ impl LiveCli {
     ) -> Result<(), Box<dyn std::error::Error>> {
         let (mut runtime, hook_abort_monitor) =
             self.prepare_turn_runtime(!clean_interactive_output)?;
-        let mut spinner = Spinner::new();
         let mut stdout = io::stdout();
         let renderer = TerminalRenderer::new();
-        spinner.tick(
-            "Thinking…",
-            renderer.color_theme(),
+        let mut activity = ActivityIndicator::start(
+            "Working",
+            *renderer.color_theme(),
+            clean_interactive_output && stdout.is_terminal(),
             &mut stdout,
         )?;
         let mut permission_prompter = CliPermissionPrompter::new(self.permission_mode);
@@ -8552,10 +8608,10 @@ impl LiveCli {
             Ok(summary) => {
                 self.replace_runtime(runtime)?;
                 if clean_interactive_output {
-                    spinner.clear(&mut stdout)?;
+                    activity.clear(&mut stdout)?;
                     print_repl_response(&summary);
                 } else {
-                    spinner.finish("✨ Done", renderer.color_theme(), &mut stdout)?;
+                    activity.finish("✨ Done", renderer.color_theme(), &mut stdout)?;
                     let final_text = final_assistant_text(&summary);
                     if !final_text.is_empty() {
                         println!("{final_text}");
@@ -8575,9 +8631,9 @@ impl LiveCli {
             }
             Err(error) => {
                 runtime.shutdown_plugins()?;
-                spinner.fail(
-                    "❌ Request failed",
-                    TerminalRenderer::new().color_theme(),
+                activity.fail(
+                    "Request failed",
+                    renderer.color_theme(),
                     &mut stdout,
                 )?;
 
@@ -8695,10 +8751,10 @@ impl LiveCli {
                             Ok(summary) => {
                                 self.replace_runtime(new_runtime)?;
                                 if clean_interactive_output {
-                                    spinner.clear(&mut stdout)?;
+                                    activity.clear(&mut stdout)?;
                                     print_repl_response(&summary);
                                 } else {
-                                    spinner.finish(
+                                    activity.finish(
                                         if round == 0 {
                                             "✨ Done (after auto-compact)"
                                         } else {
@@ -18543,10 +18599,10 @@ mod tests {
     fn repl_prompt_keeps_model_footer_and_input_marker_together() {
         let prompt = format_repl_prompt("custom-model", PermissionMode::DangerFullAccess);
 
-        assert_eq!(
-            prompt,
-            "model: custom-model · permissions: danger-full-access\n› "
-        );
+        assert!(prompt.contains("custom-model"));
+        assert!(prompt.contains("full access"));
+        assert!(prompt.contains('\n'));
+        assert!(prompt.lines().last().is_some_and(|line| line.contains("╰─")));
     }
 
     #[test]
@@ -18614,7 +18670,7 @@ mod tests {
 
         let line = format_connected_line(model);
 
-        assert_eq!(line, "Ready · claude-sonnet-4-6 via anthropic");
+        assert_eq!(line, "● Connected · anthropic");
     }
 
     #[test]
@@ -18623,7 +18679,7 @@ mod tests {
 
         let line = format_connected_line(model);
 
-        assert_eq!(line, "Ready · grok-3 via xai");
+        assert_eq!(line, "● Connected · xai");
     }
 
     #[test]
