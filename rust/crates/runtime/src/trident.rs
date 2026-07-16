@@ -159,13 +159,9 @@ pub fn trident_compact_session(
     compaction_config: CompactionConfig,
     trident_config: &TridentConfig,
 ) -> CompactionResult {
-    let (trident_session, stats) = run_trident_pipeline(session, trident_config);
+    let (trident_session, _stats) = run_trident_pipeline(session, trident_config);
 
     let result = compact_session(&trident_session, compaction_config);
-
-    if stats.superseded_count > 0 || stats.collapsed_chains > 0 || stats.clusters_found > 0 {
-        eprintln!("{}", stats.format_report());
-    }
 
     result
 }
@@ -177,17 +173,13 @@ pub fn trident_compact_session_to_target(
     target_estimated_tokens: usize,
     trident_config: &TridentConfig,
 ) -> CompactionResult {
-    let (trident_session, stats) = run_trident_pipeline(session, trident_config);
+    let (trident_session, _stats) = run_trident_pipeline(session, trident_config);
 
     let result = compact_session_to_target(
         &trident_session,
         preferred_preserve_recent_messages,
         target_estimated_tokens,
     );
-
-    if stats.superseded_count > 0 || stats.collapsed_chains > 0 || stats.clusters_found > 0 {
-        eprintln!("{}", stats.format_report());
-    }
 
     result
 }
@@ -248,6 +240,49 @@ fn stage1_supersede(messages: &[ConversationMessage]) -> (Vec<ConversationMessag
             }
         }
     }
+
+    // A tool call and its result are one protocol unit. If only one side was
+    // marked obsolete, retain both instead of creating an orphaned tool result
+    // or an assistant tool call with no result in the compacted transcript.
+    let originally_obsolete = obsolete_indices.clone();
+    obsolete_indices.retain(|index| {
+        let message = &messages[*index];
+        let tool_use_ids = message
+            .blocks
+            .iter()
+            .filter_map(|block| match block {
+                ContentBlock::ToolUse { id, .. } => Some(id),
+                ContentBlock::ToolResult { .. }
+                | ContentBlock::Text { .. }
+                | ContentBlock::Thinking { .. } => None,
+            })
+            .collect::<Vec<_>>();
+        let tool_result_ids = message
+            .blocks
+            .iter()
+            .filter_map(|block| match block {
+                ContentBlock::ToolResult { tool_use_id, .. } => Some(tool_use_id),
+                ContentBlock::ToolUse { .. }
+                | ContentBlock::Text { .. }
+                | ContentBlock::Thinking { .. } => None,
+            })
+            .collect::<Vec<_>>();
+        let use_has_kept_result = tool_use_ids.iter().any(|id| {
+            messages.iter().enumerate().any(|(result_index, candidate)| {
+                candidate.blocks.iter().any(|block| {
+                    matches!(block, ContentBlock::ToolResult { tool_use_id, .. } if tool_use_id == *id)
+                }) && !originally_obsolete.contains(&result_index)
+            })
+        });
+        let result_has_kept_use = tool_result_ids.iter().any(|id| {
+            messages.iter().enumerate().any(|(use_index, candidate)| {
+                candidate.blocks.iter().any(|block| {
+                    matches!(block, ContentBlock::ToolUse { id: candidate_id, .. } if candidate_id == *id)
+                }) && !originally_obsolete.contains(&use_index)
+            })
+        });
+        !(use_has_kept_result || result_has_kept_use)
+    });
 
     let superseded_count = obsolete_indices.len();
     let kept: Vec<ConversationMessage> = messages
@@ -384,6 +419,10 @@ fn stage2_collapse(
 }
 
 fn is_chatty_message(msg: &ConversationMessage) -> bool {
+    if msg.role == MessageRole::System {
+        return false;
+    }
+
     let total_chars: usize = msg
         .blocks
         .iter()
@@ -552,7 +591,14 @@ struct MessageFingerprint {
 }
 
 fn fingerprint_message(index: usize, msg: &ConversationMessage) -> Option<MessageFingerprint> {
-    if msg.role == MessageRole::System {
+    if msg.role == MessageRole::System
+        || msg.blocks.iter().any(|block| {
+            matches!(
+                block,
+                ContentBlock::ToolUse { .. } | ContentBlock::ToolResult { .. }
+            )
+        })
+    {
         return None;
     }
 
@@ -792,25 +838,48 @@ mod tests {
     fn stage3_clusters_similar_messages() {
         let mut messages = vec![];
         for i in 0..5 {
-            messages.push(ConversationMessage::assistant(vec![
-                ContentBlock::ToolUse {
-                    id: format!("read_{i}"),
-                    name: "read_file".to_string(),
-                    input: format!(r#"{{"path":"src/{i}.rs"}}"#),
-                },
-            ]));
-            messages.push(ConversationMessage::tool_result(
-                &format!("read_{i}"),
-                "read_file",
-                &format!(r#"{{"path":"src/{i}.rs","content":"data {i}"}}"#),
-                false,
-            ));
+            messages.push(ConversationMessage::assistant(vec![ContentBlock::Text {
+                text: format!("Inspected the related source file and found the same pattern {i}."),
+            }]));
         }
 
         let (result, clusters, clustered) = stage3_cluster(&messages, 3, 0.4);
         assert!(clusters > 0, "should find at least one cluster");
         assert!(clustered > 0);
         assert!(result.len() < messages.len());
+    }
+
+    #[test]
+    fn stage3_leaves_tool_protocol_messages_untouched() {
+        let messages = vec![
+            ConversationMessage::assistant(vec![ContentBlock::ToolUse {
+                id: "read-1".to_string(),
+                name: "read_file".to_string(),
+                input: r#"{"path":"src/main.rs"}"#.to_string(),
+            }]),
+            ConversationMessage::tool_result(
+                "read-1",
+                "read_file",
+                r#"{"path":"src/main.rs","content":"data"}"#,
+                false,
+            ),
+            ConversationMessage::assistant(vec![ContentBlock::ToolUse {
+                id: "read-2".to_string(),
+                name: "read_file".to_string(),
+                input: r#"{"path":"src/lib.rs"}"#.to_string(),
+            }]),
+            ConversationMessage::tool_result(
+                "read-2",
+                "read_file",
+                r#"{"path":"src/lib.rs","content":"data"}"#,
+                false,
+            ),
+        ];
+
+        let (result, clusters, clustered) = stage3_cluster(&messages, 2, 0.4);
+        assert_eq!(clusters, 0);
+        assert_eq!(clustered, 0);
+        assert_eq!(result, messages);
     }
 
     #[test]

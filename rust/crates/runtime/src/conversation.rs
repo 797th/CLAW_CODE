@@ -417,7 +417,7 @@ where
         let mut tool_results = Vec::new();
         let mut prompt_cache_events = Vec::new();
         let mut iterations = 0;
-        let mut auto_compaction = None;
+        let mut auto_compaction: Option<AutoCompactionEvent> = None;
         let mut consecutive_stop_blocks = 0;
         const MAX_CONSECUTIVE_STOP_BLOCKS: u32 = 3;
 
@@ -429,6 +429,20 @@ where
                 );
                 self.record_turn_failed(iterations, &error);
                 return Err(error);
+            }
+
+            // Compact before constructing the next provider request. The old
+            // implementation waited for cumulative usage after a response;
+            // cumulative input is not the current context size and can only
+            // detect the problem after an oversized request has already been
+            // sent.
+            if let Some(compaction) = self.maybe_auto_compact() {
+                auto_compaction = Some(AutoCompactionEvent {
+                    removed_message_count: auto_compaction
+                        .as_ref()
+                        .map_or(0_usize, |event| event.removed_message_count)
+                        .saturating_add(compaction.removed_message_count),
+                });
             }
 
             let request = ApiRequest {
@@ -475,12 +489,6 @@ where
                 .map_err(|error| RuntimeError::new(error.to_string()))?;
             assistant_messages.push(assistant_message);
 
-            // Run auto-compaction check before next API call, including on the terminal
-            // (no-tool) iteration, to prevent unbounded session growth (#3106).
-            if let Some(compaction) = self.maybe_auto_compact() {
-                auto_compaction = Some(compaction);
-            }
-
             if pending_tool_uses.is_empty() {
                 let stop_outcome = self
                     .hook_runner
@@ -492,9 +500,7 @@ where
                     if consecutive_stop_blocks < MAX_CONSECUTIVE_STOP_BLOCKS {
                         consecutive_stop_blocks += 1;
                         self.session
-                            .push_user_text(format!(
-                                "[Stop hook] You may not stop yet: {reason}"
-                            ))
+                            .push_user_text(format!("[Stop hook] You may not stop yet: {reason}"))
                             .map_err(|error| RuntimeError::new(error.to_string()))?;
                         continue;
                     }
@@ -630,6 +636,16 @@ where
     #[must_use]
     pub fn estimated_tokens(&self) -> usize {
         estimate_session_tokens(&self.session)
+            + self
+                .system_prompt
+                .iter()
+                .map(|prompt| prompt.len().div_ceil(4))
+                .sum::<usize>()
+    }
+
+    #[must_use]
+    pub fn estimated_session_tokens(&self) -> usize {
+        estimate_session_tokens(&self.session)
     }
 
     #[must_use]
@@ -669,18 +685,14 @@ where
     }
 
     fn maybe_auto_compact(&mut self) -> Option<AutoCompactionEvent> {
-        let observed_input_tokens = self.usage_tracker.cumulative_usage().input_tokens as usize;
         let threshold = self.auto_compaction_input_tokens_threshold as usize;
-        if observed_input_tokens < threshold {
+        let current_estimated_tokens = self.estimated_tokens();
+        if current_estimated_tokens < threshold {
             return None;
         }
 
-        let current_estimated_tokens = estimate_session_tokens(&self.session);
-        let target_estimated_tokens = auto_compaction_target_estimate(
-            current_estimated_tokens,
-            observed_input_tokens,
-            threshold,
-        );
+        let target_estimated_tokens =
+            auto_compaction_target_estimate(current_estimated_tokens, 0, threshold);
 
         let result = compact_session_to_target(
             &self.session,
@@ -807,21 +819,13 @@ where
 }
 
 fn auto_compaction_target_estimate(
-    current_estimated_tokens: usize,
-    observed_input_tokens: usize,
+    _current_estimated_tokens: usize,
+    _observed_input_tokens: usize,
     threshold: usize,
 ) -> usize {
-    let target_input_tokens = threshold
-        .saturating_mul(AUTO_COMPACTION_TARGET_THRESHOLD_NUMERATOR)
+    let target_input_tokens = threshold.saturating_mul(AUTO_COMPACTION_TARGET_THRESHOLD_NUMERATOR)
         / AUTO_COMPACTION_TARGET_THRESHOLD_DENOMINATOR;
-    if observed_input_tokens == 0 || current_estimated_tokens == 0 {
-        return target_input_tokens.max(1);
-    }
-
-    current_estimated_tokens
-        .saturating_mul(target_input_tokens.max(1))
-        .saturating_div(observed_input_tokens)
-        .max(1)
+    target_input_tokens.max(1)
 }
 
 /// Reads the automatic compaction threshold from the environment.
@@ -980,10 +984,10 @@ impl ToolExecutor for StaticToolExecutor {
 #[cfg(test)]
 mod tests {
     use super::{
-        auto_compaction_target_estimate, build_assistant_message,
-        parse_auto_compaction_threshold, ApiClient, ApiRequest, AssistantEvent,
-        AutoCompactionEvent, ConversationRuntime, PromptCacheEvent, RuntimeError,
-        StaticToolExecutor, ToolExecutor, DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD,
+        auto_compaction_target_estimate, build_assistant_message, parse_auto_compaction_threshold,
+        ApiClient, ApiRequest, AssistantEvent, AutoCompactionEvent, ConversationRuntime,
+        PromptCacheEvent, RuntimeError, StaticToolExecutor, ToolExecutor,
+        DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD,
     };
     use crate::compact::CompactionConfig;
     use crate::config::{RuntimeFeatureConfig, RuntimeHookCommand, RuntimeHookConfig};
@@ -1662,7 +1666,7 @@ mod tests {
     }
 
     #[test]
-    fn auto_compacts_when_cumulative_input_threshold_is_crossed() {
+    fn auto_compacts_before_an_oversized_request() {
         struct SimpleApi;
         impl ApiClient for SimpleApi {
             fn stream(
@@ -1684,13 +1688,13 @@ mod tests {
 
         let mut session = Session::new();
         session.messages = vec![
-            crate::session::ConversationMessage::user_text("one"),
+            crate::session::ConversationMessage::user_text("one ".repeat(30_000)),
             crate::session::ConversationMessage::assistant(vec![ContentBlock::Text {
-                text: "two".to_string(),
+                text: "two ".repeat(30_000),
             }]),
-            crate::session::ConversationMessage::user_text("three"),
+            crate::session::ConversationMessage::user_text("three ".repeat(30_000)),
             crate::session::ConversationMessage::assistant(vec![ContentBlock::Text {
-                text: "four".to_string(),
+                text: "four ".repeat(30_000),
             }]),
         ];
 
@@ -1717,8 +1721,11 @@ mod tests {
     }
 
     #[test]
-    fn auto_compaction_target_estimate_scales_down_with_observed_usage() {
-        assert_eq!(auto_compaction_target_estimate(40, 120_000, 100_000), 25);
+    fn auto_compaction_target_estimate_leaves_headroom_below_threshold() {
+        assert_eq!(
+            auto_compaction_target_estimate(40, 120_000, 100_000),
+            75_000
+        );
         assert_eq!(auto_compaction_target_estimate(5, 0, 100_000), 75_000);
     }
 
@@ -2026,7 +2033,10 @@ mod tests {
         }
 
         impl ApiClient for AlwaysRespondsApiClient {
-            fn stream(&mut self, _request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+            fn stream(
+                &mut self,
+                _request: ApiRequest,
+            ) -> Result<Vec<AssistantEvent>, RuntimeError> {
                 self.call_count += 1;
                 // No tool calls, ever: every response looks like a natural
                 // stopping point, forcing the `Stop` hook to fire on every
@@ -2078,10 +2088,12 @@ mod tests {
             .iter()
             .filter(|message| {
                 message.role == MessageRole::User
-                    && message.blocks.iter().any(|block| matches!(
-                        block,
-                        ContentBlock::Text { text } if text.contains("verification incomplete")
-                    ))
+                    && message.blocks.iter().any(|block| {
+                        matches!(
+                            block,
+                            ContentBlock::Text { text } if text.contains("verification incomplete")
+                        )
+                    })
             })
             .count();
         assert_eq!(reprompt_count, 3);
