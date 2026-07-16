@@ -1,7 +1,11 @@
 use std::fmt::Write as FmtWrite;
+use std::env;
 use std::io::{self, Write};
+use std::sync::mpsc::{self, Receiver, Sender};
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 
-use crossterm::cursor::{MoveToColumn, RestorePosition, SavePosition};
+use crossterm::cursor::MoveToColumn;
 use crossterm::style::{Color, Print, ResetColor, SetForegroundColor, Stylize};
 use crossterm::terminal::{Clear, ClearType};
 use crossterm::{execute, queue};
@@ -22,6 +26,8 @@ pub struct ColorTheme {
     table_border: Color,
     code_block_border: Color,
     spinner_active: Color,
+    spinner_label: Color,
+    spinner_elapsed: Color,
     spinner_done: Color,
     spinner_failed: Color,
 }
@@ -29,17 +35,71 @@ pub struct ColorTheme {
 impl Default for ColorTheme {
     fn default() -> Self {
         Self {
-            heading: Color::Cyan,
-            emphasis: Color::Magenta,
-            strong: Color::Yellow,
-            inline_code: Color::Green,
-            link: Color::Blue,
-            quote: Color::DarkGrey,
-            table_border: Color::DarkCyan,
-            code_block_border: Color::DarkGrey,
-            spinner_active: Color::Blue,
-            spinner_done: Color::Green,
-            spinner_failed: Color::Red,
+            heading: Color::Rgb {
+                r: 103,
+                g: 232,
+                b: 249,
+            },
+            emphasis: Color::Rgb {
+                r: 196,
+                g: 181,
+                b: 253,
+            },
+            strong: Color::Rgb {
+                r: 253,
+                g: 186,
+                b: 116,
+            },
+            inline_code: Color::Rgb {
+                r: 134,
+                g: 239,
+                b: 172,
+            },
+            link: Color::Rgb {
+                r: 147,
+                g: 197,
+                b: 253,
+            },
+            quote: Color::Rgb {
+                r: 148,
+                g: 163,
+                b: 184,
+            },
+            table_border: Color::Rgb {
+                r: 71,
+                g: 85,
+                b: 105,
+            },
+            code_block_border: Color::Rgb {
+                r: 100,
+                g: 116,
+                b: 139,
+            },
+            spinner_active: Color::Rgb {
+                r: 129,
+                g: 140,
+                b: 248,
+            },
+            spinner_label: Color::Rgb {
+                r: 226,
+                g: 232,
+                b: 240,
+            },
+            spinner_elapsed: Color::Rgb {
+                r: 148,
+                g: 163,
+                b: 184,
+            },
+            spinner_done: Color::Rgb {
+                r: 74,
+                g: 222,
+                b: 128,
+            },
+            spinner_failed: Color::Rgb {
+                r: 248,
+                g: 113,
+                b: 113,
+            },
         }
     }
 }
@@ -50,7 +110,7 @@ pub struct Spinner {
 }
 
 impl Spinner {
-    const FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+    const FRAMES: [&str; 4] = ["◐", "◓", "◑", "◒"];
 
     #[must_use]
     pub fn new() -> Self {
@@ -63,18 +123,45 @@ impl Spinner {
         theme: &ColorTheme,
         out: &mut impl Write,
     ) -> io::Result<()> {
+        self.tick_elapsed(label, Duration::ZERO, theme, out)
+    }
+
+    fn tick_elapsed(
+        &mut self,
+        label: &str,
+        elapsed: Duration,
+        theme: &ColorTheme,
+        out: &mut impl Write,
+    ) -> io::Result<()> {
         let frame = Self::FRAMES[self.frame_index % Self::FRAMES.len()];
         self.frame_index += 1;
-        queue!(
-            out,
-            SavePosition,
-            MoveToColumn(0),
-            Clear(ClearType::CurrentLine),
-            SetForegroundColor(theme.spinner_active),
-            Print(format!("{frame} {label}")),
-            ResetColor,
-            RestorePosition
-        )?;
+        if colors_enabled() {
+            queue!(
+                out,
+                MoveToColumn(0),
+                Clear(ClearType::CurrentLine),
+                SetForegroundColor(theme.spinner_active),
+                Print(format!("  {frame}")),
+                SetForegroundColor(theme.spinner_label),
+                Print(format!("  {label}")),
+                SetForegroundColor(theme.spinner_elapsed),
+                Print(format!("  {}s", elapsed.as_secs())),
+                ResetColor
+            )?;
+        } else {
+            queue!(
+                out,
+                MoveToColumn(0),
+                Clear(ClearType::CurrentLine),
+                Print(format!("  {frame}  {label}  {}s", elapsed.as_secs()))
+            )?;
+        }
+        out.flush()
+    }
+
+    pub fn clear(&mut self, out: &mut impl Write) -> io::Result<()> {
+        self.frame_index = 0;
+        execute!(out, MoveToColumn(0), Clear(ClearType::CurrentLine))?;
         out.flush()
     }
 
@@ -85,14 +172,23 @@ impl Spinner {
         out: &mut impl Write,
     ) -> io::Result<()> {
         self.frame_index = 0;
-        execute!(
-            out,
-            MoveToColumn(0),
-            Clear(ClearType::CurrentLine),
-            SetForegroundColor(theme.spinner_done),
-            Print(format!("✔ {label}\n")),
-            ResetColor
-        )?;
+        if colors_enabled() {
+            execute!(
+                out,
+                MoveToColumn(0),
+                Clear(ClearType::CurrentLine),
+                SetForegroundColor(theme.spinner_done),
+                Print(format!("✔ {label}\n")),
+                ResetColor
+            )?;
+        } else {
+            execute!(
+                out,
+                MoveToColumn(0),
+                Clear(ClearType::CurrentLine),
+                Print(format!("✔ {label}\n"))
+            )?;
+        }
         out.flush()
     }
 
@@ -103,15 +199,146 @@ impl Spinner {
         out: &mut impl Write,
     ) -> io::Result<()> {
         self.frame_index = 0;
-        execute!(
-            out,
-            MoveToColumn(0),
-            Clear(ClearType::CurrentLine),
-            SetForegroundColor(theme.spinner_failed),
-            Print(format!("✘ {label}\n")),
-            ResetColor
-        )?;
+        if colors_enabled() {
+            execute!(
+                out,
+                MoveToColumn(0),
+                Clear(ClearType::CurrentLine),
+                SetForegroundColor(theme.spinner_failed),
+                Print(format!("✘ {label}\n")),
+                ResetColor
+            )?;
+        } else {
+            execute!(
+                out,
+                MoveToColumn(0),
+                Clear(ClearType::CurrentLine),
+                Print(format!("✘ {label}\n"))
+            )?;
+        }
         out.flush()
+    }
+}
+
+fn colors_enabled() -> bool {
+    env::var_os("NO_COLOR").is_none()
+}
+
+/// A spinner that advances independently while a blocking model/tool turn runs.
+/// The worker owns stdout for the duration of the animation, so the main turn
+/// path can remain synchronous without freezing the status line.
+pub struct LiveSpinner {
+    stop_tx: Option<Sender<()>>,
+    join_handle: Option<JoinHandle<io::Result<()>>>,
+}
+
+impl LiveSpinner {
+    pub fn start(label: impl Into<String>, theme: ColorTheme) -> io::Result<Self> {
+        let label = label.into();
+        let (stop_tx, stop_rx) = mpsc::channel();
+        let join_handle = thread::Builder::new()
+            .name("claw-live-spinner".to_string())
+            .spawn(move || animate_spinner(label, theme, stop_rx))
+            .map_err(io::Error::other)?;
+
+        Ok(Self {
+            stop_tx: Some(stop_tx),
+            join_handle: Some(join_handle),
+        })
+    }
+
+    pub fn stop(&mut self) -> io::Result<()> {
+        if let Some(stop_tx) = self.stop_tx.take() {
+            let _ = stop_tx.send(());
+        }
+
+        let Some(join_handle) = self.join_handle.take() else {
+            return Ok(());
+        };
+
+        match join_handle.join() {
+            Ok(result) => result,
+            Err(_) => Err(io::Error::other("live spinner thread panicked")),
+        }
+    }
+}
+
+impl Drop for LiveSpinner {
+    fn drop(&mut self) {
+        let _ = self.stop();
+    }
+}
+
+fn animate_spinner(label: String, theme: ColorTheme, stop_rx: Receiver<()>) -> io::Result<()> {
+    let mut spinner = Spinner::new();
+    let started_at = Instant::now();
+    let mut stdout = io::stdout();
+
+    loop {
+        spinner.tick_elapsed(&label, started_at.elapsed(), &theme, &mut stdout)?;
+        match stop_rx.recv_timeout(Duration::from_millis(90)) {
+            Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+        }
+    }
+
+    spinner.clear(&mut stdout)
+}
+
+pub enum ActivityIndicator {
+    Static(Spinner),
+    Live(LiveSpinner),
+}
+
+impl ActivityIndicator {
+    pub fn start(
+        label: &str,
+        theme: ColorTheme,
+        animated: bool,
+        out: &mut impl Write,
+    ) -> io::Result<Self> {
+        if animated {
+            Ok(Self::Live(LiveSpinner::start(label, theme)?))
+        } else {
+            let mut spinner = Spinner::new();
+            spinner.tick(label, &theme, out)?;
+            Ok(Self::Static(spinner))
+        }
+    }
+
+    pub fn clear(&mut self, out: &mut impl Write) -> io::Result<()> {
+        match self {
+            Self::Static(spinner) => spinner.clear(out),
+            Self::Live(spinner) => spinner.stop(),
+        }
+    }
+
+    pub fn finish(
+        &mut self,
+        label: &str,
+        theme: &ColorTheme,
+        out: &mut impl Write,
+    ) -> io::Result<()> {
+        if let Self::Live(spinner) = self {
+            spinner.stop()?;
+        }
+
+        let mut spinner = Spinner::new();
+        spinner.finish(label, theme, out)
+    }
+
+    pub fn fail(
+        &mut self,
+        label: &str,
+        theme: &ColorTheme,
+        out: &mut impl Write,
+    ) -> io::Result<()> {
+        if let Self::Live(spinner) = self {
+            spinner.stop()?;
+        }
+
+        let mut spinner = Spinner::new();
+        spinner.fail(label, theme, out)
     }
 }
 
@@ -1066,5 +1293,8 @@ mod tests {
 
         let output = String::from_utf8_lossy(&out);
         assert!(output.contains("Working"));
+        assert!(output.contains("0s"));
+        assert!(output.contains("◐"));
+        assert!(output.contains("◓"));
     }
 }

@@ -33,6 +33,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
+use crossterm::style::{Color, Stylize};
 use log::debug;
 
 use api::{
@@ -53,7 +54,7 @@ use commands::{
 };
 use init::initialize_repo;
 use plugins::{PluginHooks, PluginManager, PluginManagerConfig, PluginRegistry};
-use render::{MarkdownStreamState, Spinner, TerminalRenderer};
+use render::{ActivityIndicator, MarkdownStreamState, TerminalRenderer};
 use runtime::{
     check_base_commit, format_stale_base_warning, format_usd, load_oauth_credentials,
     load_system_prompt, load_system_prompt_with_context, pricing_for_model, resolve_expected_base,
@@ -3706,7 +3707,58 @@ fn provider_label(kind: ProviderKind) -> &'static str {
 
 fn format_connected_line(model: &str) -> String {
     let provider = provider_label(detect_provider_kind(model));
-    format!("Ready · {model} via {provider}")
+    format!("● Connected · {provider}")
+}
+
+fn style_ui(text: &str, color: Color, bold: bool) -> String {
+    if env::var_os("NO_COLOR").is_some() {
+        return text.to_string();
+    }
+
+    if bold {
+        format!("{}", text.bold().with(color))
+    } else {
+        format!("{}", text.with(color))
+    }
+}
+
+fn repl_permission_label(permission_mode: PermissionMode) -> &'static str {
+    match permission_mode {
+        PermissionMode::DangerFullAccess => "full access",
+        PermissionMode::WorkspaceWrite => "workspace write",
+        PermissionMode::ReadOnly => "read-only",
+        PermissionMode::Prompt => "ask before tools",
+        PermissionMode::Allow => "allow",
+    }
+}
+
+fn format_repl_prompt(_model: &str, _permission_mode: PermissionMode) -> String {
+    let muted = Color::Rgb {
+        r: 148,
+        g: 163,
+        b: 184,
+    };
+    format!("{} ", style_ui("╭─", muted, false))
+}
+
+fn format_repl_footer(model: &str, permission_mode: PermissionMode) -> String {
+    let accent = Color::Rgb {
+        r: 129,
+        g: 140,
+        b: 248,
+    };
+    let muted = Color::Rgb {
+        r: 148,
+        g: 163,
+        b: 184,
+    };
+    format!(
+        "{} {} {} {}",
+        style_ui("╰─", muted, false),
+        style_ui(model, accent, false),
+        style_ui("·", muted, false),
+        style_ui(repl_permission_label(permission_mode), muted, false),
+    )
 }
 
 fn filter_tool_specs(
@@ -7635,8 +7687,10 @@ fn run_repl(
     let resolved_model = resolve_repl_model(model)?;
     let mut cli = LiveCli::new(resolved_model, true, allowed_tools, permission_mode)?;
     cli.set_reasoning_effort(reasoning_effort);
-    let mut editor =
-        input::LineEditor::new("› ", cli.repl_completion_candidates().unwrap_or_default());
+    let mut editor = input::LineEditor::new(
+        format_repl_prompt(&cli.model, cli.permission_mode),
+        cli.repl_completion_candidates().unwrap_or_default(),
+    );
     if cli.is_connected() {
         println!("{}", cli.startup_banner());
         println!("{}", format_connected_line(&cli.model));
@@ -7645,6 +7699,8 @@ fn run_repl(
     }
 
     loop {
+        editor.set_prompt(format_repl_prompt(&cli.model, cli.permission_mode));
+        editor.set_footer(format_repl_footer(&cli.model, cli.permission_mode));
         editor.set_completions(cli.repl_completion_candidates().unwrap_or_default());
         match editor.read_line()? {
             input::ReadOutcome::Submit(input) => {
@@ -7653,6 +7709,7 @@ fn run_repl(
                     continue;
                 }
                 if matches!(trimmed.as_str(), "/exit" | "/quit") {
+                    editor.finish()?;
                     cli.persist_session()?;
                     break;
                 }
@@ -7721,6 +7778,25 @@ struct LiveCli {
     runtime: BuiltRuntime,
     session: SessionHandle,
     prompt_history: Vec<PromptHistoryEntry>,
+}
+
+/// Fires the `SessionEnd` lifecycle hook, fire-and-forget, whenever a
+/// `LiveCli` goes out of scope — on every normal exit path (one-shot prompt,
+/// `/exit`, EOF, early `?` returns) since `Drop` runs regardless of how the
+/// scope ends. The hook's decision is intentionally ignored: `SessionEnd`
+/// cannot block process exit, so only a non-blocking-failure warning is
+/// surfaced (to stderr, since stdout may be carrying structured JSON output).
+impl Drop for LiveCli {
+    fn drop(&mut self) {
+        if let Some(runtime) = self.runtime.runtime.as_ref() {
+            let outcome = runtime
+                .hook_runner()
+                .run_lifecycle(runtime::HookEvent::SessionEnd, &serde_json::json!({}));
+            if let Some(warning) = outcome.warning {
+                eprintln!("SessionEnd hook warning: {warning}");
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -8337,40 +8413,28 @@ impl LiveCli {
     }
 
     fn startup_banner(&self) -> String {
-        let cwd = env::current_dir().map_or_else(
-            |_| "<unknown>".to_string(),
-            |path| path.display().to_string(),
-        );
-        let status = status_context(None).ok();
-        let git_branch = status
-            .as_ref()
-            .and_then(|context| context.git_branch.as_deref())
-            .unwrap_or("unknown");
-        let workspace = status.as_ref().map_or_else(
-            || "unknown".to_string(),
-            |context| context.git_summary.headline(),
-        );
-        let session_path = self.session.path.strip_prefix(Path::new(&cwd)).map_or_else(
-            |_| self.session.path.display().to_string(),
-            |path| path.display().to_string(),
-        );
+        let accent = Color::Rgb {
+            r: 129,
+            g: 140,
+            b: 248,
+        };
+        let muted = Color::Rgb {
+            r: 148,
+            g: 163,
+            b: 184,
+        };
+        let brand = style_ui("Claw Code", accent, true);
+        let top = style_ui("╭─", accent, false);
+        let bottom = style_ui("╰─", muted, false);
+        let help = style_ui("/help", accent, false);
+        let status = style_ui("/status", accent, false);
+        let resume = style_ui("/resume latest", accent, false);
+        let tab = style_ui("Tab", accent, true);
+        let shift_enter = style_ui("Shift+Enter", accent, true);
         format!(
-            "\x1b[1mClaw Code\x1b[0m\n\
-  \x1b[2mModel\x1b[0m            {}\n\
-  \x1b[2mPermissions\x1b[0m      {}\n\
-  \x1b[2mBranch\x1b[0m           {}\n\
-  \x1b[2mWorkspace\x1b[0m        {}\n\
-  \x1b[2mDirectory\x1b[0m        {}\n\
-  \x1b[2mSession\x1b[0m          {}\n\
-  \x1b[2mAuto-save\x1b[0m        {}\n\n\
-  \x1b[2m/help\x1b[0m commands · \x1b[2m/status\x1b[0m context · \x1b[2m/resume latest\x1b[0m restore · \x1b[2mTab\x1b[0m completes commands, models, sessions, and paths · \x1b[2mShift+Enter\x1b[0m newline",
-            self.model,
-            self.permission_mode.as_str(),
-            git_branch,
-            workspace,
-            cwd,
-            self.session.id,
-            session_path,
+            "{top} {brand}\n\
+{bottom} {help} commands · {status} context · {resume} restore\n\
+   {tab} completes commands, models, sessions, and paths · {shift_enter} newline",
         )
     }
 
@@ -8548,12 +8612,22 @@ impl LiveCli {
     }
 
     fn run_turn(&mut self, input: &str) -> Result<(), Box<dyn std::error::Error>> {
-        let (mut runtime, hook_abort_monitor) = self.prepare_turn_runtime(true)?;
-        let mut spinner = Spinner::new();
+        self.run_turn_internal(input, true)
+    }
+
+    fn run_turn_internal(
+        &mut self,
+        input: &str,
+        clean_interactive_output: bool,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let (mut runtime, hook_abort_monitor) =
+            self.prepare_turn_runtime(!clean_interactive_output)?;
         let mut stdout = io::stdout();
-        spinner.tick(
-            "Thinking…",
-            TerminalRenderer::new().color_theme(),
+        let renderer = TerminalRenderer::new();
+        let mut activity = ActivityIndicator::start(
+            "Working",
+            *renderer.color_theme(),
+            clean_interactive_output && stdout.is_terminal(),
             &mut stdout,
         )?;
         let mut permission_prompter = CliPermissionPrompter::new(self.permission_mode);
@@ -8562,22 +8636,24 @@ impl LiveCli {
         match result {
             Ok(summary) => {
                 self.replace_runtime(runtime)?;
-                spinner.finish(
-                    "✨ Done",
-                    TerminalRenderer::new().color_theme(),
-                    &mut stdout,
-                )?;
-                let final_text = final_assistant_text(&summary);
-                if !final_text.is_empty() {
-                    println!("{final_text}");
+                if clean_interactive_output {
+                    activity.clear(&mut stdout)?;
+                    print_repl_response(&summary);
+                } else {
+                    activity.finish("✨ Done", renderer.color_theme(), &mut stdout)?;
+                    let final_text = final_assistant_text(&summary);
+                    if !final_text.is_empty() {
+                        println!("{final_text}");
+                    }
+                    println!();
                 }
-                println!();
                 if let Some(event) = summary.auto_compaction {
                     println!(
                         "{}",
                         format_auto_compaction_notice(event.removed_message_count)
                     );
                 }
+                print_lifecycle_warnings(&summary);
                 self.persist_session()?;
                 self.append_turn_log(input, &summary);
                 self.maybe_auto_dream_after_success();
@@ -8585,9 +8661,9 @@ impl LiveCli {
             }
             Err(error) => {
                 runtime.shutdown_plugins()?;
-                spinner.fail(
-                    "❌ Request failed",
-                    TerminalRenderer::new().color_theme(),
+                activity.fail(
+                    "Request failed",
+                    renderer.color_theme(),
                     &mut stdout,
                 )?;
 
@@ -8697,29 +8773,40 @@ impl LiveCli {
 
                         // Build a new runtime with the compacted session and retry
                         let (mut new_runtime, hook_abort_monitor) =
-                            self.prepare_turn_runtime(true)?;
+                            self.prepare_turn_runtime(!clean_interactive_output)?;
                         drop(hook_abort_monitor);
 
                         let mut rp = CliPermissionPrompter::new(self.permission_mode);
                         match new_runtime.run_turn(input, Some(&mut rp)) {
                             Ok(summary) => {
                                 self.replace_runtime(new_runtime)?;
-                                spinner.finish(
-                                    if round == 0 {
-                                        "✨ Done (after auto-compact)"
-                                    } else {
-                                        "✨ Done (after aggressive auto-compact)"
-                                    },
-                                    TerminalRenderer::new().color_theme(),
-                                    &mut stdout,
-                                )?;
-                                println!();
+                                if clean_interactive_output {
+                                    activity.clear(&mut stdout)?;
+                                    print_repl_response(&summary);
+                                } else {
+                                    activity.finish(
+                                        if round == 0 {
+                                            "✨ Done (after auto-compact)"
+                                        } else {
+                                            "✨ Done (after aggressive auto-compact)"
+                                        },
+                                        renderer.color_theme(),
+                                        &mut stdout,
+                                    )?;
+                                    println!();
+                                    let final_text = final_assistant_text(&summary);
+                                    if !final_text.is_empty() {
+                                        println!("{final_text}");
+                                    }
+                                    println!();
+                                }
                                 if let Some(event) = summary.auto_compaction {
                                     println!(
                                         "{}",
                                         format_auto_compaction_notice(event.removed_message_count)
                                     );
                                 }
+                                print_lifecycle_warnings(&summary);
                                 self.persist_session()?;
                                 return Ok(());
                             }
@@ -8780,7 +8867,7 @@ impl LiveCli {
         match output_format {
             CliOutputFormat::Json if compact => self.run_prompt_compact_json(input),
             CliOutputFormat::Text if compact => self.run_prompt_compact(input),
-            CliOutputFormat::Text => self.run_turn(input),
+            CliOutputFormat::Text => self.run_turn_internal(input, false),
             CliOutputFormat::Json => self.run_prompt_json(input),
         }
     }
@@ -8791,6 +8878,7 @@ impl LiveCli {
         let result = runtime.run_turn(input, Some(&mut permission_prompter));
         hook_abort_monitor.stop();
         let summary = result?;
+        print_lifecycle_warnings(&summary);
         self.replace_runtime(runtime)?;
         self.persist_session()?;
         let final_text = final_assistant_text(&summary);
@@ -8804,6 +8892,7 @@ impl LiveCli {
         let result = runtime.run_turn(input, Some(&mut permission_prompter));
         hook_abort_monitor.stop();
         let summary = result?;
+        print_lifecycle_warnings(&summary);
         self.replace_runtime(runtime)?;
         self.persist_session()?;
         println!(
@@ -8829,6 +8918,7 @@ impl LiveCli {
         let result = runtime.run_turn(input, Some(&mut permission_prompter));
         hook_abort_monitor.stop();
         let summary = result?;
+        print_lifecycle_warnings(&summary);
         self.replace_runtime(runtime)?;
         self.persist_session()?;
         println!(
@@ -13982,6 +14072,35 @@ fn final_assistant_text(summary: &runtime::TurnSummary) -> String {
         .unwrap_or_default()
 }
 
+/// Surfaces non-blocking lifecycle hook problems (see
+/// `TurnSummary::lifecycle_warnings`) to stderr so they aren't silently
+/// dropped — e.g. a `SessionStart`/`UserPromptSubmit`/`Stop` hook that exited
+/// non-zero without an explicit JSON decision, or a `Stop` hook that kept
+/// blocking past the consecutive-block cap and was forcibly allowed to stop.
+fn print_lifecycle_warnings(summary: &runtime::TurnSummary) {
+    for warning in &summary.lifecycle_warnings {
+        eprintln!("warning: {warning}");
+    }
+}
+
+fn render_repl_response(text: &str) -> String {
+    let text = text.trim();
+    if text.is_empty() {
+        return String::new();
+    }
+
+    TerminalRenderer::new().markdown_to_ansi(text)
+}
+
+fn print_repl_response(summary: &runtime::TurnSummary) {
+    let rendered = render_repl_response(&final_assistant_text(summary));
+    if !rendered.is_empty() {
+        println!("{rendered}\n");
+    } else {
+        println!();
+    }
+}
+
 fn collect_tool_uses(summary: &runtime::TurnSummary) -> Vec<serde_json::Value> {
     summary
         .assistant_messages
@@ -15238,8 +15357,9 @@ mod tests {
         parse_history_count, permission_policy, print_help_to, push_output_block,
         render_config_report, render_diff_report, render_diff_report_for, render_help_topic,
         render_help_topic_json, render_memory_report, render_prompt_history_report,
-        render_repl_help, render_resume_usage, render_session_list, render_session_markdown,
-        resolve_model_alias, resolve_model_alias_with_config, resolve_repl_model,
+        render_repl_help, render_repl_response, render_resume_usage, render_session_list,
+        render_session_markdown, format_repl_footer, format_repl_prompt, resolve_model_alias,
+        resolve_model_alias_with_config, resolve_repl_model,
         resolve_session_reference, response_to_events, resume_supported_slash_commands,
         run_resume_command, short_tool_id, slash_command_completion_candidates_with_sessions,
         split_error_hint, status_context, status_json_value, summarize_tool_payload_for_markdown,
@@ -18521,6 +18641,30 @@ mod tests {
     }
 
     #[test]
+    fn repl_prompt_places_input_before_static_model_footer() {
+        let prompt = format_repl_prompt("custom-model", PermissionMode::DangerFullAccess);
+        let footer = format_repl_footer("custom-model", PermissionMode::DangerFullAccess);
+
+        assert!(prompt.contains("╭─"));
+        assert!(!prompt.contains("custom-model"));
+        assert!(!prompt.contains('\n'));
+        assert!(footer.contains("custom-model"));
+        assert!(footer.contains("full access"));
+        assert!(footer.contains("╰─"));
+        assert!(!footer.contains('\n'));
+    }
+
+    #[test]
+    fn repl_response_renders_markdown_without_raw_formatting_markers() {
+        let rendered = render_repl_response("## Answer\n\n**Done**.");
+
+        assert!(rendered.contains("Answer"));
+        assert!(rendered.contains("Done"));
+        assert!(!rendered.contains("##"));
+        assert!(!rendered.contains("**"));
+    }
+
+    #[test]
     fn logout_clears_saved_credentials_and_restores_disconnected_banner() {
         let _guard = env_lock();
         let root = temp_dir();
@@ -18575,7 +18719,7 @@ mod tests {
 
         let line = format_connected_line(model);
 
-        assert_eq!(line, "Ready · claude-sonnet-4-6 via anthropic");
+        assert_eq!(line, "● Connected · anthropic");
     }
 
     #[test]
@@ -18584,7 +18728,7 @@ mod tests {
 
         let line = format_connected_line(model);
 
-        assert_eq!(line, "Ready · grok-3 via xai");
+        assert_eq!(line, "● Connected · xai");
     }
 
     #[test]

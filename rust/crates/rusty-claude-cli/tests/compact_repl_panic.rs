@@ -45,6 +45,20 @@ fn compact_slash_command_in_repl_does_not_start_nested_tokio_runtime() {
             || plain_stdout.contains("Result           compacted"),
         "stdout should contain compact report output ({stdout:?})"
     );
+    assert!(
+        plain_stdout.contains("╭─") && plain_stdout.contains("╰─"),
+        "stdout should contain the modern model/input rails ({stdout:?})"
+    );
+    let input_rail = plain_stdout
+        .rfind("╭─")
+        .expect("stdout should contain the input rail");
+    let model_rail = plain_stdout
+        .rfind("╰─")
+        .expect("stdout should contain the model footer rail");
+    assert!(
+        input_rail < model_rail,
+        "the input rail must be above the static model footer ({stdout:?})"
+    );
 
     fs::remove_dir_all(&workspace).expect("workspace cleanup should succeed");
 }
