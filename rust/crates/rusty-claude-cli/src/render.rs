@@ -5,9 +5,9 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use crossterm::cursor::MoveToColumn;
+use crossterm::cursor::{MoveTo, MoveToColumn};
 use crossterm::style::{Color, Print, ResetColor, SetForegroundColor, Stylize};
-use crossterm::terminal::{Clear, ClearType};
+use crossterm::terminal::{self, Clear, ClearType};
 use crossterm::{execute, queue};
 use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
 use syntect::easy::HighlightLines;
@@ -275,14 +275,43 @@ fn animate_spinner(label: String, theme: ColorTheme, stop_rx: Receiver<()>) -> i
     let mut stdout = io::stdout();
 
     loop {
-        spinner.tick_elapsed(&label, started_at.elapsed(), &theme, &mut stdout)?;
+        if let Some((activity_row, _input_row)) = activity_cursor_rows() {
+            // Keep the terminal cursor parked in the composer while the
+            // activity line is redrawn above it. The saved position is the
+            // composer position established by `LineEditor::begin_working`.
+            write!(stdout, "\x1b7")?;
+            queue!(stdout, MoveTo(0, activity_row))?;
+            spinner.tick_elapsed(&label, started_at.elapsed(), &theme, &mut stdout)?;
+            write!(stdout, "\x1b8")?;
+            stdout.flush()?;
+        } else {
+            spinner.tick_elapsed(&label, started_at.elapsed(), &theme, &mut stdout)?;
+        }
         match stop_rx.recv_timeout(Duration::from_millis(90)) {
             Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
             Err(mpsc::RecvTimeoutError::Timeout) => {}
         }
     }
 
-    spinner.clear(&mut stdout)
+    if let Some((activity_row, _input_row)) = activity_cursor_rows() {
+        // Leave the cursor on the cleared activity row so the assistant
+        // response can begin there, above the pinned composer and footer.
+        execute!(
+            stdout,
+            MoveTo(0, activity_row),
+            Clear(ClearType::CurrentLine)
+        )?;
+        stdout.flush()
+    } else {
+        spinner.clear(&mut stdout)
+    }
+}
+
+/// Return the zero-based activity and composer rows used by the interactive
+/// layout. The activity line is immediately above the composer.
+fn activity_cursor_rows() -> Option<(u16, u16)> {
+    let (_, rows) = terminal::size().ok()?;
+    (rows >= 4).then_some((rows - 3, rows - 2))
 }
 
 pub enum ActivityIndicator {

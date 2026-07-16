@@ -106,6 +106,32 @@ pub fn styled_input_chip() -> String {
     format!("{} ", style(" › ").on(bg).with(fg))
 }
 
+/// Return the one-based terminal column immediately after a prompt, ignoring
+/// ANSI styling sequences. This lets the parked cursor sit inside the
+/// composer instead of covering the prompt marker.
+fn prompt_cursor_column(prompt: &str) -> u16 {
+    let mut width = 0usize;
+    let mut chars = prompt.chars();
+    while let Some(character) = chars.next() {
+        if character == '\x1b' {
+            if chars.next() == Some('[') {
+                while let Some(code) = chars.next() {
+                    if ('@'..='~').contains(&code) {
+                        break;
+                    }
+                }
+            }
+            continue;
+        }
+        if character == '\n' {
+            width = 0;
+        } else {
+            width = width.saturating_add(1);
+        }
+    }
+    u16::try_from(width.saturating_add(1)).unwrap_or(u16::MAX)
+}
+
 fn permission_segment_for_index(index: u8) -> String {
     let label = permission_display_for_index(index);
     if env::var_os("NO_COLOR").is_some() {
@@ -465,6 +491,7 @@ impl LineEditor {
 
         let working_row = rows - 2;
         let input_row = rows - 1;
+        let input_column = prompt_cursor_column(&self.prompt);
         let mut stdout = io::stdout();
 
         // The submitted input currently occupies the bottom scroll row. Move
@@ -472,7 +499,7 @@ impl LineEditor {
         write!(stdout, "\x1b[1;{working_row}r\x1b[{working_row};1H\r\n")?;
         write!(
             stdout,
-            "\x1b[{input_row};1H\x1b[2K{}\x1b[{rows};1H\x1b[2K{}\x1b[{working_row};1H\x1b[2K",
+            "\x1b[{input_row};1H\x1b[2K{}\x1b[{rows};1H\x1b[2K{}\x1b[{working_row};1H\x1b[2K\x1b[{input_row};{input_column}G",
             self.prompt, self.footer
         )?;
         stdout.flush()?;
@@ -707,8 +734,8 @@ fn normalize_completions(completions: Vec<String>) -> Vec<String> {
 mod tests {
     use super::{
         highlight_slash_command, path_completion_candidates, permission_display_for_index,
-        permission_mode_for_index, permission_mode_index, slash_command_prefix, LineEditor,
-        SlashCommandHelper,
+        permission_mode_for_index, permission_mode_index, prompt_cursor_column,
+        slash_command_prefix, LineEditor, SlashCommandHelper,
     };
     use std::fs;
     use std::path::PathBuf;
@@ -867,6 +894,15 @@ mod tests {
         editor.push_history("/help");
 
         assert_eq!(editor.editor.history().len(), 1);
+    }
+
+    #[test]
+    fn prompt_cursor_column_ignores_ansi_styling() {
+        assert_eq!(prompt_cursor_column("> "), 3);
+        assert_eq!(
+            prompt_cursor_column("\x1b[38;2;148;163;184m › \x1b[39m "),
+            5
+        );
     }
 
     #[test]

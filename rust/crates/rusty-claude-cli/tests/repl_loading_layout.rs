@@ -50,6 +50,16 @@ fn repl_keeps_working_indicator_above_composer_and_model_footer() {
         model_footer < working,
         "activity should render after the cursor is moved to the row above the composer: {terminal_output:?}"
     );
+    let activity_move = terminal_output[..working]
+        .rfind("\x1b[22;1H")
+        .expect("activity frame should move to the reserved working row");
+    let cursor_save = terminal_output[..activity_move]
+        .rfind("\x1b7")
+        .expect("activity frame should save the composer cursor");
+    assert!(
+        cursor_save < activity_move && terminal_output[working..].contains("\x1b8"),
+        "activity redraw should restore the composer cursor after painting the working row: {terminal_output:?}"
+    );
     assert!(
         terminal_output.contains("0 tok"),
         "model footer should include live token usage: {terminal_output:?}"

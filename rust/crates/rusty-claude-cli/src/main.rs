@@ -3842,6 +3842,10 @@ fn format_connected_line(model: &str) -> String {
     format!("● Connected · {provider}")
 }
 
+const CUTE_CLAW_LOGO: &str = r#"  /\_/\
+ ( o.o )  🦞
+  > ^ <"#;
+
 fn style_ui(text: &str, color: Color, bold: bool) -> String {
     if env::var_os("NO_COLOR").is_some() {
         return text.to_string();
@@ -8751,8 +8755,10 @@ impl LiveCli {
         let resume = style_ui("/resume latest", accent, false);
         let tab = style_ui("Tab", accent, true);
         let shift_enter = style_ui("Shift+Enter", accent, true);
+        let logo = style_ui(CUTE_CLAW_LOGO, accent, true);
         format!(
-            "{top} {brand}\n\
+            "{logo}\n\
+{top} {brand}\n\
 {bottom} {help} commands · {status} context · {resume} restore\n\
    {tab} completes commands, models, sessions, and paths · Shift+Tab permission mode · {shift_enter} newline",
         )
@@ -19393,6 +19399,8 @@ mod tests {
         assert!(banner.contains("Tab"));
         assert!(banner.contains("completes commands, models, sessions, and paths"));
         assert!(banner.contains("Shift+Tab permission mode"));
+        assert!(banner.contains("( o.o )"));
+        assert!(banner.contains("🦞"));
         assert!(!banner.contains("╭─"));
         assert!(!banner.contains("╰─"));
 
