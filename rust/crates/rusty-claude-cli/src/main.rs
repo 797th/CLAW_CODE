@@ -2095,7 +2095,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
             "--permission-mode" => {
                 let value = args
                     .get(index + 1)
-                    .ok_or_else(|| "missing_flag_value: missing value for --permission-mode.\nUsage: --permission-mode read-only|workspace-write|danger-full-access".to_string())?;
+                    .ok_or_else(|| "missing_flag_value: missing value for --permission-mode.\nUsage: --permission-mode prompt|read-only|workspace-write|danger-full-access".to_string())?;
                 // #468: track duplicate --permission-mode flags
                 if permission_mode_override.is_some() {
                     push_duplicate_flag("--permission-mode (overwriting previous value)");
@@ -3096,6 +3096,18 @@ fn try_resolve_bare_skill_prompt(cwd: &Path, trimmed: &str) -> Option<String> {
     }
 }
 
+fn repl_command_model_prompt(command: &SlashCommand) -> Option<String> {
+    match command {
+        SlashCommand::Skills { args } => {
+            match classify_skills_slash_command(args.as_deref()) {
+                SkillSlashDispatch::Invoke(prompt) => Some(prompt),
+                SkillSlashDispatch::Local => None,
+            }
+        }
+        _ => None,
+    }
+}
+
 fn join_optional_args(args: &[String]) -> Option<String> {
     let joined = args.join(" ");
     let trimmed = joined.trim();
@@ -3577,7 +3589,7 @@ fn parse_permission_mode_arg(value: &str) -> Result<PermissionMode, String> {
     normalize_permission_mode(value)
         .ok_or_else(|| {
             format!(
-                "invalid_permission_mode: unsupported permission mode '{value}'.\nUsage: --permission-mode read-only|workspace-write|danger-full-access"
+                "invalid_permission_mode: unsupported permission mode '{value}'.\nUsage: --permission-mode prompt|read-only|workspace-write|danger-full-access"
             )
         })
         .map(permission_mode_from_label)
@@ -3585,6 +3597,7 @@ fn parse_permission_mode_arg(value: &str) -> Result<PermissionMode, String> {
 
 fn permission_mode_from_label(mode: &str) -> PermissionMode {
     match mode {
+        "prompt" | "ask" => PermissionMode::Prompt,
         "read-only" => PermissionMode::ReadOnly,
         "workspace-write" => PermissionMode::WorkspaceWrite,
         "danger-full-access" => PermissionMode::DangerFullAccess,
@@ -3724,10 +3737,10 @@ fn style_ui(text: &str, color: Color, bold: bool) -> String {
 
 fn repl_permission_label(permission_mode: PermissionMode) -> &'static str {
     match permission_mode {
-        PermissionMode::DangerFullAccess => "full access",
-        PermissionMode::WorkspaceWrite => "workspace write",
+        PermissionMode::DangerFullAccess => "bypass",
+        PermissionMode::WorkspaceWrite => "workspace",
         PermissionMode::ReadOnly => "read-only",
-        PermissionMode::Prompt => "ask before tools",
+        PermissionMode::Prompt => "ask",
         PermissionMode::Allow => "allow",
     }
 }
@@ -3738,10 +3751,14 @@ fn format_repl_prompt(_model: &str, _permission_mode: PermissionMode) -> String 
         g: 163,
         b: 184,
     };
-    format!("{} ", style_ui("╭─", muted, false))
+    format!("{} ", style_ui("•", muted, false))
 }
 
-fn format_repl_footer(model: &str, permission_mode: PermissionMode) -> String {
+fn format_repl_footer(
+    model: &str,
+    permission_mode: PermissionMode,
+    usage: TokenUsage,
+) -> String {
     let accent = Color::Rgb {
         r: 129,
         g: 140,
@@ -3752,13 +3769,46 @@ fn format_repl_footer(model: &str, permission_mode: PermissionMode) -> String {
         g: 163,
         b: 184,
     };
+    let pricing = pricing_for_model(model).unwrap_or_else(ModelPricing::default_sonnet_tier);
+    let cost = format_usd(
+        usage
+            .estimate_cost_usd_with_pricing(pricing)
+            .total_cost_usd(),
+    );
     format!(
-        "{} {} {} {}",
-        style_ui("╰─", muted, false),
+        "{} {} {} {} {} {} {}",
+        style_ui("•", muted, false),
         style_ui(model, accent, false),
         style_ui("·", muted, false),
-        style_ui(repl_permission_label(permission_mode), muted, false),
+        style_ui(&format!("{} tok", usage.total_tokens()), muted, false),
+        style_ui("·", muted, false),
+        style_ui(&cost, muted, false),
+        style_ui(&format!("· {}", repl_permission_label(permission_mode)), muted, false),
     )
+}
+
+const SUPERPOWERS_CHECKLIST: &[&str] = &[
+    "understand request and constraints",
+    "make a focused implementation plan",
+    "work incrementally with verification",
+    "review the result before handoff",
+];
+
+fn is_superpowers_invocation(prompt: &str) -> bool {
+    prompt
+        .trim()
+        .trim_start_matches('$')
+        .split_whitespace()
+        .next()
+        == Some("superpowers")
+}
+
+fn print_superpowers_checklist() {
+    println!();
+    println!("• Superpowers workflow");
+    for item in SUPERPOWERS_CHECKLIST {
+        println!("  ☐ {item}");
+    }
 }
 
 fn filter_tool_specs(
@@ -7700,9 +7750,17 @@ fn run_repl(
 
     loop {
         editor.set_prompt(format_repl_prompt(&cli.model, cli.permission_mode));
-        editor.set_footer(format_repl_footer(&cli.model, cli.permission_mode));
+        editor.set_permission_mode(cli.permission_mode.as_str());
+        editor.set_footer(cli.repl_footer());
         editor.set_completions(cli.repl_completion_candidates().unwrap_or_default());
-        match editor.read_line()? {
+        let read_outcome = editor.read_line()?;
+        let requested_permission_mode = editor.permission_mode();
+        if requested_permission_mode != cli.permission_mode.as_str() {
+            cli.set_permissions(Some(requested_permission_mode))?;
+            cli.persist_session()?;
+        }
+
+        match read_outcome {
             input::ReadOutcome::Submit(input) => {
                 let trimmed = input.trim().to_string();
                 if trimmed.is_empty() {
@@ -7715,8 +7773,18 @@ fn run_repl(
                 }
                 match SlashCommand::parse(&trimmed) {
                     Ok(Some(command)) => {
-                        if cli.handle_repl_command(command)? {
-                            cli.persist_session()?;
+                        if let Some(prompt) = repl_command_model_prompt(&command) {
+                            editor.push_history(input);
+                            cli.record_prompt_history(&trimmed);
+                            editor.begin_working()?;
+                            if is_superpowers_invocation(&prompt) {
+                                print_superpowers_checklist();
+                            }
+                            cli.run_turn(&prompt)?;
+                        } else {
+                            if cli.handle_repl_command(command)? {
+                                cli.persist_session()?;
+                            }
                         }
                         continue;
                     }
@@ -7733,11 +7801,16 @@ fn run_repl(
                 if let Some(prompt) = try_resolve_bare_skill_prompt(&cwd, &trimmed) {
                     editor.push_history(input);
                     cli.record_prompt_history(&trimmed);
+                    editor.begin_working()?;
+                    if is_superpowers_invocation(&prompt) {
+                        print_superpowers_checklist();
+                    }
                     cli.run_turn(&prompt)?;
                     continue;
                 }
                 editor.push_history(input);
                 cli.record_prompt_history(&trimmed);
+                editor.begin_working()?;
                 cli.run_turn(&trimmed)?;
             }
             input::ReadOutcome::Cancel => {}
@@ -8424,8 +8497,8 @@ impl LiveCli {
             b: 184,
         };
         let brand = style_ui("Claw Code", accent, true);
-        let top = style_ui("╭─", accent, false);
-        let bottom = style_ui("╰─", muted, false);
+        let top = style_ui("•", accent, false);
+        let bottom = style_ui("•", muted, false);
         let help = style_ui("/help", accent, false);
         let status = style_ui("/status", accent, false);
         let resume = style_ui("/resume latest", accent, false);
@@ -8434,12 +8507,20 @@ impl LiveCli {
         format!(
             "{top} {brand}\n\
 {bottom} {help} commands · {status} context · {resume} restore\n\
-   {tab} completes commands, models, sessions, and paths · {shift_enter} newline",
+   {tab} completes commands, models, sessions, and paths · Shift+Tab permission mode · {shift_enter} newline",
         )
     }
 
     fn disconnected_startup_banner(&self) -> String {
         format!("{}\n{NEEDS_LOGIN_HINT}", self.startup_banner())
+    }
+
+    fn repl_footer(&self) -> String {
+        format_repl_footer(
+            &self.model,
+            self.permission_mode,
+            self.runtime.usage().cumulative_usage(),
+        )
     }
 
     fn repl_completion_candidates(&self) -> Result<Vec<String>, Box<dyn std::error::Error>> {
@@ -9001,7 +9082,8 @@ impl LiveCli {
                 self.compact()?;
                 false
             }
-            SlashCommand::Model { model } => self.set_model(model)?,
+            SlashCommand::Model { model: Some(model) } => self.set_model(Some(model))?,
+            SlashCommand::Model { model: None } => self.choose_model_interactively()?,
             SlashCommand::Permissions { mode } => self.set_permissions(mode)?,
             SlashCommand::Clear { confirm } => self.clear_session(confirm)?,
             SlashCommand::Cost => {
@@ -9061,7 +9143,12 @@ impl LiveCli {
             }
             SlashCommand::Skills { args } => {
                 match classify_skills_slash_command(args.as_deref()) {
-                    SkillSlashDispatch::Invoke(prompt) => self.run_turn(&prompt)?,
+                    SkillSlashDispatch::Invoke(prompt) => {
+                        if is_superpowers_invocation(&prompt) {
+                            print_superpowers_checklist();
+                        }
+                        self.run_turn(&prompt)?;
+                    }
                     SkillSlashDispatch::Local => {
                         if let Err(error) =
                             Self::print_skills(args.as_deref(), CliOutputFormat::Text)
@@ -9243,6 +9330,25 @@ impl LiveCli {
         );
     }
 
+    fn choose_model_interactively(&mut self) -> Result<bool, Box<dyn std::error::Error>> {
+        println!();
+        println!("Model selection");
+        println!("  Current          {}", self.model);
+        println!("  Aliases          opus · sonnet · haiku · gpt-oss");
+        print!("  Provider/model   ");
+        io::stdout().flush()?;
+
+        let mut input = String::new();
+        io::stdin().read_line(&mut input)?;
+        let model = input.trim();
+        if model.is_empty() {
+            println!("Model unchanged.");
+            return Ok(false);
+        }
+
+        self.set_model(Some(model.to_string()))
+    }
+
     fn set_model(&mut self, model: Option<String>) -> Result<bool, Box<dyn std::error::Error>> {
         let Some(model) = model else {
             println!(
@@ -9307,7 +9413,7 @@ impl LiveCli {
 
         let normalized = normalize_permission_mode(&mode).ok_or_else(|| {
             format!(
-                "invalid_flag_value: unsupported permission mode '{mode}'.\nUsage: --permission-mode read-only|workspace-write|danger-full-access"
+                "invalid_flag_value: unsupported permission mode '{mode}'.\nUsage: --permission-mode prompt|read-only|workspace-write|danger-full-access"
             )
         })?;
 
@@ -10396,6 +10502,7 @@ fn render_repl_help() -> String {
         "  Up/Down              Navigate prompt history".to_string(),
         "  Ctrl-R               Reverse-search prompt history".to_string(),
         "  Tab                  Complete commands, modes, and recent sessions".to_string(),
+        "  Shift+Tab            Cycle ask, workspace, and bypass permissions".to_string(),
         "  Ctrl-C               Clear input (or exit on empty prompt)".to_string(),
         "  Shift+Enter/Ctrl+J   Insert a newline".to_string(),
         "  Auto-save            .claw/sessions/<workspace-fingerprint>/<session-id>.jsonl"
@@ -12044,6 +12151,7 @@ fn init_json_value(report: &crate::init::InitReport, message: &str) -> serde_jso
 
 fn normalize_permission_mode(mode: &str) -> Option<&'static str> {
     match mode.trim() {
+        "prompt" | "ask" => Some("prompt"),
         "default" | "plan" | "read-only" => Some("read-only"),
         "acceptEdits" | "auto" | "workspace-write" => Some("workspace-write"),
         "dontAsk" | "bypassPermissions" | "dangerFullAccess" | "danger-full-access" => {
@@ -18635,6 +18743,9 @@ mod tests {
 
         assert!(banner.contains("Tab"));
         assert!(banner.contains("completes commands, models, sessions, and paths"));
+        assert!(banner.contains("Shift+Tab permission mode"));
+        assert!(!banner.contains("╭─"));
+        assert!(!banner.contains("╰─"));
 
         fs::remove_dir_all(root).expect("cleanup temp dir");
         std::env::remove_var("ANTHROPIC_API_KEY");
@@ -18643,14 +18754,24 @@ mod tests {
     #[test]
     fn repl_prompt_places_input_before_static_model_footer() {
         let prompt = format_repl_prompt("custom-model", PermissionMode::DangerFullAccess);
-        let footer = format_repl_footer("custom-model", PermissionMode::DangerFullAccess);
+        let footer = format_repl_footer(
+            "custom-model",
+            PermissionMode::DangerFullAccess,
+            runtime::TokenUsage {
+                input_tokens: 10,
+                output_tokens: 5,
+                ..Default::default()
+            },
+        );
 
-        assert!(prompt.contains("╭─"));
+        assert!(prompt.contains('•'));
         assert!(!prompt.contains("custom-model"));
         assert!(!prompt.contains('\n'));
         assert!(footer.contains("custom-model"));
-        assert!(footer.contains("full access"));
-        assert!(footer.contains("╰─"));
+        assert!(footer.contains("15 tok"));
+        assert!(footer.contains("$"));
+        assert!(footer.contains("bypass"));
+        assert!(footer.contains('•'));
         assert!(!footer.contains('\n'));
     }
 
@@ -19662,6 +19783,8 @@ UU conflicted.rs",
 
     #[test]
     fn normalizes_supported_permission_modes() {
+        assert_eq!(normalize_permission_mode("prompt"), Some("prompt"));
+        assert_eq!(normalize_permission_mode("ask"), Some("prompt"));
         assert_eq!(normalize_permission_mode("read-only"), Some("read-only"));
         assert_eq!(
             normalize_permission_mode("workspace-write"),
@@ -20052,6 +20175,7 @@ UU conflicted.rs",
         let help = render_repl_help();
         assert!(help.contains("Up/Down"));
         assert!(help.contains("Tab"));
+        assert!(help.contains("Shift+Tab"));
         assert!(help.contains("Shift+Enter/Ctrl+J"));
         assert!(help.contains("Ctrl-R"));
         assert!(help.contains("Reverse-search prompt history"));
