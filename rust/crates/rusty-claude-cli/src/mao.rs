@@ -330,6 +330,25 @@ impl From<api::ApiError> for MaoError {
 // Step 1.2: Decomposition loop — Manager decomposes the user prompt
 // ---------------------------------------------------------------------------
 
+/// Strip a leading/trailing markdown code fence (```` ``` ````-delimited)
+/// from a model reply, if present, and trim whitespace. Models sometimes
+/// wrap JSON-only replies in fences despite instructions not to; both the
+/// Manager's decomposition reply and the Gate's verdict reply are run
+/// through this before `serde_json::from_str`.
+fn strip_json_fence(raw_text: &str) -> String {
+    let trimmed = raw_text.trim();
+    if trimmed.starts_with("```") {
+        trimmed
+            .lines()
+            .skip(1)
+            .take_while(|l| !l.starts_with("```"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    } else {
+        trimmed.to_string()
+    }
+}
+
 /// Send prompt to the `ManagerAgent` and return parsed `SubTask`s.
 /// The Manager is given up to `max_refinement_cycles` inference turns to
 /// produce valid JSON; on each failed parse it is asked to correct itself.
@@ -368,18 +387,7 @@ async fn decompose_prompt(
             .unwrap_or_default();
 
         // Try to parse JSON from the response
-        let trimmed = raw_text.trim();
-        // Strip markdown code fence if present
-        let json_str = if trimmed.starts_with("```") {
-            trimmed
-                .lines()
-                .skip(1)
-                .take_while(|l| !l.starts_with("```"))
-                .collect::<Vec<_>>()
-                .join("\n")
-        } else {
-            trimmed.to_string()
-        };
+        let json_str = strip_json_fence(&raw_text);
 
         match serde_json::from_str::<Vec<SubTask>>(&json_str) {
             Ok(tasks) if tasks.is_empty() => {
@@ -491,6 +499,253 @@ async fn spawn_subagents(
 }
 
 // ---------------------------------------------------------------------------
+// Step 1.4 (Task 11): QAS-style reviewer gate pass, one iteration
+// ---------------------------------------------------------------------------
+
+/// A single actionable issue raised by the gate reviewer. `id` ties the
+/// finding back to the originating brief's `SubTask::id` when the gate could
+/// attribute it to one; `None` when the finding isn't tied to a specific
+/// brief (e.g. a cross-cutting concern).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GateFinding {
+    #[serde(default)]
+    pub id: Option<u32>,
+    pub issue: String,
+}
+
+/// The gate persona's parsed JSON reply.
+#[derive(Debug, Clone, Deserialize)]
+struct GateVerdict {
+    verdict: String,
+    #[serde(default)]
+    findings: Vec<GateFinding>,
+}
+
+/// Final gate outcome attached to `OrchestrationOutput`: the verdict — after
+/// any malformed-JSON/unrecognized-verdict fallback to `"pass"` has already
+/// been applied — plus whatever findings the gate raised (may be non-empty
+/// even on a `"pass"`, and are always surfaced either way).
+#[derive(Debug, Clone)]
+pub struct GateOutcome {
+    pub verdict: String,
+    pub findings: Vec<GateFinding>,
+}
+
+/// Select the first `Gate`-role persona in `personas` (deterministic:
+/// `personas` is already ordered defaults-then-discovered, per
+/// `load_personas`). Additional Gate personas are reported so operators
+/// notice they're being skipped rather than silently combined or randomly
+/// chosen.
+fn select_gate_persona(personas: &[Persona]) -> Option<&Persona> {
+    let mut gates = personas.iter().filter(|p| p.role == AgentRole::Gate);
+    let first = gates.next();
+    let extra: Vec<&str> = gates.map(|p| p.name.as_str()).collect();
+    if !extra.is_empty() {
+        eprintln!(
+            "[mao] multiple Gate personas found; using '{}', skipping: {}",
+            first.map_or("?", |p| p.name.as_str()),
+            extra.join(", ")
+        );
+    }
+    first
+}
+
+/// Render the original briefs (one line per sub-task) for the gate's user
+/// message.
+fn render_briefs_for_gate(results: &[SubTaskResult]) -> String {
+    results
+        .iter()
+        .map(|r| format!("Task {} ({}): {}", r.task.id, r.task.agent, r.task.brief))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Render the aggregated subagent output (including any per-subagent errors)
+/// for the gate's user message.
+fn render_aggregated_for_gate(results: &[SubTaskResult]) -> String {
+    results
+        .iter()
+        .map(|r| {
+            let error_suffix = r
+                .error
+                .as_ref()
+                .map(|e| format!("\n[error: {e}]"))
+                .unwrap_or_default();
+            format!(
+                "--- Task {} ({}) output ---\n{}{error_suffix}",
+                r.task.id, r.task.agent, r.output
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
+/// Run the gate persona's one review pass over the aggregated subagent
+/// output. Malformed/unparseable JSON, an unrecognized `verdict` value, or a
+/// failed API call are all treated as a `"pass"` with an `eprintln!`
+/// warning — the gate must never brick the aggregation loop.
+async fn run_gate_pass(
+    client: &ProviderClient,
+    model: &str,
+    gate_persona: &Persona,
+    results: &[SubTaskResult],
+) -> GateOutcome {
+    let pass = |findings: Vec<GateFinding>| GateOutcome {
+        verdict: "pass".to_string(),
+        findings,
+    };
+
+    let user_message = format!(
+        "You are reviewing the aggregated output of several specialized subagents against their original briefs.\n\n\
+         Briefs:\n{}\n\n\
+         Aggregated output:\n{}\n\n\
+         Reply with ONLY JSON, no prose, no markdown fences, of the exact form:\n\
+         {{\"verdict\":\"pass\"|\"block\",\"findings\":[{{\"id\":<brief id or null>,\"issue\":\"...\"}}]}}\n\
+         `findings` may be an empty array. Set `id` to the brief's integer id when a finding is tied to a specific brief; use null otherwise.",
+        render_briefs_for_gate(results),
+        render_aggregated_for_gate(results),
+    );
+
+    let request = MessageRequest {
+        model: model.to_string(),
+        max_tokens: 2048,
+        messages: vec![InputMessage::user_text(user_message)],
+        system: Some(gate_persona.system_prompt.clone()),
+        ..Default::default()
+    };
+
+    let response = match client.send_message(&request).await {
+        Ok(response) => response,
+        Err(e) => {
+            eprintln!("[mao] gate pass request failed ({e}); treating as pass");
+            return pass(Vec::new());
+        }
+    };
+
+    let raw_text = response
+        .content
+        .iter()
+        .find_map(|block| match block {
+            OutputContentBlock::Text { text } => Some(text.clone()),
+            _ => None,
+        })
+        .unwrap_or_default();
+
+    let json_str = strip_json_fence(&raw_text);
+    match serde_json::from_str::<GateVerdict>(&json_str) {
+        Ok(verdict) if verdict.verdict == "pass" => GateOutcome {
+            verdict: "pass".to_string(),
+            findings: verdict.findings,
+        },
+        Ok(verdict) if verdict.verdict == "block" => GateOutcome {
+            verdict: "block".to_string(),
+            findings: verdict.findings,
+        },
+        Ok(verdict) => {
+            eprintln!(
+                "[mao] gate returned unrecognized verdict '{}'; treating as pass",
+                verdict.verdict
+            );
+            pass(verdict.findings)
+        }
+        Err(parse_err) => {
+            eprintln!(
+                "[mao] gate reply could not be parsed as JSON ({parse_err}); treating as pass. Raw reply:\n{raw_text}"
+            );
+            pass(Vec::new())
+        }
+    }
+}
+
+/// Route `block` findings back to their owning subagent for exactly one
+/// revision pass. Findings sharing a brief `id` are grouped so each
+/// implicated subagent is re-dispatched exactly once, with all of its
+/// findings folded into a single revision instruction. Findings with no
+/// `id` (or an `id` that doesn't match any known brief) are **not**
+/// re-dispatched to anyone — the simplest, most deterministic option given
+/// the brief allows either "route to all implicated subagents" or "append
+/// to the final report"; those findings still ride along in the
+/// caller-visible `GateOutcome::findings` and so are surfaced in the final
+/// report regardless. See Task 11 report for the full rationale.
+async fn apply_gate_findings(
+    client: Arc<ProviderClient>,
+    model: &str,
+    personas: Arc<Vec<Persona>>,
+    mut results: Vec<SubTaskResult>,
+    findings: &[GateFinding],
+) -> Vec<SubTaskResult> {
+    let mut by_id: Vec<(u32, Vec<&str>)> = Vec::new();
+    for finding in findings {
+        let Some(id) = finding.id else { continue };
+        if let Some(entry) = by_id.iter_mut().find(|(existing_id, _)| *existing_id == id) {
+            entry.1.push(finding.issue.as_str());
+        } else {
+            by_id.push((id, vec![finding.issue.as_str()]));
+        }
+    }
+
+    for (id, issues) in by_id {
+        let Some(index) = results.iter().position(|r| r.task.id == id) else {
+            eprintln!("[mao] gate finding references unknown brief id {id}; skipping re-dispatch");
+            continue;
+        };
+        let original_task = results[index].task.clone();
+        let revised_brief = format!(
+            "{}\n\nA reviewer found: {}. Revise your output.",
+            original_task.brief,
+            issues.join("; ")
+        );
+        let revised_task = SubTask {
+            id: original_task.id,
+            agent: original_task.agent.clone(),
+            brief: revised_brief,
+        };
+        eprintln!(
+            "[mao] gate blocked; re-dispatching task {id} ({}) for one revision pass",
+            original_task.agent
+        );
+        let revised_result = run_subagent(
+            Arc::clone(&client),
+            model.to_string(),
+            revised_task,
+            Arc::clone(&personas),
+        )
+        .await;
+        results[index] = revised_result;
+    }
+
+    results
+}
+
+/// Run the QAS reviewer gate over already-aggregated subagent results, if
+/// `personas` defines a `Gate`-role persona (Task 11). On `"block"`,
+/// implicated subagents are re-dispatched for exactly one revision pass
+/// (see `apply_gate_findings`) — there is no second gate pass over the
+/// revised output. Returns `(results, None)` unchanged, with zero extra
+/// provider calls, when no Gate persona is defined.
+async fn run_gate(
+    client: Arc<ProviderClient>,
+    model: &str,
+    personas: Arc<Vec<Persona>>,
+    results: Vec<SubTaskResult>,
+) -> (Vec<SubTaskResult>, Option<GateOutcome>) {
+    let Some(gate_persona) = select_gate_persona(&personas) else {
+        return (results, None);
+    };
+    let gate_persona = gate_persona.clone();
+
+    let outcome = run_gate_pass(client.as_ref(), model, &gate_persona, &results).await;
+
+    if outcome.verdict == "block" {
+        let revised =
+            apply_gate_findings(client, model, personas, results, &outcome.findings).await;
+        (revised, Some(outcome))
+    } else {
+        (results, Some(outcome))
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Public entry point
 // ---------------------------------------------------------------------------
 
@@ -535,15 +790,28 @@ pub fn run_orchestrate(
 
         let task_count = tasks.len();
         eprintln!("[mao] Spawning {task_count} subagent(s) with model {worker_model}…");
-        let results = spawn_subagents(worker_client, worker_model, tasks, personas).await;
+        let results = spawn_subagents(
+            Arc::clone(&worker_client),
+            worker_model,
+            tasks,
+            Arc::clone(&personas),
+        )
+        .await;
 
-        Ok(OrchestrationOutput { results })
+        // ── Step 1.4 (Task 11): QAS reviewer gate pass, one iteration ────
+        let (results, gate) =
+            run_gate(worker_client, worker_model, personas, results).await;
+
+        Ok(OrchestrationOutput { results, gate })
     })
 }
 
 /// Aggregated output from a Phase 1 orchestration run.
 pub struct OrchestrationOutput {
     pub results: Vec<SubTaskResult>,
+    /// The reviewer gate's verdict, if `personas` defined a `Gate`-role
+    /// persona (Task 11). `None` when no Gate persona was present.
+    pub gate: Option<GateOutcome>,
 }
 
 impl OrchestrationOutput {
@@ -567,6 +835,26 @@ impl OrchestrationOutput {
             }
             out.push_str("---\n");
         }
+        if let Some(gate) = &self.gate {
+            use std::fmt::Write as _;
+            out.push_str("\n## Reviewer Gate\n\n");
+            let _ = writeln!(out, "**Verdict:** {}", gate.verdict);
+            if gate.findings.is_empty() {
+                out.push_str("No findings.\n");
+            } else {
+                out.push_str("**Findings:**\n");
+                for finding in &gate.findings {
+                    match finding.id {
+                        Some(id) => {
+                            let _ = writeln!(out, "- (brief {id}) {}", finding.issue);
+                        }
+                        None => {
+                            let _ = writeln!(out, "- {}", finding.issue);
+                        }
+                    }
+                }
+            }
+        }
         out
     }
 
@@ -583,6 +871,13 @@ impl OrchestrationOutput {
                 "output": r.output,
                 "error": r.error,
             })).collect::<Vec<_>>(),
+            "gate": self.gate.as_ref().map(|g| serde_json::json!({
+                "verdict": g.verdict,
+                "findings": g.findings.iter().map(|f| serde_json::json!({
+                    "id": f.id,
+                    "issue": f.issue,
+                })).collect::<Vec<_>>(),
+            })),
         });
         serde_json::to_string_pretty(&value).unwrap_or_else(|_| "{}".to_string())
     }
@@ -855,5 +1150,318 @@ mod persona_tests {
         );
         assert_eq!(qas_matches[0].name, "qas", "first-discovered persona wins");
         assert_eq!(qas_matches[0].role, AgentRole::Gate);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests: Task 11 — reviewer gate pass
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod gate_tests {
+    use super::*;
+    use api::AnthropicClient;
+    use std::io::{Read, Write};
+    use std::net::{TcpListener, TcpStream};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
+
+    /// A minimal, single-purpose HTTP mock server: it accepts one TCP
+    /// connection per request (forcing `Connection: close` so the client
+    /// can't keep-alive across scripted responses), and hands out the
+    /// canned JSON bodies from `responses` in the order requests arrive.
+    /// `run_gate`'s gate-then-redispatch calls are strictly sequential (see
+    /// `run_gate`/`apply_gate_findings`), so FIFO ordering is sufficient —
+    /// no need to inspect request bodies to route responses.
+    struct ScriptedServer {
+        base_url: String,
+        request_count: Arc<AtomicUsize>,
+        captured_bodies: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl ScriptedServer {
+        fn start(responses: Vec<String>) -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock gate server");
+            let addr = listener.local_addr().expect("mock server local addr");
+            let request_count = Arc::new(AtomicUsize::new(0));
+            let captured_bodies = Arc::new(Mutex::new(Vec::new()));
+            let responses = Arc::new(responses);
+
+            {
+                let request_count = Arc::clone(&request_count);
+                let captured_bodies = Arc::clone(&captured_bodies);
+                std::thread::spawn(move || {
+                    for stream in listener.incoming() {
+                        let Ok(mut stream) = stream else { continue };
+                        let idx = request_count.fetch_add(1, Ordering::SeqCst);
+                        let request_body = read_http_request_body(&mut stream);
+                        captured_bodies.lock().unwrap().push(request_body);
+                        let response_body = responses.get(idx).cloned().unwrap_or_else(|| {
+                            r#"{"id":"fallback","type":"message","role":"assistant","content":[{"type":"text","text":"{\"verdict\":\"pass\",\"findings\":[]}"}],"model":"test"}"#.to_string()
+                        });
+                        write_http_response(&mut stream, &response_body);
+                    }
+                });
+            }
+
+            Self {
+                base_url: format!("http://{addr}"),
+                request_count,
+                captured_bodies,
+            }
+        }
+
+        fn call_count(&self) -> usize {
+            self.request_count.load(Ordering::SeqCst)
+        }
+
+        fn bodies(&self) -> Vec<String> {
+            self.captured_bodies.lock().unwrap().clone()
+        }
+
+        /// A `ProviderClient::Anthropic` wired to this server — a real
+        /// client hitting a local, scripted `/v1/messages` endpoint rather
+        /// than a hand-rolled trait mock.
+        fn client(&self) -> ProviderClient {
+            ProviderClient::Anthropic(AnthropicClient::new("test-key").with_base_url(&self.base_url))
+        }
+    }
+
+    fn read_http_request_body(stream: &mut TcpStream) -> String {
+        let mut data = Vec::new();
+        let mut buffer = [0u8; 8192];
+        while let Ok(n) = stream.read(&mut buffer) {
+            if n == 0 {
+                break;
+            }
+            data.extend_from_slice(&buffer[..n]);
+            let Some(header_end) = find_double_crlf(&data) else {
+                continue;
+            };
+            let headers_text = String::from_utf8_lossy(&data[..header_end]).to_string();
+            let content_length: usize = headers_text
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse().ok())
+                        .flatten()
+                })
+                .unwrap_or(0);
+            if data.len() >= header_end + 4 + content_length {
+                let body_start = header_end + 4;
+                return String::from_utf8_lossy(&data[body_start..body_start + content_length])
+                    .to_string();
+            }
+        }
+        String::new()
+    }
+
+    fn find_double_crlf(data: &[u8]) -> Option<usize> {
+        data.windows(4).position(|w| w == b"\r\n\r\n")
+    }
+
+    fn write_http_response(stream: &mut TcpStream, body: &str) {
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        let _ = stream.write_all(response.as_bytes());
+        let _ = stream.flush();
+    }
+
+    /// Wrap `text` as an Anthropic-style `MessageResponse` JSON body whose
+    /// sole content block is that text.
+    fn message_response_json(text: &str) -> String {
+        serde_json::json!({
+            "id": "resp",
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "text", "text": text}],
+            "model": "test",
+        })
+        .to_string()
+    }
+
+    fn gate_persona(system_prompt: &str) -> Persona {
+        Persona {
+            name: "qas".to_string(),
+            system_prompt: system_prompt.to_string(),
+            role: AgentRole::Gate,
+        }
+    }
+
+    fn implementer_persona(name: &str) -> Persona {
+        Persona {
+            name: name.to_string(),
+            system_prompt: format!("You are the {name} agent."),
+            role: AgentRole::Implementer,
+        }
+    }
+
+    /// `#[tokio::test]` isn't available: this crate's dev-dependency on
+    /// `tokio` only enables `rt-multi-thread`, not `macros`. Build a runtime
+    /// by hand instead (mirrors `run_orchestrate`'s own construction).
+    fn block_on<F: std::future::Future>(future: F) -> F::Output {
+        tokio::runtime::Runtime::new()
+            .expect("build test tokio runtime")
+            .block_on(future)
+    }
+
+    fn fixture_result(id: u32, agent: &str, output: &str) -> SubTaskResult {
+        SubTaskResult {
+            task: SubTask {
+                id,
+                agent: agent.to_string(),
+                brief: format!("Implement {agent} feature {id}"),
+            },
+            output: output.to_string(),
+            error: None,
+        }
+    }
+
+    #[test]
+    fn gate_block_triggers_exactly_one_redispatch_and_reports_verdict() {
+        block_on(async {
+            let gate_reply = message_response_json(
+                r#"{"verdict":"block","findings":[{"id":1,"issue":"missing null check"}]}"#,
+            );
+            let redispatch_reply = message_response_json("fn revised() { /* fixed */ }");
+            let server = ScriptedServer::start(vec![gate_reply, redispatch_reply]);
+
+            let personas = Arc::new(vec![
+                implementer_persona("backend"),
+                gate_persona("You are the QAS gate agent."),
+            ]);
+            let results = vec![
+                fixture_result(1, "backend", "fn original() { /* has a bug */ }"),
+                fixture_result(2, "frontend", "<div>ok</div>"),
+            ];
+
+            let (final_results, gate) = run_gate(
+                Arc::new(server.client()),
+                "test-model",
+                Arc::clone(&personas),
+                results,
+            )
+            .await;
+
+            assert_eq!(
+                server.call_count(),
+                2,
+                "expected exactly one gate call + one redispatch"
+            );
+
+            let gate = gate.expect("gate persona is present; outcome must be Some");
+            assert_eq!(gate.verdict, "block");
+            assert_eq!(gate.findings.len(), 1);
+            assert_eq!(gate.findings[0].id, Some(1));
+            assert_eq!(gate.findings[0].issue, "missing null check");
+
+            // Task 1 (backend) was re-dispatched: its output reflects the
+            // scripted revision reply, not the original buggy output.
+            let revised = final_results.iter().find(|r| r.task.id == 1).unwrap();
+            assert_eq!(revised.output, "fn revised() { /* fixed */ }");
+            assert!(!revised.output.contains("has a bug"));
+
+            // Task 2 (frontend) had no finding tied to it and was left alone.
+            let untouched = final_results.iter().find(|r| r.task.id == 2).unwrap();
+            assert_eq!(untouched.output, "<div>ok</div>");
+
+            // The re-dispatch brief embeds the finding text and the revision
+            // instruction, and only task 1's original brief was re-sent.
+            let bodies = server.bodies();
+            assert_eq!(bodies.len(), 2);
+            assert!(bodies[1].contains("A reviewer found: missing null check"));
+            assert!(bodies[1].contains("Revise your output"));
+            assert!(bodies[1].contains("Implement backend feature 1"));
+        });
+    }
+
+    #[test]
+    fn gate_pass_verdict_skips_redispatch_and_is_noted_in_output() {
+        block_on(async {
+            let gate_reply = message_response_json(r#"{"verdict":"pass","findings":[]}"#);
+            let server = ScriptedServer::start(vec![gate_reply]);
+
+            let personas = Arc::new(vec![
+                implementer_persona("backend"),
+                gate_persona("You are the QAS gate agent."),
+            ]);
+            let results = vec![fixture_result(1, "backend", "fn original() {}")];
+
+            let (final_results, gate) = run_gate(
+                Arc::new(server.client()),
+                "test-model",
+                Arc::clone(&personas),
+                results,
+            )
+            .await;
+
+            assert_eq!(server.call_count(), 1, "pass verdict must not trigger a redispatch");
+            let gate = gate.expect("gate persona present");
+            assert_eq!(gate.verdict, "pass");
+            assert!(gate.findings.is_empty());
+            assert_eq!(final_results[0].output, "fn original() {}");
+        });
+    }
+
+    #[test]
+    fn malformed_gate_json_is_treated_as_pass_with_no_redispatch() {
+        block_on(async {
+            let gate_reply = message_response_json("this is not JSON at all");
+            let server = ScriptedServer::start(vec![gate_reply]);
+
+            let personas = Arc::new(vec![
+                implementer_persona("backend"),
+                gate_persona("You are the QAS gate agent."),
+            ]);
+            let results = vec![fixture_result(1, "backend", "fn original() {}")];
+
+            let (final_results, gate) = run_gate(
+                Arc::new(server.client()),
+                "test-model",
+                Arc::clone(&personas),
+                results,
+            )
+            .await;
+
+            assert_eq!(
+                server.call_count(),
+                1,
+                "malformed gate reply must not trigger a redispatch"
+            );
+            let gate = gate.expect("gate persona present");
+            assert_eq!(gate.verdict, "pass", "malformed JSON must fall back to pass");
+            assert!(gate.findings.is_empty());
+            assert_eq!(final_results[0].output, "fn original() {}");
+        });
+    }
+
+    #[test]
+    fn no_gate_persona_means_zero_extra_provider_calls() {
+        block_on(async {
+            // No responses scripted at all — if `run_gate` made any provider
+            // call here, the server would serve the built-in fallback body
+            // rather than panicking, so we assert via `call_count()` instead
+            // of relying on a missing-script failure.
+            let server = ScriptedServer::start(vec![]);
+
+            let personas = Arc::new(vec![implementer_persona("backend")]);
+            let results = vec![fixture_result(1, "backend", "fn original() {}")];
+
+            let (final_results, gate) = run_gate(
+                Arc::new(server.client()),
+                "test-model",
+                Arc::clone(&personas),
+                results.clone(),
+            )
+            .await;
+
+            assert_eq!(server.call_count(), 0, "no Gate persona must mean zero provider calls");
+            assert!(gate.is_none());
+            assert_eq!(final_results[0].output, results[0].output);
+        });
     }
 }
