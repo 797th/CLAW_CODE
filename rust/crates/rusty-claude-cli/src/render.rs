@@ -123,7 +123,8 @@ impl Spinner {
         theme: &ColorTheme,
         out: &mut impl Write,
     ) -> io::Result<()> {
-        self.tick_elapsed(label, Duration::ZERO, theme, out)
+        self.tick_elapsed(label, Duration::ZERO, theme, out)?;
+        out.flush()
     }
 
     fn tick_elapsed(
@@ -156,7 +157,9 @@ impl Spinner {
                 Print(format!("  {frame}  {label}  {}s", elapsed.as_secs()))
             )?;
         }
-        out.flush()
+        // The caller decides when to flush. Interactive frames must restore
+        // the composer cursor before the terminal sees the update.
+        Ok(())
     }
 
     pub fn clear(&mut self, out: &mut impl Write) -> io::Result<()> {
@@ -286,6 +289,7 @@ fn animate_spinner(label: String, theme: ColorTheme, stop_rx: Receiver<()>) -> i
             stdout.flush()?;
         } else {
             spinner.tick_elapsed(&label, started_at.elapsed(), &theme, &mut stdout)?;
+            stdout.flush()?;
         }
         match stop_rx.recv_timeout(Duration::from_millis(90)) {
             Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
@@ -1169,6 +1173,25 @@ fn strip_ansi(input: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{strip_ansi, MarkdownStreamState, Spinner, TerminalRenderer};
+    use std::io::{self, Write};
+
+    #[derive(Default)]
+    struct FlushTrackingWriter {
+        bytes: Vec<u8>,
+        flushes: usize,
+    }
+
+    impl Write for FlushTrackingWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.bytes.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            self.flushes += 1;
+            Ok(())
+        }
+    }
 
     #[test]
     fn renders_markdown_with_styling_and_lists() {
@@ -1325,5 +1348,26 @@ mod tests {
         assert!(output.contains("0s"));
         assert!(output.contains("◐"));
         assert!(output.contains("◓"));
+    }
+
+    #[test]
+    fn elapsed_spinner_frame_stays_buffered_until_cursor_restore() {
+        let terminal_renderer = TerminalRenderer::new();
+        let mut spinner = Spinner::new();
+        let mut out = FlushTrackingWriter::default();
+
+        spinner
+            .tick_elapsed(
+                "Working",
+                std::time::Duration::from_secs(2),
+                terminal_renderer.color_theme(),
+                &mut out,
+            )
+            .expect("tick should queue successfully");
+        assert_eq!(out.flushes, 0);
+
+        out.write_all(b"\x1b8").expect("cursor restore should write");
+        out.flush().expect("frame should flush after cursor restore");
+        assert_eq!(out.flushes, 1);
     }
 }
