@@ -33,7 +33,7 @@ fn export_help_emits_bounded_json_when_requested_384() {
     assert_eq!(parsed["command"], "export");
     assert_eq!(
         parsed["usage"],
-        "claw export [--session <id|latest>] [--output <path>] [--output-format <format>]"
+        "clawcli export [--session <id|latest>] [--output <path>] [--output-format <format>]"
     );
     assert_eq!(parsed["defaults"]["session"], "latest");
     assert!(parsed["options"].as_array().expect("options").len() >= 4);
@@ -54,7 +54,7 @@ fn export_help_preserves_plaintext_in_text_mode_384() {
     );
     let stdout = String::from_utf8(output.stdout).expect("stdout utf8");
     assert!(stdout.starts_with("Export\n"));
-    assert!(stdout.contains("Usage            claw export"));
+    assert!(stdout.contains("Usage            clawcli export"));
     serde_json::from_str::<Value>(&stdout).expect_err("text help should remain plaintext");
 }
 
@@ -552,7 +552,7 @@ fn assert_json_command_with_env(current_dir: &Path, args: &[&str], envs: &[(&str
 }
 
 fn run_claw(current_dir: &Path, args: &[&str], envs: &[(&str, &str)]) -> Output {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_claw"));
+    let mut command = Command::new(env!("CARGO_BIN_EXE_clawcli"));
     command.current_dir(current_dir).args(args);
     for (key, value) in envs {
         command.env(key, value);

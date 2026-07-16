@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# dogfood-build.sh — Build claw from current checkout and verify provenance.
+# dogfood-build.sh — Build clawcli from current checkout and verify provenance.
 #
 # Injects GIT_SHA at build time so version JSON is non-null.
 # Suppresses Cargo compile noise on stderr.
@@ -15,10 +15,10 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 RUST_DIR="$REPO_ROOT/rust"
-BINARY="$RUST_DIR/target/debug/claw"
+BINARY="$RUST_DIR/target/debug/clawcli"
 EXPECTED_SHA="$(git -C "$REPO_ROOT" rev-parse --short HEAD)"
 
-echo "▶ Building claw from $REPO_ROOT" >&2
+echo "▶ Building clawcli from $REPO_ROOT" >&2
 echo "  Commit: $(git -C "$REPO_ROOT" log --oneline -1)" >&2
 
 # Inject GIT_SHA so version JSON returns a non-null sha.

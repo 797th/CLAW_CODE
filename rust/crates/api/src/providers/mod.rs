@@ -36,6 +36,26 @@ pub enum ProviderKind {
     NvidiaNim,
 }
 
+/// Return the explicit endpoint protocol selected by the CLI setup flow.
+///
+/// A custom endpoint can use any model identifier, including identifiers that
+/// happen to look like a known vendor model. The explicit marker therefore
+/// takes precedence over the model-name registry and keeps generic endpoint
+/// connections generic.
+pub fn configured_provider_kind() -> Option<ProviderKind> {
+    let value = std::env::var("CLAW_ENDPOINT_TYPE")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| dotenv_value("CLAW_ENDPOINT_TYPE"))?;
+    match value.trim().to_ascii_lowercase().as_str() {
+        "openai" | "openai-compatible" | "openai_custom_endpoint" => {
+            Some(ProviderKind::OpenAi)
+        }
+        "anthropic" | "anthropic-compatible" => Some(ProviderKind::Anthropic),
+        _ => None,
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProviderMetadata {
     pub provider: ProviderKind,
@@ -277,6 +297,9 @@ pub fn metadata_for_model(model: &str) -> Option<ProviderMetadata> {
 
 #[must_use]
 pub fn detect_provider_kind(model: &str) -> ProviderKind {
+    if let Some(configured_provider) = configured_provider_kind() {
+        return configured_provider;
+    }
     if let Some(metadata) = metadata_for_model(model) {
         return metadata.provider;
     }
@@ -285,7 +308,8 @@ pub fn detect_provider_kind(model: &str) -> ProviderKind {
     // even when the model name has no recognized prefix — this is the
     // common case for local providers (Ollama, LM Studio, vLLM, etc.)
     // where model names like "qwen2.5-coder:7b" don't match any prefix.
-    if std::env::var_os("OPENAI_BASE_URL").is_some() && openai_compat::has_api_key("OPENAI_API_KEY")
+    if openai_compat::has_configured_value("OPENAI_BASE_URL")
+        && openai_compat::has_api_key("OPENAI_API_KEY")
     {
         return ProviderKind::OpenAi;
     }
@@ -303,7 +327,7 @@ pub fn detect_provider_kind(model: &str) -> ProviderKind {
     }
     // Last resort: if OPENAI_BASE_URL is set without OPENAI_API_KEY (some
     // local providers like Ollama don't require auth), still route there.
-    if std::env::var_os("OPENAI_BASE_URL").is_some() {
+    if openai_compat::has_configured_value("OPENAI_BASE_URL") {
         return ProviderKind::OpenAi;
     }
     ProviderKind::Anthropic
@@ -1349,6 +1373,18 @@ NO_EQUALS_LINE
             provider,
             ProviderKind::OpenAi,
             "OPENAI_BASE_URL should win over Anthropic fallback for unknown models"
+        );
+    }
+
+    #[test]
+    fn explicit_generic_endpoint_type_overrides_known_model_registry() {
+        let _lock = env_lock();
+        let _endpoint_type = EnvVarGuard::set("CLAW_ENDPOINT_TYPE", Some("openai-compatible"));
+
+        assert_eq!(
+            detect_provider_kind("openai/gpt-oss-120b"),
+            ProviderKind::OpenAi,
+            "generic endpoint selection must not route a custom connection to NVIDIA"
         );
     }
 

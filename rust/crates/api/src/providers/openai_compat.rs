@@ -1454,8 +1454,19 @@ pub fn has_api_key(key: &str) -> bool {
 }
 
 #[must_use]
+pub fn has_configured_value(key: &str) -> bool {
+    read_env_non_empty(key)
+        .ok()
+        .and_then(std::convert::identity)
+        .is_some()
+}
+
+#[must_use]
 pub fn read_base_url(config: OpenAiCompatConfig) -> String {
-    std::env::var(config.base_url_env).unwrap_or_else(|_| config.default_base_url.to_string())
+    read_env_non_empty(config.base_url_env)
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| config.default_base_url.to_string())
 }
 
 fn chat_completions_endpoint(base_url: &str) -> String {

@@ -9,19 +9,19 @@ For a task-oriented guide with copy/paste examples, see [`../USAGE.md`](../USAGE
 ```bash
 # Inspect available commands
 cd rust/
-cargo run -p rusty-claude-cli -- --help
+cargo run -p rusty-claude-cli --bin clawcli -- --help
 
 # Build the workspace
 cargo build --workspace
 
 # Run the interactive REPL
-cargo run -p rusty-claude-cli -- --model openai/gpt-oss-120b
+cargo run -p rusty-claude-cli --bin clawcli -- --model openai/gpt-oss-120b
 
 # One-shot prompt
-cargo run -p rusty-claude-cli -- prompt "explain this codebase"
+cargo run -p rusty-claude-cli --bin clawcli -- prompt "explain this codebase"
 
 # JSON output for automation
-cargo run -p rusty-claude-cli -- --output-format json prompt "summarize src/main.rs"
+cargo run -p rusty-claude-cli --bin clawcli -- --output-format json prompt "summarize src/main.rs"
 
 # The convenience launcher (same source, relaxed CWD guard)
 cargo run -p rusty-claude-cli --bin cliclaw --
@@ -29,24 +29,30 @@ cargo run -p rusty-claude-cli --bin cliclaw --
 
 The workspace emits two entrypoints from the same `main.rs`:
 
-- `claw`: canonical binary name used by the docs and tests
+- `clawcli`: canonical binary name used by the docs and tests
 - `cliclaw`: convenience launcher — same binary under a name that relaxes the working-directory guard (handy for global, run-from-anywhere installs)
 
 To install **both** binaries on macOS, Linux, or Windows, use the repo-root installer (see `../README.md`):
 
 ```bash
-python3 ../install/install.py        # builds + installs claw and cliclaw, updates PATH
+python3 ../install/install.py        # builds + installs clawcli and cliclaw, updates PATH
 ```
 
 Older `cli797` installs still get the same launcher defaults if you already have that binary lying around.
 
 ## Configuration
 
-Set your API credentials:
+On the first interactive run, `clawcli` opens a setup wizard when no
+credentials are found. Choose OpenAI-compatible or Anthropic-compatible,
+enter a base URL, API key, and model. The OpenAI-compatible option defaults to
+`https://api.openai.com/v1`, so the same flow supports custom gateways and
+local OpenAI-compatible servers.
+
+For non-interactive setup, set your API credentials:
 
 ```bash
-export OPENAI_BASE_URL="https://integrate.api.nvidia.com/v1"
-export OPENAI_API_KEY="nvapi-..."
+export OPENAI_BASE_URL="https://your-gateway.example/v1"
+export OPENAI_API_KEY="..."
 ```
 
 Anthropic-compatible endpoints still work too:
@@ -56,6 +62,9 @@ export ANTHROPIC_API_KEY="sk-ant-..."
 # Or use a proxy:
 export ANTHROPIC_BASE_URL="https://your-proxy.com"
 ```
+
+The wizard stores credentials in `~/.claw/.env` (or
+`$CLAW_CONFIG_HOME/.env`) and the selected model in `settings.json`.
 
 ## Mock parity harness
 
@@ -137,7 +146,7 @@ Short names resolve to the latest model versions:
 Representative current surface:
 
 ```text
-claw [OPTIONS] [COMMAND]
+clawcli [OPTIONS] [COMMAND]
 cliclaw [OPTIONS] [COMMAND]
 
 Flags:
@@ -165,12 +174,12 @@ Top-level commands:
   init
 ```
 
-`claw acp` is a local discoverability surface for editor-first users: it reports the current ACP/Zed status without starting the runtime. As of April 16, 2026, claw-code does **not** ship an ACP/Zed daemon entrypoint yet, and `claw acp serve` is only a status alias until the real protocol surface lands.
+`clawcli acp` is a local discoverability surface for editor-first users: it reports the current ACP/Zed status without starting the runtime. As of April 16, 2026, claw-code does **not** ship an ACP/Zed daemon entrypoint yet, and `clawcli acp serve` is only a status alias until the real protocol surface lands.
 
 The command surface is moving quickly. For the canonical live help text, run:
 
 ```bash
-cargo run -p rusty-claude-cli -- --help
+cargo run -p rusty-claude-cli --bin clawcli -- --help
 ```
 
 ## Slash Commands (REPL)
@@ -193,7 +202,7 @@ Notable claw-first surfaces now available directly in slash form:
 - `/plugin [list|install <path>|enable <name>|disable <name>|uninstall <id>|update <id>]`
 - `/subagent [list|steer <target> <msg>|kill <id>]`
 
-See [`../USAGE.md`](../USAGE.md) for usage examples and run `cargo run -p rusty-claude-cli -- --help` for the live canonical command list.
+See [`../USAGE.md`](../USAGE.md) for usage examples and run `cargo run -p rusty-claude-cli --bin clawcli -- --help` for the live canonical command list.
 
 ## Workspace Layout
 
@@ -208,7 +217,7 @@ rust/
     ├── mock-anthropic-service/ # Deterministic local Anthropic-compatible mock
     ├── plugins/            # Plugin metadata, manager, install/enable/disable surfaces
     ├── runtime/            # Session, config, permissions, MCP, prompts, auth/runtime loop
-    ├── rusty-claude-cli/   # Main CLI binary (`claw`)
+    ├── rusty-claude-cli/   # Main CLI binary (`clawcli`)
     ├── telemetry/          # Session tracing and usage telemetry types
     └── tools/              # Built-in tools, skill resolution, tool search, agent runtime surfaces
 ```
@@ -229,7 +238,7 @@ rust/
 
 - **~20K lines** of Rust
 - **9 crates** in workspace
-- **Binary names:** `claw`, `cliclaw`
+- **Binary names:** `clawcli`, `cliclaw`
 - **Default model:** `openai/gpt-oss-120b`
 - **Default permissions:** `danger-full-access`
 

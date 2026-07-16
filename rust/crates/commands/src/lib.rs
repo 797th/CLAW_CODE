@@ -265,6 +265,13 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
         resume_supported: true,
     },
     SlashCommandSpec {
+        name: "login",
+        aliases: &[],
+        summary: "Connect or reconfigure an API provider (base URL, key, model)",
+        argument_hint: None,
+        resume_supported: false,
+    },
+    SlashCommandSpec {
         name: "plan",
         aliases: &[],
         summary: "Toggle or inspect planning mode",
@@ -1401,12 +1408,13 @@ pub fn validate_slash_command_input(
             validate_no_args(command, &args)?;
             SlashCommand::Doctor
         }
-        "login" | "logout" => {
-            return Err(command_error(
-                "This auth flow was removed. Set ANTHROPIC_API_KEY or ANTHROPIC_AUTH_TOKEN instead.",
-                command,
-                "",
-            ));
+        "login" => {
+            validate_no_args(command, &args)?;
+            SlashCommand::Login
+        }
+        "logout" => {
+            validate_no_args(command, &args)?;
+            SlashCommand::Logout
         }
         "vim" => {
             validate_no_args(command, &args)?;
@@ -1914,7 +1922,7 @@ fn slash_command_category(name: &str) -> &'static str {
         | "stickers" | "language" | "profile" | "max-tokens" | "temperature" | "system-prompt"
         | "api-key" | "terminal-setup" | "notifications" | "telemetry" | "providers" | "env"
         | "project" | "reasoning" | "budget" | "rate-limit" | "workspace" | "reset" | "ide"
-        | "desktop" | "upgrade" => "Config",
+        | "desktop" | "upgrade" | "login" => "Config",
         "debug-tool-call" | "doctor" | "sandbox" | "diagnostics" | "tool-details" | "changelog"
         | "metrics" => "Debug",
         _ => "Tools",
@@ -2677,7 +2685,7 @@ fn render_mcp_report_for(
                 Err(err) => {
                     let empty = std::collections::BTreeMap::new();
                     Ok(format!(
-                        "Config load error\n  Status           fail\n  Summary          runtime config failed to load; reporting partial MCP view\n  Details          {err}\n  Hint             `claw doctor` classifies config parse errors; fix the listed field and rerun\n\n{}",
+                        "Config load error\n  Status           fail\n  Summary          runtime config failed to load; reporting partial MCP view\n  Details          {err}\n  Hint             `clawcli doctor` classifies config parse errors; fix the listed field and rerun\n\n{}",
                         render_mcp_summary_report(cwd, &empty)
                     ))
                 }
@@ -2704,7 +2712,7 @@ fn render_mcp_report_for(
                     runtime_config.mcp().get(server_name),
                 )),
                 Err(err) => Ok(format!(
-                    "Config load error\n  Status           fail\n  Summary          runtime config failed to load; cannot resolve `{server_name}`\n  Details          {err}\n  Hint             `claw doctor` classifies config parse errors; fix the listed field and rerun"
+                    "Config load error\n  Status           fail\n  Summary          runtime config failed to load; cannot resolve `{server_name}`\n  Details          {err}\n  Hint             `clawcli doctor` classifies config parse errors; fix the listed field and rerun"
                 )),
             }
         }
@@ -2712,13 +2720,13 @@ fn render_mcp_report_for(
             // `mcp list <filter>` — list does not accept arguments; treat as unsupported action.
             Ok(render_mcp_unsupported_action_text(
                 args,
-                "list accepts no filter argument; use `claw mcp list`",
+                "list accepts no filter argument; use `clawcli mcp list`",
             ))
         }
         Some(args) if matches!(args.split_whitespace().next(), Some("info" | "describe")) => {
             Ok(render_mcp_unsupported_action_text(
                 args,
-                "use `claw mcp show <server>` to inspect a server",
+                "use `clawcli mcp show <server>` to inspect a server",
             ))
         }
         Some(args) => Ok(render_mcp_usage(Some(args))),
@@ -2741,7 +2749,7 @@ fn render_mcp_unsupported_action_json(action: &str, hint: &str) -> Value {
         "hint": hint,
         "usage": {
             "slash_command": "/mcp [list|show <server>|help]",
-            "direct_cli": "claw mcp [list|show <server>|help]",
+            "direct_cli": "clawcli mcp [list|show <server>|help]",
         },
     })
 }
@@ -2830,13 +2838,13 @@ fn render_mcp_report_json_for(
         Some(args) if args.split_whitespace().next() == Some("list") && args.contains(' ') => {
             Ok(render_mcp_unsupported_action_json(
                 args,
-                "list accepts no filter argument; use `claw mcp list`",
+                "list accepts no filter argument; use `clawcli mcp list`",
             ))
         }
         Some(args) if matches!(args.split_whitespace().next(), Some("info" | "describe")) => {
             Ok(render_mcp_unsupported_action_json(
                 args,
-                "use `claw mcp show <server>` to inspect a server",
+                "use `clawcli mcp show <server>` to inspect a server",
             ))
         }
         Some(args) => Ok(render_mcp_usage_json(Some(args))),
@@ -3922,7 +3930,7 @@ fn render_agents_usage(unexpected: Option<&str>) -> String {
     let mut lines = vec![
         "Agents".to_string(),
         "  Usage            /agents [list|help]".to_string(),
-        "  Direct CLI       claw agents".to_string(),
+        "  Direct CLI       clawcli agents".to_string(),
         "  Sources          .claw/agents, ~/.claw/agents, $CLAW_CONFIG_HOME/agents".to_string(),
     ];
     if let Some(args) = unexpected {
@@ -3937,7 +3945,7 @@ fn render_agents_usage_json(unexpected: Option<&str>) -> Value {
         "action": "help",
         "usage": {
             "slash_command": "/agents [list|help]",
-            "direct_cli": "claw agents [list|help]",
+            "direct_cli": "clawcli agents [list|help]",
             "sources": [".claw/agents", "~/.claw/agents", "$CLAW_CONFIG_HOME/agents"],
         },
         "unexpected": unexpected,
@@ -3949,7 +3957,7 @@ fn render_skills_usage(unexpected: Option<&str>) -> String {
         "Skills".to_string(),
         "  Usage            /skills [list|install <path>|help|<skill> [args]]".to_string(),
         "  Alias            /skill".to_string(),
-        "  Direct CLI       claw skills [list|install <path>|help|<skill> [args]]".to_string(),
+        "  Direct CLI       clawcli skills [list|install <path>|help|<skill> [args]]".to_string(),
         "  Invoke           /skills help overview -> $help overview".to_string(),
         "  Install root     $CLAW_CONFIG_HOME/skills or ~/.claw/skills".to_string(),
         "  Sources          .claw/skills, .omc/skills, .agents/skills, .codex/skills, .claude/skills, ~/.claw/skills, ~/.omc/skills, ~/.claude/skills/omc-learned, ~/.codex/skills, ~/.claude/skills, legacy /commands".to_string(),
@@ -3967,7 +3975,7 @@ fn render_skills_usage_json(unexpected: Option<&str>) -> Value {
         "usage": {
             "slash_command": "/skills [list|install <path>|help|<skill> [args]]",
             "aliases": ["/skill"],
-            "direct_cli": "claw skills [list|install <path>|help|<skill> [args]]",
+            "direct_cli": "clawcli skills [list|install <path>|help|<skill> [args]]",
             "invoke": "/skills help overview -> $help overview",
             "install_root": "$CLAW_CONFIG_HOME/skills or ~/.claw/skills",
             "sources": [
@@ -3993,7 +4001,7 @@ fn render_mcp_usage(unexpected: Option<&str>) -> String {
     let mut lines = vec![
         "MCP".to_string(),
         "  Usage            /mcp [list|show <server>|help]".to_string(),
-        "  Direct CLI       claw mcp [list|show <server>|help]".to_string(),
+        "  Direct CLI       clawcli mcp [list|show <server>|help]".to_string(),
         "  Sources          .claw/settings.json, .claw/settings.local.json".to_string(),
     ];
     if let Some(args) = unexpected {
@@ -4008,7 +4016,7 @@ fn render_mcp_usage_json(unexpected: Option<&str>) -> Value {
         "action": "help",
         "usage": {
             "slash_command": "/mcp [list|show <server>|help]",
-            "direct_cli": "claw mcp [list|show <server>|help]",
+            "direct_cli": "clawcli mcp [list|show <server>|help]",
             "sources": [".claw/settings.json", ".claw/settings.local.json"],
         },
         "unexpected": unexpected,
@@ -4786,7 +4794,7 @@ mod tests {
     #[test]
     fn skills_show_and_list_filter_do_not_invoke_model() {
         // `show`, `info`, `list <filter>` must route to Local, not Invoke.
-        // Regression for: `claw skills show plan` unexpectedly spawned a model session.
+        // Regression for: `clawcli skills show plan` unexpectedly spawned a model session.
         for token in &["show", "info", "describe"] {
             assert_eq!(
                 classify_skills_slash_command(Some(token)),
@@ -4876,11 +4884,13 @@ mod tests {
     }
 
     #[test]
-    fn removed_login_and_logout_commands_report_env_auth_guidance() {
-        let login_error = parse_error_message("/login");
-        assert!(login_error.contains("ANTHROPIC_API_KEY"));
-        let logout_error = parse_error_message("/logout");
-        assert!(logout_error.contains("ANTHROPIC_AUTH_TOKEN"));
+    fn login_and_logout_parse_as_repl_auth_commands() {
+        // /login is the interactive provider-setup command and must parse.
+        let parsed = SlashCommand::parse("/login");
+        assert_eq!(parsed, Ok(Some(SlashCommand::Login)));
+        // /logout is the interactive disconnect command and must parse.
+        let logout = SlashCommand::parse("/logout");
+        assert_eq!(logout, Ok(Some(SlashCommand::Logout)));
     }
 
     #[test]
@@ -4925,9 +4935,9 @@ mod tests {
         assert!(help.contains("/agents [list|help]"));
         assert!(help.contains("/skills [list|install <path>|help|<skill> [args]]"));
         assert!(help.contains("aliases: /skill"));
-        assert!(!help.contains("/login"));
+        assert!(help.contains("/login"));
         assert!(!help.contains("/logout"));
-        assert_eq!(slash_command_specs().len(), 140);
+        assert_eq!(slash_command_specs().len(), 141);
         assert!(resume_supported_slash_commands().len() >= 39);
     }
 
@@ -5318,7 +5328,7 @@ mod tests {
         let help = handle_agents_slash_command_json(Some("help"), &workspace).expect("agents help");
         assert_eq!(help["kind"], "agents");
         assert_eq!(help["action"], "help");
-        assert_eq!(help["usage"]["direct_cli"], "claw agents [list|help]");
+        assert_eq!(help["usage"]["direct_cli"], "clawcli agents [list|help]");
 
         let unexpected = handle_agents_slash_command_json(Some("show planner"), &workspace)
             .expect("agents usage");
@@ -5443,7 +5453,7 @@ mod tests {
         assert_eq!(help["usage"]["aliases"][0], "/skill");
         assert_eq!(
             help["usage"]["direct_cli"],
-            "claw skills [list|install <path>|help|<skill> [args]]"
+            "clawcli skills [list|install <path>|help|<skill> [args]]"
         );
 
         let _ = fs::remove_dir_all(workspace);
@@ -5457,7 +5467,7 @@ mod tests {
         let agents_help =
             super::handle_agents_slash_command(Some("help"), &cwd).expect("agents help");
         assert!(agents_help.contains("Usage            /agents [list|help]"));
-        assert!(agents_help.contains("Direct CLI       claw agents"));
+        assert!(agents_help.contains("Direct CLI       clawcli agents"));
         assert!(agents_help
             .contains("Sources          .claw/agents, ~/.claw/agents, $CLAW_CONFIG_HOME/agents"));
 
@@ -5581,7 +5591,7 @@ mod tests {
 
         let help = super::handle_mcp_slash_command(Some("help"), &cwd).expect("mcp help");
         assert!(help.contains("Usage            /mcp [list|show <server>|help]"));
-        assert!(help.contains("Direct CLI       claw mcp [list|show <server>|help]"));
+        assert!(help.contains("Direct CLI       clawcli mcp [list|show <server>|help]"));
 
         let unexpected =
             super::handle_mcp_slash_command(Some("show alpha beta"), &cwd).expect("mcp usage");
@@ -5761,7 +5771,7 @@ mod tests {
 
     #[test]
     fn mcp_degrades_gracefully_on_malformed_mcp_config_144() {
-        // #144: mirror of #143's partial-success contract for `claw mcp`.
+        // #144: mirror of #143's partial-success contract for `clawcli mcp`.
         // Previously `mcp` hard-failed on any config parse error, hiding
         // well-formed servers and forcing claws to fall back to `doctor`.
         // Now `mcp` emits a degraded envelope instead: exit 0, status:

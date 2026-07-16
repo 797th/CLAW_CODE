@@ -55,7 +55,7 @@ fn run_claw_repl(
     home: &std::path::Path,
     stdin: &str,
 ) -> Output {
-    let mut command = python_pty_command(env!("CARGO_BIN_EXE_claw"));
+    let mut command = python_pty_command(env!("CARGO_BIN_EXE_clawcli"));
     let mut child = command
         .current_dir(cwd)
         .env_clear()

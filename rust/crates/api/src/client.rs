@@ -36,11 +36,17 @@ impl ProviderClient {
                 // DashScope models (qwen-*) also return ProviderKind::OpenAi because they
                 // speak the OpenAI wire format, but they need the DashScope config which
                 // reads DASHSCOPE_API_KEY and points at dashscope.aliyuncs.com.
-                let config = match providers::metadata_for_model(&resolved_model) {
-                    Some(meta) if meta.auth_env == "DASHSCOPE_API_KEY" => {
-                        OpenAiCompatConfig::dashscope()
+                let config = if providers::configured_provider_kind()
+                    == Some(ProviderKind::OpenAi)
+                {
+                    OpenAiCompatConfig::openai()
+                } else {
+                    match providers::metadata_for_model(&resolved_model) {
+                        Some(meta) if meta.auth_env == "DASHSCOPE_API_KEY" => {
+                            OpenAiCompatConfig::dashscope()
+                        }
+                        _ => OpenAiCompatConfig::openai(),
                     }
-                    _ => OpenAiCompatConfig::openai(),
                 };
                 Ok(Self::OpenAi(OpenAiCompatClient::from_env(config)?))
             }

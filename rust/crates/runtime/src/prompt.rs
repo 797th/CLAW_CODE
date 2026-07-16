@@ -53,6 +53,23 @@ pub const FRONTIER_MODEL_NAME: &str = "Claude Opus 4.6";
 const MAX_INSTRUCTION_FILE_CHARS: usize = 4_000;
 const MAX_TOTAL_INSTRUCTION_CHARS: usize = 12_000;
 
+/// Always-on concise response rules adapted from Julius Brussee's caveman
+/// skill. Keeping this in the shared prompt builder makes the behavior apply
+/// to interactive, one-shot, resumed, and model-switched sessions alike.
+pub const CAVEMAN_SYSTEM_PROMPT: &str = r#"# Always-on concise response style
+
+Use terse, high-signal language in every reply. This style is active from the first turn; do not wait for a command or skill invocation.
+
+- Keep technical substance, decisions, necessary reasoning, caveats, and next steps. Remove filler, pleasantries, repetition, and empty hedging.
+- Short sentences and fragments are fine when meaning stays clear. Do not narrate tool calls or add decorative headings, tables, or emoji unless useful or requested.
+- Preserve code, commands, paths, URLs, identifiers, API names, configuration keys, and exact error text verbatim. Keep code blocks unchanged.
+- Do not invent prose abbreviations. Use standard technical terms and the user's dominant language.
+- Keep code, commit messages, and pull-request descriptions professional and readable; concise does not mean caveman wording inside those artifacts.
+- Use complete, unambiguous prose for security warnings, irreversible actions, confirmations, multi-step procedures, and situations where compression could cause a mistake.
+- Never announce or label this style, and never provide a normal answer followed by a style recap.
+- If the user asks for normal mode, more detail, or clarification, follow that request for the relevant response; resume concise style afterward unless they ask to keep it off.
+"#;
+
 /// Neutral identity for the model family line in generated prompts.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum ModelFamilyIdentity {
@@ -186,6 +203,7 @@ impl SystemPromptBuilder {
     pub fn build(&self) -> Vec<String> {
         let mut sections = Vec::new();
         sections.push(get_simple_intro_section(self.output_style_name.is_some()));
+        sections.push(CAVEMAN_SYSTEM_PROMPT.to_string());
         if let (Some(name), Some(prompt)) = (&self.output_style_name, &self.output_style_prompt) {
             sections.push(format!("# Output Style: {name}\n{prompt}"));
         }
@@ -1012,6 +1030,25 @@ mod tests {
         assert!(prompt.contains(SYSTEM_PROMPT_DYNAMIC_BOUNDARY));
 
         fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn embeds_always_on_concise_response_style() {
+        let project_context = ProjectContext {
+            cwd: PathBuf::from("/tmp/project"),
+            current_date: "2026-03-31".to_string(),
+            ..ProjectContext::default()
+        };
+
+        let prompt = SystemPromptBuilder::new()
+            .with_os("linux", "6.8")
+            .with_project_context(project_context)
+            .render();
+
+        assert!(prompt.contains("# Always-on concise response style"));
+        assert!(prompt.contains("active from the first turn"));
+        assert!(prompt.contains("Keep code blocks unchanged."));
+        assert!(prompt.contains("Use complete, unambiguous prose"));
     }
 
     #[test]

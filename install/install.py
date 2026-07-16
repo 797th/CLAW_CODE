@@ -6,7 +6,7 @@ Single entry point that works identically on macOS, Linux, and Windows:
     python3 install.py                 # debug build (default)
     python3 install.py --release       # optimized release build
     python3 install.py --no-verify     # skip post-install smoke test
-    python3 install.py --install-dir /opt/claw/bin
+    python3 install.py --install-dir /opt/clawcli/bin
     python3 install.py --no-path-update
     python3 install.py --help
 
@@ -18,7 +18,7 @@ host platform, and hands off to the matching native backend under
     Windows        ->  powershell backends/windows.ps1 <flags>
 
 The backends own the real build/copy/PATH logic so each one stays in its OS's
-idiomatic shell and is independently runnable and debuggable. Both ``claw`` and
+idiomatic shell and is independently runnable and debuggable. Both ``clawcli`` and
 ``cliclaw`` are built and installed on every OS (same binary, two names — the
 ``cliclaw`` name relaxes the working-directory guard at runtime).
 """
@@ -300,7 +300,7 @@ def main(argv: list[str]) -> int:
     # Steps 4-6 (build, install, verify/next-steps) run inside the native
     # backend — the backend owns the real build/copy/PATH/verify logic.
     info(
-        f"handing off to {os_family} backend — building both claw + cliclaw "
+        f"handing off to {os_family} backend — building both clawcli + cliclaw "
         f"({opts.profile}); first build may take a few minutes"
     )
 

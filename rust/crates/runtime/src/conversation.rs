@@ -542,6 +542,14 @@ where
         &mut self.api_client
     }
 
+    /// Immutable access to the API client. Used by the REPL to inspect
+    /// connection state (e.g. whether credentials are configured) without
+    /// needing a mutable borrow.
+    #[must_use]
+    pub fn api_client(&self) -> &C {
+        &self.api_client
+    }
+
     pub fn session_mut(&mut self) -> &mut Session {
         &mut self.session
     }

@@ -3,7 +3,7 @@
 This repo already had **container detection** in the Rust runtime before this document was added:
 
 - `rust/crates/runtime/src/sandbox.rs` detects Docker/Podman/container markers such as `/.dockerenv`, `/run/.containerenv`, matching env vars, and `/proc/1/cgroup` hints.
-- `rust/crates/rusty-claude-cli/src/main.rs` exposes that state through the `claw sandbox` / `cargo run -p rusty-claude-cli -- sandbox` report.
+- `rust/crates/rusty-claude-cli/src/main.rs` exposes that state through the `clawcli sandbox` / `cargo run -p rusty-claude-cli --bin clawcli -- sandbox` report.
 - `.github/workflows/rust-ci.yml` runs on `ubuntu-latest`, but it does **not** define a Docker or Podman container job.
 - Before this change, the repo did **not** have a checked-in `Dockerfile`, `Containerfile`, or `.devcontainer/` config.
 
@@ -86,15 +86,15 @@ Inside the shell:
 ```bash
 cargo build --workspace
 cargo test --workspace
-cargo run -p rusty-claude-cli -- --help
-cargo run -p rusty-claude-cli -- sandbox
+cargo run -p rusty-claude-cli --bin clawcli -- --help
+cargo run -p rusty-claude-cli --bin clawcli -- sandbox
 ```
 
 The `sandbox` command is a useful sanity check: inside Docker or Podman it should report `In container true` and list the markers the runtime detected.
 
 ## Bind-mount this repo and another repo at the same time
 
-If you want to run `claw` against a second checkout while keeping `claw-code` itself mounted read-write:
+If you want to run `clawcli` against a second checkout while keeping `claw-code` itself mounted read-write:
 
 ### Docker
 
@@ -121,7 +121,7 @@ podman run --rm -it \
 Then, for example:
 
 ```bash
-cargo run -p rusty-claude-cli -- prompt "summarize /repo"
+cargo run -p rusty-claude-cli --bin clawcli -- prompt "summarize /repo"
 ```
 
 ## Notes

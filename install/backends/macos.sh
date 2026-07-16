@@ -4,7 +4,7 @@
 # Invoked by install/install.py. Also runnable standalone:
 #   bash install/backends/macos.sh --release
 #
-# Builds both `claw` and `cliclaw` from rust/, copies them into a bin directory,
+# Builds both `clawcli` and `cliclaw` from rust/, copies them into a bin directory,
 # adds that directory to the user PATH (idempotently), and runs a smoke test.
 set -euo pipefail
 
@@ -88,7 +88,7 @@ info "running: cargo ${CARGO_FLAGS[*]}"
     CARGO_TERM_COLOR="${CARGO_TERM_COLOR:-always}" cargo "${CARGO_FLAGS[@]}"
 )
 
-for BIN_NAME in claw cliclaw; do
+for BIN_NAME in clawcli cliclaw; do
     BIN_PATH="${TARGET_DIR}/${BIN_NAME}"
     if [ ! -x "${BIN_PATH}" ]; then
         error "Expected binary not found: ${BIN_PATH}"
@@ -102,7 +102,7 @@ done
 # ---------------------------------------------------------------------------
 
 mkdir -p "${INSTALL_DIR}"
-for BIN_NAME in claw cliclaw; do
+for BIN_NAME in clawcli cliclaw; do
     install -m 0755 "${TARGET_DIR}/${BIN_NAME}" "${INSTALL_DIR}/${BIN_NAME}"
     ok "installed ${INSTALL_DIR}/${BIN_NAME}"
 done
@@ -124,7 +124,7 @@ if [ "${NO_PATH_UPDATE}" = "0" ]; then
         if [ -f "${RCFILE}" ] || [ "${RCFILE}" = "${HOME}/.zshrc" ]; then
             MARKER="export PATH=\"${INSTALL_DIR}:\$PATH\""
             if ! grep -qF "${MARKER}" "${RCFILE}" 2>/dev/null; then
-                printf '\n# Added by claw installer\n%s\n' "${MARKER}" >> "${RCFILE}"
+                printf '\n# Added by clawcli installer\n%s\n' "${MARKER}" >> "${RCFILE}"
                 UPDATED_RC="${UPDATED_RC} ${RCFILE##*/}"
             fi
         fi
@@ -143,11 +143,11 @@ fi
 if [ "${SKIP_VERIFY}" = "1" ]; then
     warn "verification skipped (--no-verify)"
 else
-    info "running: claw --version"
-    if VERSION_OUT="$("${INSTALL_DIR}/claw" --version 2>&1)"; then
-        ok "claw --version -> ${VERSION_OUT}"
+    info "running: clawcli --version"
+    if VERSION_OUT="$("${INSTALL_DIR}/clawcli" --version 2>&1)"; then
+        ok "clawcli --version -> ${VERSION_OUT}"
     else
-        error "claw --version failed:"; printf '%s\n' "${VERSION_OUT}" 1>&2; exit 1
+        error "clawcli --version failed:"; printf '%s\n' "${VERSION_OUT}" 1>&2; exit 1
     fi
 fi
 
@@ -159,11 +159,11 @@ cat <<EOF
 
 ${C_GREEN}Claw Code is built and installed.${C_RESET}
 
-  Binaries:  ${C_BOLD}${INSTALL_DIR}/claw${C_RESET}  and  ${C_BOLD}${INSTALL_DIR}/cliclaw${C_RESET}
+  Binaries:  ${C_BOLD}${INSTALL_DIR}/clawcli${C_RESET}  and  ${C_BOLD}${INSTALL_DIR}/cliclaw${C_RESET}
   Profile:   ${PROFILE}
 
-  ${C_DIM}# claw — the standard CLI${C_RESET}
-  claw prompt "summarize this repository"
+  ${C_DIM}# clawcli — the standard CLI${C_RESET}
+  clawcli prompt "summarize this repository"
 
   ${C_DIM}# cliclaw — same binary, relaxes the working-directory guard${C_RESET}
   cliclaw prompt "review this repository"

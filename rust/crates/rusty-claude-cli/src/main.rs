@@ -27,9 +27,9 @@ use std::time::{Duration, Instant, UNIX_EPOCH};
 use api::{
     detect_provider_kind, model_family_identity_for, resolve_startup_auth_source, AnthropicClient,
     AuthSource, ContentBlockDelta, InputContentBlock, InputMessage, MessageRequest,
-    MessageResponse, OutputContentBlock, PromptCache, ProviderClient as ApiProviderClient,
-    ProviderKind, StreamEvent as ApiStreamEvent, ToolChoice, ToolDefinition,
-    ToolResultContentBlock,
+    MessageResponse, OpenAiCompatClient, OpenAiCompatConfig, OutputContentBlock, PromptCache,
+    ProviderClient as ApiProviderClient, ProviderKind, StreamEvent as ApiStreamEvent, ToolChoice,
+    ToolDefinition, ToolResultContentBlock,
 };
 
 use commands::{
@@ -59,8 +59,18 @@ use tools::{
 };
 
 const DEFAULT_MODEL: &str = "openai/gpt-oss-120b";
+const DEFAULT_OPENAI_COMPAT_BASE_URL: &str = "https://api.openai.com/v1";
+const DEFAULT_ANTHROPIC_COMPAT_BASE_URL: &str = "https://api.anthropic.com";
+const DEFAULT_OPENAI_COMPAT_MODEL: &str = "gpt-4o-mini";
+const DEFAULT_ANTHROPIC_COMPAT_MODEL: &str = "claude-sonnet-4-6";
 
-/// #148: Model provenance for `claw status` JSON/text output. Records where
+/// Hint shown when the user tries to send a message before running `/login`.
+/// The REPL boots credential-free; this is the single source of truth for the
+/// "not connected" guidance so the banner, the message path, and `/status`
+/// stay in sync.
+const NEEDS_LOGIN_HINT: &str = "No API credentials configured. Run /login to connect a provider.";
+
+/// #148: Model provenance for `clawcli status` JSON/text output. Records where
 /// the resolved model string came from so claws don't have to re-read argv
 /// to audit whether their `--model` flag was honored vs falling back to env
 /// or config or default.
@@ -254,7 +264,7 @@ fn main() {
             // #156: Add machine-readable error kind to text output so stderr observers
             // don't need to regex-scrape the prose.
             let kind = classify_error_kind(&message);
-            if message.contains("`claw --help`") {
+            if message.contains("`clawcli --help`") {
                 eprintln!(
                     "[error-kind: {kind}]
 error: {message}"
@@ -264,7 +274,7 @@ error: {message}"
                     "[error-kind: {kind}]
 error: {message}
 
-Run `claw --help` for usage."
+Run `clawcli --help` for usage."
                 );
             }
         }
@@ -360,6 +370,495 @@ fn merge_prompt_with_stdin(prompt: &str, stdin_content: Option<&str>) -> String 
     format!("{prompt}\n\n{trimmed}")
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EndpointProtocol {
+    OpenAiCompatible,
+    AnthropicCompatible,
+}
+
+impl EndpointProtocol {
+    fn display_name(self) -> &'static str {
+        match self {
+            Self::OpenAiCompatible => "OpenAI-compatible",
+            Self::AnthropicCompatible => "Anthropic-compatible",
+        }
+    }
+
+    fn endpoint_type(self) -> &'static str {
+        match self {
+            Self::OpenAiCompatible => "openai-compatible",
+            Self::AnthropicCompatible => "anthropic-compatible",
+        }
+    }
+
+    fn api_key_env(self) -> &'static str {
+        match self {
+            Self::OpenAiCompatible => "OPENAI_API_KEY",
+            Self::AnthropicCompatible => "ANTHROPIC_API_KEY",
+        }
+    }
+
+    fn base_url_env(self) -> &'static str {
+        match self {
+            Self::OpenAiCompatible => "OPENAI_BASE_URL",
+            Self::AnthropicCompatible => "ANTHROPIC_BASE_URL",
+        }
+    }
+
+    fn default_base_url(self) -> &'static str {
+        match self {
+            Self::OpenAiCompatible => DEFAULT_OPENAI_COMPAT_BASE_URL,
+            Self::AnthropicCompatible => DEFAULT_ANTHROPIC_COMPAT_BASE_URL,
+        }
+    }
+
+    fn default_model(self) -> &'static str {
+        match self {
+            Self::OpenAiCompatible => DEFAULT_OPENAI_COMPAT_MODEL,
+            Self::AnthropicCompatible => DEFAULT_ANTHROPIC_COMPAT_MODEL,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProviderSetup {
+    protocol: EndpointProtocol,
+    base_url: String,
+    api_key: String,
+    model: String,
+}
+
+fn interactive_setup_available() -> bool {
+    io::stdin().is_terminal() && io::stdout().is_terminal()
+}
+
+fn credentials_present_for_model(model: &str) -> bool {
+    match detect_provider_kind(model) {
+        ProviderKind::Anthropic => api::resolve_startup_auth_source(|| Ok(None)).is_ok(),
+        ProviderKind::Xai => api::has_api_key("XAI_API_KEY"),
+        ProviderKind::NvidiaNim => api::has_api_key("NVIDIA_API_KEY"),
+        ProviderKind::OpenAi => {
+            let credential_env = if api::configured_provider_kind() == Some(ProviderKind::OpenAi)
+            {
+                "OPENAI_API_KEY"
+            } else {
+                let canonical = api::resolve_model_alias(model).to_ascii_lowercase();
+                if canonical.starts_with("qwen/")
+                    || canonical.starts_with("qwen-")
+                    || canonical.starts_with("kimi/")
+                    || canonical.starts_with("kimi-")
+                {
+                    "DASHSCOPE_API_KEY"
+                } else {
+                    "OPENAI_API_KEY"
+                }
+            };
+            api::has_api_key(credential_env)
+        }
+    }
+}
+
+fn maybe_setup_provider(model: String) -> Result<String, Box<dyn std::error::Error>> {
+    if credentials_present_for_model(&model) || !interactive_setup_available() {
+        return Ok(model);
+    }
+
+    let setup = prompt_for_provider_setup(&model)?;
+    let cwd = env::current_dir()?;
+    let config_home = ConfigLoader::default_for(cwd).config_home().to_path_buf();
+    persist_provider_setup(&config_home, &setup)?;
+    apply_provider_setup_to_process(&setup);
+    println!();
+    println!(
+        "Saved {} connection for model `{}`.",
+        setup.protocol.display_name(),
+        setup.model
+    );
+    println!(
+        "Credentials are stored in {} and the model in {}/settings.json.",
+        config_home.join(".env").display(),
+        config_home.display()
+    );
+    Ok(setup.model)
+}
+
+fn prompt_for_provider_setup(preferred_model: &str) -> io::Result<ProviderSetup> {
+    println!();
+    println!("No API credentials were detected for the selected model.");
+    println!("Choose a connection type:");
+    println!(
+        "  1) OpenAI-compatible (recommended) — custom URL plus API key"
+    );
+    println!("  2) Anthropic-compatible — custom URL plus API key");
+
+    let protocol = loop {
+        let choice = prompt_text("Connection type", Some("1"))?;
+        match choice.trim().to_ascii_lowercase().as_str() {
+            "1" | "openai" | "openai-compatible" | "openai custom" => {
+                break EndpointProtocol::OpenAiCompatible;
+            }
+            "2" | "anthropic" | "anthropic-compatible" => {
+                break EndpointProtocol::AnthropicCompatible;
+            }
+            _ => println!("Please choose 1 or 2."),
+        }
+    };
+
+    let base_url = loop {
+        let value = prompt_text("Base URL", Some(protocol.default_base_url()))?;
+        match validate_endpoint_url(&value) {
+            Ok(()) => break value,
+            Err(error) => println!("{error}"),
+        }
+    };
+    let api_key = prompt_secret("API key: ")?;
+    let default_model = setup_default_model(protocol, preferred_model);
+    let model = loop {
+        let value = prompt_text("Model", Some(&default_model))?;
+        let value = normalize_setup_model(protocol, &value);
+        if value.is_empty() {
+            println!("Model cannot be empty.");
+        } else if value.chars().any(char::is_whitespace) {
+            println!("Model cannot contain whitespace.");
+        } else {
+            break value;
+        }
+    };
+
+    Ok(ProviderSetup {
+        protocol,
+        base_url,
+        api_key,
+        model,
+    })
+}
+
+fn prompt_text(label: &str, default: Option<&str>) -> io::Result<String> {
+    loop {
+        print!("{label}");
+        if let Some(default) = default {
+            print!(" [{default}]");
+        }
+        print!(": ");
+        io::stdout().flush()?;
+
+        let mut input = String::new();
+        let bytes_read = io::stdin().read_line(&mut input)?;
+        if bytes_read == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "provider setup cancelled",
+            ));
+        }
+        let value = input.trim();
+        if value.is_empty() {
+            if let Some(default) = default.filter(|value| !value.is_empty()) {
+                return Ok(default.to_string());
+            }
+            println!("This value cannot be empty.");
+            continue;
+        }
+        return Ok(value.to_string());
+    }
+}
+
+fn prompt_secret(label: &str) -> io::Result<String> {
+    loop {
+        print!("{label}");
+        io::stdout().flush()?;
+
+        let read_result = read_secret_from_terminal();
+        println!();
+
+        let value = read_result?.trim().to_string();
+        if value.is_empty() {
+            println!("API key cannot be empty.");
+            continue;
+        }
+        return Ok(value);
+    }
+}
+
+fn read_secret_from_terminal() -> io::Result<String> {
+    use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+
+    crossterm::terminal::enable_raw_mode().map_err(io::Error::other)?;
+    let result = (|| {
+        let mut value = String::new();
+        loop {
+            let event = event::read().map_err(io::Error::other)?;
+            let Event::Key(key) = event else {
+                if let Event::Paste(text) = event {
+                    value.push_str(&text);
+                }
+                continue;
+            };
+            if key.kind != KeyEventKind::Press {
+                continue;
+            }
+            match key.code {
+                KeyCode::Enter => break,
+                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::Interrupted,
+                        "provider setup cancelled",
+                    ));
+                }
+                KeyCode::Char(character) => value.push(character),
+                KeyCode::Backspace => {
+                    value.pop();
+                }
+                KeyCode::Esc => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::Interrupted,
+                        "provider setup cancelled",
+                    ));
+                }
+                _ => {}
+            }
+        }
+        Ok(value)
+    })();
+    let restore_result = crossterm::terminal::disable_raw_mode().map_err(io::Error::other);
+    match (result, restore_result) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(_), Err(error)) | (Err(_), Err(error)) => Err(error),
+    }
+}
+
+fn validate_endpoint_url(value: &str) -> Result<(), String> {
+    if value.contains('\n') || value.contains('\r') || value.chars().any(char::is_whitespace) {
+        return Err("Base URL cannot contain whitespace or newlines.".to_string());
+    }
+    if !(value.starts_with("http://") || value.starts_with("https://")) {
+        return Err("Base URL must start with http:// or https://.".to_string());
+    }
+    Ok(())
+}
+
+fn setup_default_model(protocol: EndpointProtocol, preferred_model: &str) -> String {
+    let preferred_model = preferred_model.trim();
+    if preferred_model.is_empty() || preferred_model == DEFAULT_MODEL {
+        return protocol.default_model().to_string();
+    }
+
+    let normalized = match protocol {
+        EndpointProtocol::OpenAiCompatible => preferred_model
+            .strip_prefix("openai/")
+            .unwrap_or(preferred_model),
+        EndpointProtocol::AnthropicCompatible => preferred_model
+            .strip_prefix("anthropic/")
+            .unwrap_or(preferred_model),
+    };
+    if normalized.is_empty()
+        || (protocol == EndpointProtocol::OpenAiCompatible
+            && normalized.starts_with("claude"))
+        || (protocol == EndpointProtocol::AnthropicCompatible
+            && (normalized.starts_with("gpt-") || normalized.starts_with("gpt_")))
+    {
+        protocol.default_model().to_string()
+    } else {
+        normalized.to_string()
+    }
+}
+
+fn normalize_setup_model(protocol: EndpointProtocol, value: &str) -> String {
+    let value = value.trim();
+    match protocol {
+        EndpointProtocol::OpenAiCompatible => value
+            .strip_prefix("openai/")
+            .unwrap_or(value)
+            .to_string(),
+        EndpointProtocol::AnthropicCompatible => value
+            .strip_prefix("anthropic/")
+            .unwrap_or(value)
+            .to_string(),
+    }
+}
+
+fn persist_provider_setup(
+    config_home: &Path,
+    setup: &ProviderSetup,
+) -> Result<(), Box<dyn std::error::Error>> {
+    fs::create_dir_all(config_home)?;
+    let settings_path = config_home.join("settings.json");
+    write_user_model_setting(&settings_path, &setup.model)?;
+
+    let dotenv_path = config_home.join(".env");
+    upsert_dotenv_values(
+        &dotenv_path,
+        &[
+            ("CLAW_ENDPOINT_TYPE", setup.protocol.endpoint_type()),
+            (setup.protocol.base_url_env(), setup.base_url.as_str()),
+            (setup.protocol.api_key_env(), setup.api_key.as_str()),
+        ],
+    )?;
+    restrict_file_permissions(&dotenv_path)?;
+    Ok(())
+}
+
+fn clear_provider_setup(config_home: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let dotenv_path = config_home.join(".env");
+    remove_dotenv_keys(
+        &dotenv_path,
+        &[
+            "CLAW_ENDPOINT_TYPE",
+            "OPENAI_BASE_URL",
+            "OPENAI_API_KEY",
+            "ANTHROPIC_BASE_URL",
+            "ANTHROPIC_API_KEY",
+            "ANTHROPIC_AUTH_TOKEN",
+            "XAI_API_KEY",
+            "NVIDIA_API_KEY",
+            "DASHSCOPE_API_KEY",
+        ],
+    )?;
+    Ok(())
+}
+
+fn write_user_model_setting(path: &Path, model: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let mut root = if path.is_file() {
+        let contents = fs::read_to_string(path)?;
+        if contents.trim().is_empty() {
+            json!({})
+        } else {
+            serde_json::from_str::<Value>(&contents)?
+        }
+    } else {
+        json!({})
+    };
+    let object = root.as_object_mut().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{} must contain a JSON object", path.display()),
+        )
+    })?;
+    object.insert("model".to_string(), Value::String(model.to_string()));
+    let contents = format!("{}\n", serde_json::to_string_pretty(&root)?);
+    fs::write(path, contents)?;
+    Ok(())
+}
+
+fn upsert_dotenv_values(
+    path: &Path,
+    values: &[(&str, &str)],
+) -> Result<(), Box<dyn std::error::Error>> {
+    if values
+        .iter()
+        .any(|(_, value)| value.contains('\n') || value.contains('\r'))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "endpoint settings cannot contain newlines",
+        )
+        .into());
+    }
+    let existing = fs::read_to_string(path).unwrap_or_default();
+    let mut lines = Vec::new();
+    let mut written_keys = BTreeSet::new();
+
+    for line in existing.lines() {
+        let Some(key) = dotenv_key_for_line(line) else {
+            lines.push(line.to_string());
+            continue;
+        };
+        if let Some((_, value)) = values.iter().find(|(candidate, _)| *candidate == key) {
+            lines.push(format!("{key}={value}"));
+            written_keys.insert(key.to_string());
+        } else {
+            lines.push(line.to_string());
+        }
+    }
+
+    for (key, value) in values {
+        if !written_keys.contains(*key) {
+            lines.push(format!("{key}={value}"));
+        }
+    }
+
+    let mut contents = lines.join("\n");
+    if !contents.is_empty() {
+        contents.push('\n');
+    }
+    fs::write(path, contents)?;
+    Ok(())
+}
+
+fn remove_dotenv_keys(path: &Path, keys: &[&str]) -> Result<(), Box<dyn std::error::Error>> {
+    let existing = match fs::read_to_string(path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+
+    let retained = existing
+        .lines()
+        .filter(|line| {
+            dotenv_key_for_line(line)
+                .map(|key| !keys.contains(&key))
+                .unwrap_or(true)
+        })
+        .collect::<Vec<_>>();
+
+    if retained.is_empty() {
+        fs::remove_file(path)?;
+        return Ok(());
+    }
+
+    let mut contents = retained.join("\n");
+    contents.push('\n');
+    fs::write(path, contents)?;
+    Ok(())
+}
+
+fn dotenv_key_for_line(line: &str) -> Option<&str> {
+    let trimmed = line.trim();
+    if trimmed.is_empty() || trimmed.starts_with('#') {
+        return None;
+    }
+    let (raw_key, _) = trimmed.split_once('=')?;
+    let key = raw_key.trim();
+    let key = key.strip_prefix("export ").map_or(key, str::trim);
+    (!key.is_empty()).then_some(key)
+}
+
+#[cfg(unix)]
+fn restrict_file_permissions(path: &Path) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let mut permissions = fs::metadata(path)?.permissions();
+    permissions.set_mode(0o600);
+    fs::set_permissions(path, permissions)
+}
+
+#[cfg(not(unix))]
+fn restrict_file_permissions(_path: &Path) -> io::Result<()> {
+    Ok(())
+}
+
+fn apply_provider_setup_to_process(setup: &ProviderSetup) {
+    env::set_var("CLAW_ENDPOINT_TYPE", setup.protocol.endpoint_type());
+    env::set_var(setup.protocol.base_url_env(), &setup.base_url);
+    env::set_var(setup.protocol.api_key_env(), &setup.api_key);
+}
+
+fn clear_provider_setup_from_process() {
+    for key in [
+        "CLAW_ENDPOINT_TYPE",
+        "OPENAI_BASE_URL",
+        "OPENAI_API_KEY",
+        "ANTHROPIC_BASE_URL",
+        "ANTHROPIC_API_KEY",
+        "ANTHROPIC_AUTH_TOKEN",
+        "XAI_API_KEY",
+        "NVIDIA_API_KEY",
+        "DASHSCOPE_API_KEY",
+    ] {
+        env::remove_var(key);
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = env::args().skip(1).collect();
@@ -436,6 +935,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 None
             };
             let effective_prompt = merge_prompt_with_stdin(&prompt, stdin_context.as_deref());
+            let model = maybe_setup_provider(model)?;
             let mut cli = LiveCli::new(model, true, allowed_tools, permission_mode)?;
             cli.set_reasoning_effort(reasoning_effort);
             cli.run_turn_with_output(&effective_prompt, output_format, compact)?;
@@ -593,7 +1093,7 @@ enum CliAction {
     Init {
         output_format: CliOutputFormat,
     },
-    // #146: `claw config` and `claw diff` are pure-local read-only
+    // #146: `clawcli config` and `clawcli diff` are pure-local read-only
     // introspection commands; wire them as standalone CLI subcommands.
     Config {
         section: Option<String>,
@@ -641,7 +1141,7 @@ enum LocalHelpTopic {
     Doctor,
     Acp,
     // #141: extend the local-help pattern to every subcommand so
-    // `claw <subcommand> --help` has one consistent contract.
+    // `clawcli <subcommand> --help` has one consistent contract.
     Init,
     State,
     Export,
@@ -699,7 +1199,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                     && matches!(rest[0].as_str(), "prompt" | "commit" | "pr" | "issue") =>
             {
                 // `--help` following a subcommand that would otherwise forward
-                // the arg to the API (e.g. `claw prompt --help`) should show
+                // the arg to the API (e.g. `clawcli prompt --help`) should show
                 // top-level help instead. Subcommands that consume their own
                 // args (agents, mcp, plugins, skills) and local help-topic
                 // subcommands (status, sandbox, doctor, init, state, export,
@@ -932,8 +1432,8 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
             output_format,
         }),
         // #145: `plugins` was routed through the prompt fallback because no
-        // top-level parser arm produced CliAction::Plugins. That made `claw
-        // plugins` (and `claw plugins --help`, `claw plugins list`, ...)
+        // top-level parser arm produced CliAction::Plugins. That made `clawcli
+        // plugins` (and `clawcli plugins --help`, `clawcli plugins list`, ...)
         // attempt an Anthropic network call, surfacing the misleading error
         // `missing Anthropic credentials` even though the command is purely
         // local introspection. Mirror `agents`/`mcp`/`skills`: action is the
@@ -947,7 +1447,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
             let target = tail.get(1).cloned();
             if tail.len() > 2 {
                 return Err(format!(
-                    "unexpected extra arguments after `claw {} {}`: {}",
+                    "unexpected extra arguments after `clawcli {} {}`: {}",
                     rest[0],
                     tail[..2].join(" "),
                     tail[2..].join(" ")
@@ -962,7 +1462,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
         // #146: `config` is pure-local read-only introspection (merges
         // `.claw.json` + `.claw/settings.json` from disk, no network, no
         // state mutation). Previously callers had to spin up a session with
-        // `claw --resume SESSION.jsonl /config` to see their own config,
+        // `clawcli --resume SESSION.jsonl /config` to see their own config,
         // which is synthetic friction. Accepts an optional section name
         // (env|hooks|model|plugins) matching the slash command shape.
         "config" => {
@@ -970,7 +1470,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
             let section = tail.first().cloned();
             if tail.len() > 1 {
                 return Err(format!(
-                    "unexpected extra arguments after `claw config {}`: {}",
+                    "unexpected extra arguments after `clawcli config {}`: {}",
                     tail[0],
                     tail[1..].join(" ")
                 ));
@@ -985,19 +1485,19 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
         "diff" => {
             if rest.len() > 1 {
                 return Err(format!(
-                    "unexpected extra arguments after `claw diff`: {}",
+                    "unexpected extra arguments after `clawcli diff`: {}",
                     rest[1..].join(" ")
                 ));
             }
             Ok(CliAction::Diff { output_format })
         }
-        // `claw permissions <mode>` falls through to the LLM when called
+        // `clawcli permissions <mode>` falls through to the LLM when called
         // with a subcommand argument because parse_single_word_command_alias
         // only intercepts the bare single-word form. Catch all multi-word
         // forms here and return a structured guidance error so no network
         // call or session is created.
         "permissions" => Err(
-            "`claw permissions` is a slash command. Start `claw` and run `/permissions` inside the REPL.\n  Usage  /permissions [read-only|workspace-write|danger-full-access]".to_string()
+            "`clawcli permissions` is a slash command. Start `clawcli` and run `/permissions` inside the REPL.\n  Usage  /permissions [read-only|workspace-write|danger-full-access]".to_string()
         ),
         "skills" => {
             let args = join_optional_args(&rest[1..]);
@@ -1021,11 +1521,16 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
         }
         "system-prompt" => parse_system_prompt_args(&rest[1..], model, output_format),
         "acp" => parse_acp_args(&rest[1..], output_format),
-        "login" | "logout" => Err(removed_auth_surface_error(rest[0].as_str())),
+        "login" => Err(format!(
+            "`clawcli login` is an interactive command. Start `clawcli` and run /login inside the \
+             REPL to connect an API provider. For non-interactive setup, set OPENAI_API_KEY (with \
+             OPENAI_BASE_URL for a custom endpoint) or ANTHROPIC_API_KEY."
+        )),
+        "logout" => Err(removed_auth_surface_error(rest[0].as_str())),
         "init" => Ok(CliAction::Init { output_format }),
         "export" => parse_export_args(&rest[1..], output_format),
         "orchestrate" => {
-            // Usage: claw orchestrate [--worker-model <model>] <prompt…>
+            // Usage: clawcli orchestrate [--worker-model <model>] <prompt…>
             // Manager always uses the resolved `model` (default: gpt-oss-120b).
             // Worker defaults to the same model but can be overridden.
             let mut worker_model = model.clone();
@@ -1044,7 +1549,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
             let prompt = prompt_parts.join(" ");
             if prompt.trim().is_empty() {
                 return Err(
-                    "orchestrate requires a prompt. Usage: claw orchestrate <prompt>".to_string(),
+                    "orchestrate requires a prompt. Usage: clawcli orchestrate <prompt>".to_string(),
                 );
             }
             Ok(CliAction::Orchestrate {
@@ -1091,21 +1596,21 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                         message.push_str(&line);
                     }
                     message.push_str(
-                        "\nRun `claw --help` for the full list. If you meant to send a prompt literally, use `claw prompt <text>`.",
+                        "\nRun `clawcli --help` for the full list. If you meant to send a prompt literally, use `clawcli prompt <text>`.",
                     );
                     return Err(message);
                 }
             }
             // #147: guard empty/whitespace-only prompts at the fallthrough
             // path the same way `"prompt"` arm above does. Without this,
-            // `claw ""`, `claw "   "`, and `claw "" ""` silently route to
+            // `clawcli ""`, `clawcli "   "`, and `clawcli "" ""` silently route to
             // the Anthropic call and surface a misleading
             // `missing Anthropic credentials` error (or burn API tokens on
             // an empty prompt when credentials are present).
             let joined = rest.join(" ");
             if joined.trim().is_empty() {
                 return Err(
-                    "empty prompt: provide a subcommand (run `claw --help`) or a non-empty prompt string"
+                    "empty prompt: provide a subcommand (run `clawcli --help`) or a non-empty prompt string"
                         .to_string(),
                 );
             }
@@ -1246,11 +1751,11 @@ fn bare_slash_command_guidance(command_name: &str) -> Option<String> {
         .find(|spec| spec.name == command_name)?;
     let guidance = if slash_command.resume_supported {
         format!(
-            "`claw {command_name}` is a slash command. Use `claw --resume SESSION.jsonl /{command_name}` or start `claw` and run `/{command_name}`."
+            "`clawcli {command_name}` is a slash command. Use `clawcli --resume SESSION.jsonl /{command_name}` or start `clawcli` and run `/{command_name}`."
         )
     } else {
         format!(
-            "`claw {command_name}` is a slash command. Start `claw` and run `/{command_name}` inside the REPL."
+            "`clawcli {command_name}` is a slash command. Start `clawcli` and run `/{command_name}` inside the REPL."
         )
     };
     Some(guidance)
@@ -1258,7 +1763,7 @@ fn bare_slash_command_guidance(command_name: &str) -> Option<String> {
 
 fn removed_auth_surface_error(command_name: &str) -> String {
     format!(
-        "`claw {command_name}` has been removed. Set ANTHROPIC_API_KEY or ANTHROPIC_AUTH_TOKEN instead."
+        "`clawcli {command_name}` has been removed. Set ANTHROPIC_API_KEY or ANTHROPIC_AUTH_TOKEN instead."
     )
 }
 
@@ -1267,7 +1772,7 @@ fn parse_acp_args(args: &[String], output_format: CliOutputFormat) -> Result<Cli
         [] => Ok(CliAction::Acp { output_format }),
         [subcommand] if subcommand == "serve" => Ok(CliAction::Acp { output_format }),
         _ => Err(String::from(
-            "unsupported ACP invocation. Use `claw acp`, `claw acp serve`, `claw --acp`, or `claw -acp`.",
+            "unsupported ACP invocation. Use `clawcli acp`, `clawcli acp serve`, `clawcli --acp`, or `clawcli -acp`.",
         )),
     }
 }
@@ -1345,7 +1850,7 @@ fn parse_direct_slash_cli_action(
         Ok(Some(command)) => Err({
             let _ = command;
             format!(
-                "slash command {command_name} is interactive-only. Start `claw` and run it there, or use `claw --resume SESSION.jsonl {command_name}` / `claw --resume {latest} {command_name}` when the command is marked [resume] in /help.",
+                "slash command {command_name} is interactive-only. Start `clawcli` and run it there, or use `clawcli --resume SESSION.jsonl {command_name}` / `clawcli --resume {latest} {command_name}` when the command is marked [resume] in /help.",
                 command_name = rest[0],
                 latest = LATEST_SESSION_REFERENCE,
             )
@@ -1362,7 +1867,7 @@ fn format_unknown_option(option: &str) -> String {
         message.push_str(suggestion);
         message.push('?');
     }
-    message.push_str("\nRun `claw --help` for usage.");
+    message.push_str("\nRun `clawcli --help` for usage.");
     message
 }
 
@@ -1377,7 +1882,7 @@ fn format_unknown_direct_slash_command(name: &str) -> String {
         message.push('\n');
         message.push_str(note);
     }
-    message.push_str("\nRun `claw --help` for CLI usage, or start `claw` and use /help.");
+    message.push_str("\nRun `clawcli --help` for CLI usage, or start `clawcli` and use /help.");
     message
 }
 
@@ -1399,7 +1904,7 @@ fn format_unknown_slash_command(name: &str) -> String {
 fn omc_compatibility_note_for_unknown_slash_command(name: &str) -> Option<&'static str> {
     name.starts_with("oh-my-claudecode:")
         .then_some(
-            "Compatibility note: `/oh-my-claudecode:*` is a Claude Code/OMC plugin command. `claw` does not yet load plugin slash commands, Claude statusline stdin, or OMC session hooks.",
+            "Compatibility note: `/oh-my-claudecode:*` is a Claude Code/OMC plugin command. `clawcli` does not yet load plugin slash commands, Claude statusline stdin, or OMC session hooks.",
         )
 }
 
@@ -1695,8 +2200,8 @@ fn display_command_name() -> String {
     match current_launcher_name().as_deref() {
         Some(name) if name.eq_ignore_ascii_case("cliclaw") => "cliclaw".to_string(),
         Some(name) if name.eq_ignore_ascii_case("cli797") => "cli797".to_string(),
-        Some(name) if name.eq_ignore_ascii_case("claw") => "claw".to_string(),
-        _ => "claw".to_string(),
+        Some(name) if name.eq_ignore_ascii_case("clawcli") => "clawcli".to_string(),
+        _ => "clawcli".to_string(),
     }
 }
 
@@ -1778,7 +2283,7 @@ fn provider_label(kind: ProviderKind) -> &'static str {
 
 fn format_connected_line(model: &str) -> String {
     let provider = provider_label(detect_provider_kind(model));
-    format!("Connected: {model} via {provider}")
+    format!("Ready · {model} via {provider}")
 }
 
 fn filter_tool_specs(
@@ -2168,7 +2673,7 @@ fn run_doctor(output_format: CliOutputFormat) -> Result<(), Box<dyn std::error::
     Ok(())
 }
 
-/// Starts a minimal Model Context Protocol server that exposes claw's
+/// Starts a minimal Model Context Protocol server that exposes clawcli's
 /// built-in tools over stdio.
 ///
 /// Tool descriptors come from [`tools::mvp_tool_specs`] and calls are
@@ -2183,18 +2688,18 @@ fn run_worker_state(output_format: CliOutputFormat) -> Result<(), Box<dyn std::e
     if !state_path.exists() {
         // #139: this error used to say "run a worker first" without telling
         // callers how to run one. "worker" is an internal concept (there is
-        // no `claw worker` subcommand), so claws/CI had no discoverable path
+        // no `clawcli worker` subcommand), so claws/CI had no discoverable path
         // from the error to a fix. Emit an actionable, structured error that
         // names the two concrete commands that produce worker state.
         //
         // Format in both text and JSON modes is stable so scripts can match:
         //   error: no worker state file found at <path>
         //     Hint: worker state is written by the interactive REPL or a non-interactive prompt.
-        //     Run:   claw               # start the REPL (writes state on first turn)
-        //     Or:    claw prompt <text> # run one non-interactive turn
-        //     Then rerun: claw state [--output-format json]
+        //     Run:   clawcli               # start the REPL (writes state on first turn)
+        //     Or:    clawcli prompt <text> # run one non-interactive turn
+        //     Then rerun: clawcli state [--output-format json]
         return Err(format!(
-            "no worker state file found at {path}\n  Hint: worker state is written by the interactive REPL or a non-interactive prompt.\n  Run:   claw               # start the REPL (writes state on first turn)\n  Or:    claw prompt <text> # run one non-interactive turn\n  Then rerun: claw state [--output-format json]",
+            "no worker state file found at {path}\n  Hint: worker state is written by the interactive REPL or a non-interactive prompt.\n  Run:   clawcli               # start the REPL (writes state on first turn)\n  Or:    clawcli prompt <text> # run one non-interactive turn\n  Then rerun: clawcli state [--output-format json]",
             path = state_path.display()
         )
         .into());
@@ -2225,7 +2730,7 @@ fn run_mcp_serve() -> Result<(), Box<dyn std::error::Error>> {
         .collect();
 
     let spec = McpServerSpec {
-        server_name: "claw".to_string(),
+        server_name: "clawcli".to_string(),
         server_version: VERSION.to_string(),
         tools,
         tool_handler: Box::new(execute_tool),
@@ -2243,32 +2748,54 @@ fn run_mcp_serve() -> Result<(), Box<dyn std::error::Error>> {
 
 #[allow(clippy::too_many_lines)]
 fn check_auth_health() -> DiagnosticCheck {
-    let api_key_present = env::var("ANTHROPIC_API_KEY")
-        .ok()
-        .is_some_and(|value| !value.trim().is_empty());
-    let auth_token_present = env::var("ANTHROPIC_AUTH_TOKEN")
-        .ok()
-        .is_some_and(|value| !value.trim().is_empty());
+    let api_key_present = api::has_api_key("ANTHROPIC_API_KEY");
+    let auth_token_present = api::has_api_key("ANTHROPIC_AUTH_TOKEN");
+    let openai_api_key_present = api::has_api_key("OPENAI_API_KEY");
+    let xai_api_key_present = api::has_api_key("XAI_API_KEY");
+    let nvidia_api_key_present = api::has_api_key("NVIDIA_API_KEY");
+    let dashscope_api_key_present = api::has_api_key("DASHSCOPE_API_KEY");
+    let credentials_present = api_key_present
+        || auth_token_present
+        || openai_api_key_present
+        || xai_api_key_present
+        || nvidia_api_key_present
+        || dashscope_api_key_present;
     let env_details = format!(
-        "Environment       api_key={} auth_token={}",
+        "Environment       anthropic_api_key={} auth_token={} openai_api_key={} xai_api_key={} nvidia_api_key={} dashscope_api_key={}",
         if api_key_present { "present" } else { "absent" },
         if auth_token_present {
             "present"
         } else {
             "absent"
-        }
+        },
+        if openai_api_key_present {
+            "present"
+        } else {
+            "absent"
+        },
+        if xai_api_key_present { "present" } else { "absent" },
+        if nvidia_api_key_present {
+            "present"
+        } else {
+            "absent"
+        },
+        if dashscope_api_key_present {
+            "present"
+        } else {
+            "absent"
+        },
     );
 
     match load_oauth_credentials() {
         Ok(Some(token_set)) => DiagnosticCheck::new(
             "Auth",
-            if api_key_present || auth_token_present {
+            if credentials_present {
                 DiagnosticLevel::Ok
             } else {
                 DiagnosticLevel::Warn
             },
-            if api_key_present || auth_token_present {
-                "supported auth env vars are configured; legacy saved OAuth is ignored"
+            if credentials_present {
+                "supported API credentials are configured; legacy saved OAuth is ignored"
             } else {
                 "legacy saved OAuth credentials are present but unsupported"
             },
@@ -2291,12 +2818,26 @@ fn check_auth_health() -> DiagnosticCheck {
                     token_set.scopes.join(",")
                 }
             ),
-            "Suggested action  set ANTHROPIC_API_KEY or ANTHROPIC_AUTH_TOKEN; `claw login` is removed"
+            "Suggested action  run `clawcli` to configure an endpoint, or set a supported API credential"
                 .to_string(),
         ])
         .with_data(Map::from_iter([
             ("api_key_present".to_string(), json!(api_key_present)),
             ("auth_token_present".to_string(), json!(auth_token_present)),
+            (
+                "openai_api_key_present".to_string(),
+                json!(openai_api_key_present),
+            ),
+            ("xai_api_key_present".to_string(), json!(xai_api_key_present)),
+            (
+                "nvidia_api_key_present".to_string(),
+                json!(nvidia_api_key_present),
+            ),
+            (
+                "dashscope_api_key_present".to_string(),
+                json!(dashscope_api_key_present),
+            ),
+            ("credentials_present".to_string(), json!(credentials_present)),
             ("legacy_saved_oauth_present".to_string(), json!(true)),
             (
                 "legacy_saved_oauth_expires_at".to_string(),
@@ -2310,21 +2851,35 @@ fn check_auth_health() -> DiagnosticCheck {
         ])),
         Ok(None) => DiagnosticCheck::new(
             "Auth",
-            if api_key_present || auth_token_present {
+            if credentials_present {
                 DiagnosticLevel::Ok
             } else {
                 DiagnosticLevel::Warn
             },
-            if api_key_present || auth_token_present {
-                "supported auth env vars are configured"
+            if credentials_present {
+                "supported API credentials are configured"
             } else {
-                "no supported auth env vars were found"
+                "no supported API credentials were found"
             },
         )
         .with_details(vec![env_details])
         .with_data(Map::from_iter([
             ("api_key_present".to_string(), json!(api_key_present)),
             ("auth_token_present".to_string(), json!(auth_token_present)),
+            (
+                "openai_api_key_present".to_string(),
+                json!(openai_api_key_present),
+            ),
+            ("xai_api_key_present".to_string(), json!(xai_api_key_present)),
+            (
+                "nvidia_api_key_present".to_string(),
+                json!(nvidia_api_key_present),
+            ),
+            (
+                "dashscope_api_key_present".to_string(),
+                json!(dashscope_api_key_present),
+            ),
+            ("credentials_present".to_string(), json!(credentials_present)),
             ("legacy_saved_oauth_present".to_string(), json!(false)),
             ("legacy_saved_oauth_expires_at".to_string(), Value::Null),
             ("legacy_refresh_token_present".to_string(), json!(false)),
@@ -2338,6 +2893,20 @@ fn check_auth_health() -> DiagnosticCheck {
         .with_data(Map::from_iter([
             ("api_key_present".to_string(), json!(api_key_present)),
             ("auth_token_present".to_string(), json!(auth_token_present)),
+            (
+                "openai_api_key_present".to_string(),
+                json!(openai_api_key_present),
+            ),
+            ("xai_api_key_present".to_string(), json!(xai_api_key_present)),
+            (
+                "nvidia_api_key_present".to_string(),
+                json!(nvidia_api_key_present),
+            ),
+            (
+                "dashscope_api_key_present".to_string(),
+                json!(dashscope_api_key_present),
+            ),
+            ("credentials_present".to_string(), json!(credentials_present)),
             ("legacy_saved_oauth_present".to_string(), Value::Null),
             ("legacy_saved_oauth_expires_at".to_string(), Value::Null),
             ("legacy_refresh_token_present".to_string(), Value::Null),
@@ -2453,7 +3022,7 @@ fn check_install_source_health() -> DiagnosticCheck {
         "Recommended path  build from this repo or use the upstream binary documented in README.md"
             .to_string(),
         format!(
-            "Deprecated crate  `{DEPRECATED_INSTALL_COMMAND}` installs a deprecated stub and does not provide the `claw` binary"
+            "Deprecated crate  `{DEPRECATED_INSTALL_COMMAND}` installs a deprecated stub and does not provide the `clawcli` binary"
         )
             .to_string(),
     ])
@@ -2667,7 +3236,7 @@ fn dump_manifests(
 }
 
 const DUMP_MANIFESTS_OVERRIDE_HINT: &str =
-    "Hint: set CLAUDE_CODE_UPSTREAM=/path/to/upstream or pass `claw dump-manifests --manifests-dir /path/to/upstream`.";
+    "Hint: set CLAUDE_CODE_UPSTREAM=/path/to/upstream or pass `clawcli dump-manifests --manifests-dir /path/to/upstream`.";
 
 // Internal function for testing that accepts a workspace directory path.
 fn dump_manifests_at_path(
@@ -3554,7 +4123,7 @@ fn run_resume_command(
             Ok(ResumeCommandOutcome {
                 session: cleared,
                 message: Some(format!(
-                    "Session cleared\n  Mode             resumed session reset\n  Previous session {previous_session_id}\n  Backup           {}\n  Resume previous  claw --resume {}\n  New session      {new_session_id}\n  Session file     {}",
+                    "Session cleared\n  Mode             resumed session reset\n  Previous session {previous_session_id}\n  Backup           {}\n  Resume previous  clawcli --resume {}\n  New session      {new_session_id}\n  Session file     {}",
                     backup_path.display(),
                     backup_path.display(),
                     session_path.display()
@@ -3716,7 +4285,7 @@ fn run_resume_command(
         SlashCommand::Skills { args } => {
             if let SkillSlashDispatch::Invoke(_) = classify_skills_slash_command(args.as_deref()) {
                 return Err(
-                    "resumed /skills invocations are interactive-only; start `claw` and run `/skills <skill>` in the REPL".into(),
+                    "resumed /skills invocations are interactive-only; start `clawcli` and run `/skills <skill>` in the REPL".into(),
                 );
             }
             let cwd = env::current_dir()?;
@@ -3732,7 +4301,7 @@ fn run_resume_command(
                 action.as_deref()
             {
                 return Err(
-                    "resumed /plugins mutations are interactive-only; start `claw` and run `/plugins` in the REPL".into(),
+                    "resumed /plugins mutations are interactive-only; start `clawcli` and run `/plugins` in the REPL".into(),
                 );
             }
             let cwd = env::current_dir()?;
@@ -3919,9 +4488,9 @@ fn enforce_broad_cwd_policy(
     if is_interactive {
         // Interactive mode: print warning and ask for confirmation
         eprintln!(
-            "Warning: claw is running from a very broad directory ({}).\n\
+            "Warning: clawcli is running from a very broad directory ({}).\n\
              The agent can read and search everything under this path.\n\
-             Consider running from inside your project: cd /path/to/project && claw",
+             Consider running from inside your project: cd /path/to/project && clawcli",
             cwd.display()
         );
         eprint!("Continue anyway? [y/N]: ");
@@ -3938,10 +4507,10 @@ fn enforce_broad_cwd_policy(
     } else {
         // Non-interactive mode: exit with error (JSON or text)
         let message = format!(
-            "claw is running from a very broad directory ({}). \
+            "clawcli is running from a very broad directory ({}). \
              The agent can read and search everything under this path. \
              Use --allow-broad-cwd to proceed anyway, \
-             or run from inside your project: cd /path/to/project && claw",
+             or run from inside your project: cd /path/to/project && clawcli",
             cwd.display()
         );
         match output_format {
@@ -3984,13 +4553,21 @@ fn run_repl(
 ) -> Result<(), Box<dyn std::error::Error>> {
     enforce_broad_cwd_policy(allow_broad_cwd, CliOutputFormat::Text)?;
     run_stale_base_preflight(base_commit.as_deref());
+    // The REPL boots credential-free. Provider setup happens on demand via
+    // `/login` (or before the first message that needs the model). The
+    // `LiveCli` constructor builds a placeholder client when no credentials
+    // are present, so this never blocks on a setup wizard.
     let resolved_model = resolve_repl_model(model);
     let mut cli = LiveCli::new(resolved_model, true, allowed_tools, permission_mode)?;
     cli.set_reasoning_effort(reasoning_effort);
     let mut editor =
-        input::LineEditor::new("> ", cli.repl_completion_candidates().unwrap_or_default());
-    println!("{}", cli.startup_banner());
-    println!("{}", format_connected_line(&cli.model));
+        input::LineEditor::new("› ", cli.repl_completion_candidates().unwrap_or_default());
+    if cli.is_connected() {
+        println!("{}", cli.startup_banner());
+        println!("{}", format_connected_line(&cli.model));
+    } else {
+        println!("{}", cli.disconnected_startup_banner());
+    }
 
     loop {
         editor.set_completions(cli.repl_completion_candidates().unwrap_or_default());
@@ -4587,6 +5164,96 @@ impl LiveCli {
         }
     }
 
+    /// Whether the live runtime has real credentials configured. False until
+    /// `/login` runs (or credentials were present at boot).
+    fn is_connected(&self) -> bool {
+        self.runtime
+            .runtime
+            .as_ref()
+            .map_or(true, |rt| !rt.api_client().needs_credentials())
+    }
+
+    /// Run the interactive provider setup wizard (`/login`), persist the
+    /// result, and rebuild the live runtime against the new credentials so
+    /// subsequent turns use them immediately. Mirrors `set_model`'s rebuild
+    /// flow so the in-memory session is preserved across the switch.
+    fn run_login(&mut self) -> Result<bool, Box<dyn std::error::Error>> {
+        if !interactive_setup_available() {
+            eprintln!(
+                "{NEEDS_LOGIN_HINT} For non-interactive setup, set OPENAI_API_KEY (with \
+                 OPENAI_BASE_URL for a custom endpoint) or ANTHROPIC_API_KEY before starting."
+            );
+            return Ok(false);
+        }
+        let preferred_model = self.model.clone();
+        let setup = prompt_for_provider_setup(&preferred_model)?;
+        let cwd = env::current_dir()?;
+        let config_home = ConfigLoader::default_for(cwd).config_home().to_path_buf();
+        persist_provider_setup(&config_home, &setup)?;
+        apply_provider_setup_to_process(&setup);
+
+        // Rebuild the runtime against the now-configured credentials. The
+        // model may have changed during setup, so thread it through like
+        // `/model` does and refresh the system prompt.
+        let session = self.runtime.session().clone();
+        let system_prompt = build_system_prompt(&setup.model)?;
+        let runtime = build_runtime(
+            session,
+            &self.session.id,
+            setup.model.clone(),
+            system_prompt.clone(),
+            true,
+            true,
+            self.allowed_tools.clone(),
+            self.permission_mode,
+            None,
+        )?;
+        self.replace_runtime(runtime)?;
+        self.system_prompt = system_prompt;
+        self.model = setup.model.clone();
+        println!();
+        println!(
+            "Saved {} connection for model `{}`.",
+            setup.protocol.display_name(),
+            setup.model
+        );
+        println!(
+            "Credentials are stored in {} and the model in {}/settings.json.",
+            config_home.join(".env").display(),
+            config_home.display()
+        );
+        println!("{}", format_connected_line(&self.model));
+        Ok(true)
+    }
+
+    fn run_logout(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        let cwd = env::current_dir()?;
+        let config_home = ConfigLoader::default_for(cwd).config_home().to_path_buf();
+        clear_provider_setup(&config_home)?;
+        clear_provider_setup_from_process();
+
+        let session = self.runtime.session().clone();
+        let system_prompt = build_system_prompt(&self.model)?;
+        let runtime = build_runtime(
+            session,
+            &self.session.id,
+            self.model.clone(),
+            system_prompt.clone(),
+            true,
+            true,
+            self.allowed_tools.clone(),
+            self.permission_mode,
+            None,
+        )?;
+        self.replace_runtime(runtime)?;
+        self.system_prompt = system_prompt;
+
+        println!();
+        println!("Logged out.");
+        println!("{}", self.disconnected_startup_banner());
+        Ok(())
+    }
+
     fn startup_banner(&self) -> String {
         let cwd = env::current_dir().map_or_else(
             |_| "<unknown>".to_string(),
@@ -4606,13 +5273,7 @@ impl LiveCli {
             |path| path.display().to_string(),
         );
         format!(
-            "\x1b[38;5;196m\
- ██████╗██╗      █████╗ ██╗    ██╗\n\
-██╔════╝██║     ██╔══██╗██║    ██║\n\
-██║     ██║     ███████║██║ █╗ ██║\n\
-██║     ██║     ██╔══██║██║███╗██║\n\
-╚██████╗███████╗██║  ██║╚███╔███╔╝\n\
- ╚═════╝╚══════╝╚═╝  ╚═╝ ╚══╝╚══╝\x1b[0m \x1b[38;5;208mCode\x1b[0m 🦞\n\n\
+            "\x1b[1mClaw Code\x1b[0m\n\
   \x1b[2mModel\x1b[0m            {}\n\
   \x1b[2mPermissions\x1b[0m      {}\n\
   \x1b[2mBranch\x1b[0m           {}\n\
@@ -4620,7 +5281,7 @@ impl LiveCli {
   \x1b[2mDirectory\x1b[0m        {}\n\
   \x1b[2mSession\x1b[0m          {}\n\
   \x1b[2mAuto-save\x1b[0m        {}\n\n\
-  Type \x1b[1m/help\x1b[0m for commands · \x1b[1m/status\x1b[0m for live context · \x1b[2m/resume latest\x1b[0m jumps back to the newest session · \x1b[1m/diff\x1b[0m then \x1b[1m/commit\x1b[0m to ship · \x1b[2mTab\x1b[0m for workflow completions · \x1b[2mShift+Enter\x1b[0m for newline",
+  \x1b[2m/help\x1b[0m commands · \x1b[2m/status\x1b[0m context · \x1b[2m/resume latest\x1b[0m restore · \x1b[2mTab\x1b[0m completes commands, models, sessions, and paths · \x1b[2mShift+Enter\x1b[0m newline",
             self.model,
             self.permission_mode.as_str(),
             git_branch,
@@ -4629,6 +5290,10 @@ impl LiveCli {
             self.session.id,
             session_path,
         )
+    }
+
+    fn disconnected_startup_banner(&self) -> String {
+        format!("{}\n{NEEDS_LOGIN_HINT}", self.startup_banner())
     }
 
     fn repl_completion_candidates(&self) -> Result<Vec<String>, Box<dyn std::error::Error>> {
@@ -4805,7 +5470,7 @@ impl LiveCli {
         let mut spinner = Spinner::new();
         let mut stdout = io::stdout();
         spinner.tick(
-            "🦀 Thinking...",
+            "Thinking…",
             TerminalRenderer::new().color_theme(),
             &mut stdout,
         )?;
@@ -5066,9 +5731,15 @@ impl LiveCli {
                 println!("{}", format_cost_report(usage));
                 false
             }
-            SlashCommand::Login
-            | SlashCommand::Logout
-            | SlashCommand::Vim
+            SlashCommand::Login => {
+                self.run_login()?;
+                false
+            }
+            SlashCommand::Logout => {
+                self.run_logout()?;
+                false
+            }
+            SlashCommand::Vim
             | SlashCommand::Upgrade
             | SlashCommand::Share
             | SlashCommand::Feedback
@@ -5406,7 +6077,7 @@ impl LiveCli {
         args: Option<&str>,
         output_format: CliOutputFormat,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        // `claw mcp serve` starts a stdio MCP server exposing claw's built-in
+        // `clawcli mcp serve` starts a stdio MCP server exposing clawcli's built-in
         // tools. All other `mcp` subcommands fall through to the existing
         // configured-server reporter (`list`, `status`, ...).
         if matches!(args.map(str::trim), Some("serve")) {
@@ -6123,7 +6794,7 @@ fn status_context(
     let loader = ConfigLoader::default_for(&cwd);
     let discovered_config_files = loader.discover().len();
     // #143: degrade gracefully on config parse failure rather than hard-fail.
-    // `claw doctor` already does this; `claw status` now matches that contract
+    // `clawcli doctor` already does this; `clawcli status` now matches that contract
     // so that one malformed `mcpServers.*` entry doesn't take down the whole
     // health surface (workspace, git, model, permission, sandbox can still be
     // reported independently).
@@ -6185,7 +6856,7 @@ fn format_status_report(
     let mut blocks: Vec<String> = Vec::new();
     if let Some(err) = context.config_load_error.as_deref() {
         blocks.push(format!(
-            "Config load error\n  Status           fail\n  Summary          runtime config failed to load; reporting partial status\n  Details          {err}\n  Hint             `claw doctor` classifies config parse errors; fix the listed field and rerun"
+            "Config load error\n  Status           fail\n  Summary          runtime config failed to load; reporting partial status\n  Details          {err}\n  Hint             `clawcli doctor` classifies config parse errors; fix the listed field and rerun"
         ));
     }
     // #148: render Model source line after Model, showing where the string
@@ -6366,85 +7037,85 @@ fn sandbox_json_value(status: &runtime::SandboxStatus) -> serde_json::Value {
 fn render_help_topic(topic: LocalHelpTopic) -> String {
     match topic {
         LocalHelpTopic::Status => "Status
-  Usage            claw status [--output-format <format>]
+  Usage            clawcli status [--output-format <format>]
   Purpose          show the local workspace snapshot without entering the REPL
   Output           model, permissions, git state, config files, and sandbox status
   Formats          text (default), json
-  Related          /status · claw --resume latest /status"
+  Related          /status · clawcli --resume latest /status"
             .to_string(),
         LocalHelpTopic::Sandbox => "Sandbox
-  Usage            claw sandbox [--output-format <format>]
+  Usage            clawcli sandbox [--output-format <format>]
   Purpose          inspect the resolved sandbox and isolation state for the current directory
   Output           namespace, network, filesystem, and fallback details
   Formats          text (default), json
-  Related          /sandbox · claw status"
+  Related          /sandbox · clawcli status"
             .to_string(),
         LocalHelpTopic::Doctor => "Doctor
-  Usage            claw doctor [--output-format <format>]
+  Usage            clawcli doctor [--output-format <format>]
   Purpose          diagnose local auth, config, workspace, sandbox, and build metadata
   Output           local-only health report; no provider request or session resume required
   Formats          text (default), json
-  Related          /doctor · claw --resume latest /doctor"
+  Related          /doctor · clawcli --resume latest /doctor"
             .to_string(),
         LocalHelpTopic::Acp => "ACP / Zed
-  Usage            claw acp [serve] [--output-format <format>]
-  Aliases          claw --acp · claw -acp
+  Usage            clawcli acp [serve] [--output-format <format>]
+  Aliases          clawcli --acp · clawcli -acp
   Purpose          explain the current editor-facing ACP/Zed launch contract without starting the runtime
   Status           discoverability only; `serve` is a status alias and does not launch a daemon yet
   Formats          text (default), json
-  Related          ROADMAP #64a (discoverability) · ROADMAP #76 (real ACP support) · claw --help"
+  Related          ROADMAP #64a (discoverability) · ROADMAP #76 (real ACP support) · clawcli --help"
             .to_string(),
         LocalHelpTopic::Init => "Init
-  Usage            claw init [--output-format <format>]
+  Usage            clawcli init [--output-format <format>]
   Purpose          create .claw/, .claw.json, .gitignore, and CLAUDE.md in the current project
   Output           list of created vs. skipped files (idempotent: safe to re-run)
   Formats          text (default), json
-  Related          claw status · claw doctor"
+  Related          clawcli status · clawcli doctor"
             .to_string(),
         LocalHelpTopic::State => "State
-  Usage            claw state [--output-format <format>]
+  Usage            clawcli state [--output-format <format>]
   Purpose          read .claw/worker-state.json written by the interactive REPL or a one-shot prompt
   Output           worker id, model, permissions, session reference (text or json)
   Formats          text (default), json
-  Produces state   `claw` (interactive REPL) or `claw prompt <text>` (one non-interactive turn)
-  Observes state   `claw state` reads; clawhip/CI may poll this file without HTTP
+  Produces state   `clawcli` (interactive REPL) or `clawcli prompt <text>` (one non-interactive turn)
+  Observes state   `clawcli state` reads; clawhip/CI may poll this file without HTTP
   Exit codes       0 if state file exists and parses; 1 with actionable hint otherwise
-  Related          claw status · ROADMAP #139 (this worker-concept contract)"
+  Related          clawcli status · ROADMAP #139 (this worker-concept contract)"
             .to_string(),
         LocalHelpTopic::Export => "Export
-  Usage            claw export [--session <id|latest>] [--output <path>] [--output-format <format>]
+  Usage            clawcli export [--session <id|latest>] [--output <path>] [--output-format <format>]
   Purpose          serialize a managed session to JSON for review, transfer, or archival
   Defaults         --session latest (most recent managed session in .claw/sessions/)
   Formats          text (default), json
-  Related          /session list · claw --resume latest"
+  Related          /session list · clawcli --resume latest"
             .to_string(),
         LocalHelpTopic::Version => "Version
-  Usage            claw version [--output-format <format>]
-  Aliases          claw --version · claw -V
-  Purpose          print the claw CLI version and build metadata
+  Usage            clawcli version [--output-format <format>]
+  Aliases          clawcli --version · clawcli -V
+  Purpose          print the clawcli CLI version and build metadata
   Formats          text (default), json
-  Related          claw doctor (full build/auth/config diagnostic)"
+  Related          clawcli doctor (full build/auth/config diagnostic)"
             .to_string(),
         LocalHelpTopic::SystemPrompt => "System Prompt
-  Usage            claw system-prompt [--cwd <path>] [--date YYYY-MM-DD] [--output-format <format>]
-  Purpose          render the resolved system prompt that `claw` would send for the given cwd + date
+  Usage            clawcli system-prompt [--cwd <path>] [--date YYYY-MM-DD] [--output-format <format>]
+  Purpose          render the resolved system prompt that `clawcli` would send for the given cwd + date
   Options          --cwd overrides the workspace dir · --date injects a deterministic date stamp
   Formats          text (default), json
-  Related          claw doctor · claw dump-manifests"
+  Related          clawcli doctor · clawcli dump-manifests"
             .to_string(),
         LocalHelpTopic::DumpManifests => "Dump Manifests
-  Usage            claw dump-manifests [--manifests-dir <path>] [--output-format <format>]
+  Usage            clawcli dump-manifests [--manifests-dir <path>] [--output-format <format>]
   Purpose          emit every skill/agent/tool manifest the resolver would load for the current cwd
   Options          --manifests-dir scopes discovery to a specific directory
   Formats          text (default), json
-  Related          claw skills · claw agents · claw doctor"
+  Related          clawcli skills · clawcli agents · clawcli doctor"
             .to_string(),
         LocalHelpTopic::BootstrapPlan => "Bootstrap Plan
-  Usage            claw bootstrap-plan [--output-format <format>]
+  Usage            clawcli bootstrap-plan [--output-format <format>]
   Purpose          list the ordered startup phases the CLI would execute before dispatch
   Output           phase names (text) or structured phase list (json) — primary output is the plan itself
   Formats          text (default), json
-  Related          claw doctor · claw status"
+  Related          clawcli doctor · clawcli status"
             .to_string(),
     }
 }
@@ -6470,7 +7141,7 @@ fn render_export_help_json() -> serde_json::Value {
         "kind": "help",
         "topic": "export",
         "command": "export",
-        "usage": "claw export [--session <id|latest>] [--output <path>] [--output-format <format>]",
+        "usage": "clawcli export [--session <id|latest>] [--output <path>] [--output-format <format>]",
         "purpose": "serialize a managed session to JSON for review, transfer, or archival",
         "defaults": {
             "session": LATEST_SESSION_REFERENCE,
@@ -6504,7 +7175,7 @@ fn render_export_help_json() -> serde_json::Value {
                 "description": "show help for the export command"
             }
         ],
-        "related": ["/session list", "claw --resume latest"]
+        "related": ["/session list", "clawcli --resume latest"]
     })
 }
 
@@ -6536,11 +7207,11 @@ fn print_help_topic(
 }
 
 fn print_acp_status(output_format: CliOutputFormat) -> Result<(), Box<dyn std::error::Error>> {
-    let message = "ACP/Zed editor integration is not implemented in claw-code yet. `claw acp serve` is only a discoverability alias today; it does not launch a daemon or Zed-specific protocol endpoint. Use the normal terminal surfaces for now and track ROADMAP #76 for real ACP support.";
+    let message = "ACP/Zed editor integration is not implemented in claw-code yet. `clawcli acp serve` is only a discoverability alias today; it does not launch a daemon or Zed-specific protocol endpoint. Use the normal terminal surfaces for now and track ROADMAP #76 for real ACP support.";
     match output_format {
         CliOutputFormat::Text => {
             println!(
-                "ACP / Zed\n  Status           discoverability only\n  Launch           `claw acp serve` / `claw --acp` / `claw -acp` report status only; no editor daemon is available yet\n  Today            use `claw prompt`, the REPL, or `claw doctor` for local verification\n  Tracking         ROADMAP #76\n  Message          {message}"
+                "ACP / Zed\n  Status           discoverability only\n  Launch           `clawcli acp serve` / `clawcli --acp` / `clawcli -acp` report status only; no editor daemon is available yet\n  Today            use `clawcli prompt`, the REPL, or `clawcli doctor` for local verification\n  Tracking         ROADMAP #76\n  Message          {message}"
             );
         }
         CliOutputFormat::Json => {
@@ -6557,9 +7228,9 @@ fn print_acp_status(output_format: CliOutputFormat) -> Result<(), Box<dyn std::e
                     "discoverability_tracking": "ROADMAP #64a",
                     "tracking": "ROADMAP #76",
                     "recommended_workflows": [
-                        "claw prompt TEXT",
-                        "claw",
-                        "claw doctor"
+                        "clawcli prompt TEXT",
+                        "clawcli",
+                        "clawcli doctor"
                     ],
                 }))?
             );
@@ -8157,6 +8828,11 @@ impl runtime::PermissionPrompter for CliPermissionPrompter {
 struct AnthropicRuntimeClient {
     runtime: tokio::runtime::Runtime,
     client: ApiProviderClient,
+    // True when the client was built without real credentials (the REPL
+    // boots credential-free and asks the user to run `/login`). The first
+    // request against a client built this way returns a clear error instead
+    // of being sent with empty auth.
+    needs_credentials: bool,
     session_id: String,
     model: String,
     enable_tools: bool,
@@ -8192,17 +8868,23 @@ impl AnthropicRuntimeClient {
         // reads `ANTHROPIC_BASE_URL` and is required for the local
         // mock-server test harness
         // (`crates/rusty-claude-cli/tests/compact_output.rs`) to point
-        // claw at its fake Anthropic endpoint. We also attach a
+        // clawcli at its fake Anthropic endpoint. We also attach a
         // session-scoped prompt cache on the Anthropic path; the
         // prompt cache is Anthropic-only so non-Anthropic variants
         // skip it.
         let resolved_model = api::resolve_model_alias(&model);
-        let client = match detect_provider_kind(&resolved_model) {
+        let provider_kind = detect_provider_kind(&resolved_model);
+        let has_credentials = credentials_present_for_kind(provider_kind);
+        let client = match provider_kind {
             ProviderKind::Anthropic => {
-                let auth = resolve_cli_auth_source()?;
-                let inner = AnthropicClient::from_auth(auth)
-                    .with_base_url(api::read_base_url())
-                    .with_prompt_cache(PromptCache::new(session_id));
+                // Fall back to `AuthSource::None` when no credentials are
+                // present so the REPL can boot credential-free. The request
+                // path returns a clear "run /login" error before sending.
+                let inner = AnthropicClient::from_auth(
+                    resolve_cli_auth_source().unwrap_or(AuthSource::None),
+                )
+                .with_base_url(api::read_base_url())
+                .with_prompt_cache(PromptCache::new(session_id));
                 ApiProviderClient::Anthropic(inner)
             }
             ProviderKind::Xai | ProviderKind::OpenAi | ProviderKind::NvidiaNim => {
@@ -8215,12 +8897,22 @@ impl AnthropicRuntimeClient {
                 // override internally, so this one call covers OpenAI,
                 // OpenRouter, xAI, DashScope, NVIDIA NIM, Ollama, and any
                 // other OpenAI-compat endpoint users configure via env vars.
-                ApiProviderClient::from_model_with_anthropic_auth(&resolved_model, None)?
+                //
+                // When credentials are missing, `from_env` errors; construct
+                // a placeholder OpenAI-compat client directly so the REPL
+                // boots credential-free and the request path surfaces the
+                // "run /login" error instead.
+                if has_credentials {
+                    ApiProviderClient::from_model_with_anthropic_auth(&resolved_model, None)?
+                } else {
+                    ApiProviderClient::OpenAi(openai_compat_placeholder_client(&resolved_model))
+                }
             }
         };
         Ok(Self {
             runtime: tokio::runtime::Runtime::new()?,
             client,
+            needs_credentials: !has_credentials,
             session_id: session_id.to_string(),
             model,
             enable_tools,
@@ -8235,6 +8927,14 @@ impl AnthropicRuntimeClient {
     fn set_reasoning_effort(&mut self, effort: Option<String>) {
         self.reasoning_effort = effort;
     }
+
+    /// True when this client was built without real credentials. The REPL
+    /// surfaces a "run /login" hint instead of a "Ready" line while this is
+    /// set; `/login` rebuilds the runtime with a real client and clears it.
+    #[must_use]
+    fn needs_credentials(&self) -> bool {
+        self.needs_credentials
+    }
 }
 
 fn resolve_cli_auth_source() -> Result<AuthSource, Box<dyn std::error::Error>> {
@@ -8246,9 +8946,38 @@ fn resolve_cli_auth_source_for_cwd() -> Result<AuthSource, api::ApiError> {
     resolve_startup_auth_source(|| Ok(None))
 }
 
+/// Whether real credentials exist for a provider *kind* (independent of any
+/// model name). The REPL boots credential-free and prompts for `/login`, so
+/// `AnthropicRuntimeClient::new` uses this to decide between a real client
+/// and a placeholder that surfaces a "run /login" error at request time.
+fn credentials_present_for_kind(kind: ProviderKind) -> bool {
+    match kind {
+        ProviderKind::Anthropic => api::resolve_startup_auth_source(|| Ok(None)).is_ok(),
+        ProviderKind::Xai => api::has_api_key("XAI_API_KEY"),
+        ProviderKind::NvidiaNim => api::has_api_key("NVIDIA_API_KEY"),
+        ProviderKind::OpenAi => api::has_api_key("OPENAI_API_KEY"),
+    }
+}
+
+/// Build a placeholder OpenAI-compatible client for the credential-free boot
+/// path. It carries an empty key; the first request returns a clear
+/// "run /login" error before any network call. The chosen config is the
+/// generic OpenAI one — `/login` re-runs provider detection after the user
+/// supplies real credentials, so this never actually sends a request.
+fn openai_compat_placeholder_client(_model: &str) -> OpenAiCompatClient {
+    OpenAiCompatClient::new(String::new(), OpenAiCompatConfig::openai())
+}
+
 impl ApiClient for AnthropicRuntimeClient {
     #[allow(clippy::too_many_lines)]
     fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+        // Credential-free boot path: the REPL started before `/login` was run.
+        // Fail fast with a clear hint instead of sending a request with empty
+        // auth. Once `/login` completes it rebuilds the runtime, so this client
+        // is replaced and the flag no longer trips.
+        if self.needs_credentials {
+            return Err(RuntimeError::new(NEEDS_LOGIN_HINT));
+        }
         if let Some(progress_reporter) = &self.progress_reporter {
             progress_reporter.mark_model_phase();
         }
@@ -8555,7 +9284,7 @@ fn format_context_window_blocked_error(session_id: &str, error: &api::ApiError) 
     lines.push("Recovery".to_string());
     lines.push("  Compact          /compact".to_string());
     lines.push(format!(
-        "  Resume compact   claw --resume {session_id} /compact"
+        "  Resume compact   clawcli --resume {session_id} /compact"
     ));
     lines.push("  Fresh session    /clear --confirm".to_string());
     lines.push(
@@ -8643,7 +9372,6 @@ fn collect_prompt_cache_events(summary: &runtime::TurnSummary) -> Vec<serde_json
 /// in this build. Used to filter both REPL completions and help output so the
 /// discovery surface only shows commands that actually work (ROADMAP #39).
 const STUB_COMMANDS: &[&str] = &[
-    "login",
     "logout",
     "vim",
     "upgrade",
@@ -9635,7 +10363,7 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
         out,
         "      Diagnose local auth, config, workspace, and sandbox health"
     )?;
-    writeln!(out, "  claw acp [serve]")?;
+    writeln!(out, "  clawcli acp [serve]")?;
     writeln!(
         out,
         "      Show ACP/Zed editor integration status (currently unsupported; aliases: --acp, -acp)"
@@ -9802,11 +10530,14 @@ mod tests {
         resolve_session_reference, response_to_events, resume_supported_slash_commands,
         run_resume_command, short_tool_id, slash_command_completion_candidates_with_sessions,
         split_error_hint, status_context, status_json_value, summarize_tool_payload_for_markdown,
-        try_resolve_bare_skill_prompt, validate_no_args, write_mcp_server_fixture, CliAction,
-        CliOutputFormat, CliToolExecutor, GitWorkspaceSummary, InternalPromptProgressEvent,
+        try_resolve_bare_skill_prompt, validate_endpoint_url, validate_no_args,
+        write_mcp_server_fixture, EndpointProtocol, ProviderSetup, CliAction, CliOutputFormat,
+        CliToolExecutor, GitWorkspaceSummary, InternalPromptProgressEvent,
         InternalPromptProgressState, LiveCli, LocalHelpTopic, PromptHistoryEntry,
         SessionLifecycleKind, SessionLifecycleSummary, SlashCommand, StatusUsage, TmuxPaneSnapshot,
-        DEFAULT_MODEL, LATEST_SESSION_REFERENCE, STUB_COMMANDS,
+        DEFAULT_ANTHROPIC_COMPAT_BASE_URL, DEFAULT_ANTHROPIC_COMPAT_MODEL,
+        DEFAULT_MODEL, DEFAULT_OPENAI_COMPAT_BASE_URL, DEFAULT_OPENAI_COMPAT_MODEL,
+        LATEST_SESSION_REFERENCE, persist_provider_setup, setup_default_model, STUB_COMMANDS,
     };
     use api::{ApiError, MessageResponse, OutputContentBlock, Usage};
     use plugins::{
@@ -9927,7 +10658,7 @@ mod tests {
         );
         assert!(rendered.contains("Compact          /compact"), "{rendered}");
         assert!(
-            rendered.contains("Resume compact   claw --resume session-issue-32 /compact"),
+            rendered.contains("Resume compact   clawcli --resume session-issue-32 /compact"),
             "{rendered}"
         );
         assert!(
@@ -10035,7 +10766,7 @@ mod tests {
         );
         assert!(rendered.contains("Compact          /compact"), "{rendered}");
         assert!(
-            rendered.contains("Resume compact   claw --resume session-issue-32 /compact"),
+            rendered.contains("Resume compact   clawcli --resume session-issue-32 /compact"),
             "{rendered}"
         );
     }
@@ -10050,6 +10781,87 @@ mod tests {
             .as_nanos();
         let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
         std::env::temp_dir().join(format!("rusty-claude-cli-{nanos}-{unique}"))
+    }
+
+    #[test]
+    fn endpoint_setup_defaults_to_generic_protocol_values() {
+        assert_eq!(
+            setup_default_model(EndpointProtocol::OpenAiCompatible, DEFAULT_MODEL),
+            DEFAULT_OPENAI_COMPAT_MODEL
+        );
+        assert_eq!(
+            setup_default_model(EndpointProtocol::AnthropicCompatible, DEFAULT_MODEL),
+            DEFAULT_ANTHROPIC_COMPAT_MODEL
+        );
+        assert_eq!(
+            EndpointProtocol::OpenAiCompatible.default_base_url(),
+            DEFAULT_OPENAI_COMPAT_BASE_URL
+        );
+        assert_eq!(
+            EndpointProtocol::AnthropicCompatible.default_base_url(),
+            DEFAULT_ANTHROPIC_COMPAT_BASE_URL
+        );
+        assert_eq!(
+            super::normalize_setup_model(EndpointProtocol::OpenAiCompatible, "openai/custom-model"),
+            "custom-model"
+        );
+        assert_eq!(
+            super::normalize_setup_model(
+                EndpointProtocol::AnthropicCompatible,
+                "anthropic/custom-model"
+            ),
+            "custom-model"
+        );
+    }
+
+    #[test]
+    fn endpoint_setup_persists_url_and_key_separately_from_model() {
+        let config_home = temp_dir();
+        let setup = ProviderSetup {
+            protocol: EndpointProtocol::OpenAiCompatible,
+            base_url: "http://127.0.0.1:8000/v1".to_string(),
+            api_key: "test-secret-key".to_string(),
+            model: "custom-model".to_string(),
+        };
+
+        persist_provider_setup(&config_home, &setup).expect("setup should persist");
+
+        let settings = fs::read_to_string(config_home.join("settings.json"))
+            .expect("settings should be written");
+        let settings_json: serde_json::Value =
+            serde_json::from_str(&settings).expect("settings should be valid JSON");
+        assert_eq!(settings_json["model"], "custom-model");
+        assert!(
+            settings_json.get("apiKey").is_none(),
+            "API keys must not be written to settings.json"
+        );
+
+        let dotenv = fs::read_to_string(config_home.join(".env")).expect("dotenv should exist");
+        assert!(dotenv.contains("CLAW_ENDPOINT_TYPE=openai-compatible"));
+        assert!(dotenv.contains("OPENAI_BASE_URL=http://127.0.0.1:8000/v1"));
+        assert!(dotenv.contains("OPENAI_API_KEY=test-secret-key"));
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            let mode = fs::metadata(config_home.join(".env"))
+                .expect("dotenv metadata")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+
+        fs::remove_dir_all(config_home).expect("cleanup setup fixture");
+    }
+
+    #[test]
+    fn endpoint_url_validation_rejects_non_http_urls() {
+        assert!(validate_endpoint_url("https://gateway.example/v1").is_ok());
+        assert!(validate_endpoint_url("http://127.0.0.1:8000/v1").is_ok());
+        assert!(validate_endpoint_url("gateway.example/v1").is_err());
+        assert!(validate_endpoint_url("https://gateway.example/v1\nsecret").is_err());
     }
 
     fn git(args: &[&str], cwd: &Path) {
@@ -10746,9 +11558,11 @@ mod tests {
 
     #[allow(clippy::too_many_lines)]
     #[test]
-    fn removed_login_and_logout_subcommands_error_helpfully() {
-        let login = parse_args(&["login".to_string()]).expect_err("login should be removed");
-        assert!(login.contains("ANTHROPIC_API_KEY"));
+    fn login_cli_arg_routes_to_repl_and_logout_errors() {
+        // `clawcli login` is not a CLI subcommand — /login runs interactively
+        // in the REPL. The direct invocation should guide the user there.
+        let login = parse_args(&["login".to_string()]).expect_err("login should guide to REPL");
+        assert!(login.contains("/login"));
         let logout = parse_args(&["logout".to_string()]).expect_err("logout should be removed");
         assert!(logout.contains("ANTHROPIC_AUTH_TOKEN"));
         assert_eq!(
@@ -11159,7 +11973,7 @@ mod tests {
         assert_eq!(value["command"], "export");
         assert_eq!(
             value["usage"],
-            "claw export [--session <id|latest>] [--output <path>] [--output-format <format>]"
+            "clawcli export [--session <id|latest>] [--output <path>] [--output-format <format>]"
         );
         assert_eq!(value["defaults"]["session"], LATEST_SESSION_REFERENCE);
         assert!(value["options"].as_array().expect("options array").len() >= 4);
@@ -11172,9 +11986,9 @@ mod tests {
     #[allow(clippy::too_many_lines)]
     #[test]
     fn status_degrades_gracefully_on_malformed_mcp_config_143() {
-        // #143: previously `claw status` hard-failed on any config parse error,
+        // #143: previously `clawcli status` hard-failed on any config parse error,
         // taking down the entire health surface for one malformed MCP entry.
-        // `claw doctor` already degrades gracefully; this test locks `status`
+        // `clawcli doctor` already degrades gracefully; this test locks `status`
         // to the same contract.
         let _guard = env_lock();
         let root = temp_dir();
@@ -11349,15 +12163,15 @@ mod tests {
         );
         // New actionable hints — this is what #139 is fixing.
         assert!(
-            message.contains("claw prompt"),
-            "error should name `claw prompt <text>` as a producer: {message}"
+            message.contains("clawcli prompt"),
+            "error should name `clawcli prompt <text>` as a producer: {message}"
         );
         assert!(
             message.contains("REPL"),
             "error should mention the interactive REPL as a producer: {message}"
         );
         assert!(
-            message.contains("claw state"),
+            message.contains("clawcli state"),
             "error should tell the user what to rerun once state exists: {message}"
         );
         // And the State --help topic must document the worker relationship
@@ -11368,8 +12182,8 @@ mod tests {
             "state help must document how state is produced: {state_help}"
         );
         assert!(
-            state_help.contains("claw prompt"),
-            "state help must name `claw prompt <text>` as a producer: {state_help}"
+            state_help.contains("clawcli prompt"),
+            "state help must name `clawcli prompt <text>` as a producer: {state_help}"
         );
     }
 
@@ -12005,7 +12819,7 @@ mod tests {
         let error = parse_args(&["/status".to_string()])
             .expect_err("/status should remain REPL-only when invoked directly");
         assert!(error.contains("interactive-only"));
-        assert!(error.contains("claw --resume SESSION.jsonl /status"));
+        assert!(error.contains("clawcli --resume SESSION.jsonl /status"));
     }
 
     #[test]
@@ -12220,7 +13034,7 @@ mod tests {
         let error = parse_args(&["--resum".to_string()]).expect_err("unknown option should fail");
         assert!(error.contains("unknown option: --resum"));
         assert!(error.contains("Did you mean --resume?"));
-        assert!(error.contains("claw --help"));
+        assert!(error.contains("clawcli --help"));
     }
 
     #[test]
@@ -12414,10 +13228,59 @@ mod tests {
         });
 
         assert!(banner.contains("Tab"));
-        assert!(banner.contains("workflow completions"));
+        assert!(banner.contains("completes commands, models, sessions, and paths"));
 
         fs::remove_dir_all(root).expect("cleanup temp dir");
         std::env::remove_var("ANTHROPIC_API_KEY");
+    }
+
+    #[test]
+    fn logout_clears_saved_credentials_and_restores_disconnected_banner() {
+        let _guard = env_lock();
+        let root = temp_dir();
+        let config_home = temp_dir();
+        fs::create_dir_all(&root).expect("root dir");
+        fs::create_dir_all(&config_home).expect("config dir");
+        fs::write(
+            config_home.join(".env"),
+            "CLAW_ENDPOINT_TYPE=openai-compatible\nOPENAI_BASE_URL=https://example.invalid/v1\nOPENAI_API_KEY=test-key\nKEEP_ME=1\n",
+        )
+        .expect("write dotenv");
+
+        let original_config_home = std::env::var("CLAW_CONFIG_HOME").ok();
+        std::env::set_var("CLAW_CONFIG_HOME", &config_home);
+        std::env::set_var("CLAW_ENDPOINT_TYPE", "openai-compatible");
+        std::env::set_var("OPENAI_BASE_URL", "https://example.invalid/v1");
+        std::env::set_var("OPENAI_API_KEY", "test-key");
+
+        let banner = with_current_dir(&root, || {
+            let mut cli = LiveCli::new(
+                "openai/gpt-oss-120b".to_string(),
+                true,
+                None,
+                PermissionMode::DangerFullAccess,
+            )
+            .expect("cli should initialize");
+            assert!(cli.is_connected(), "seeded env should look connected");
+            cli.run_logout().expect("logout should succeed");
+            assert!(!cli.is_connected(), "logout should rebuild disconnected runtime");
+            cli.disconnected_startup_banner()
+        });
+
+        let dotenv = fs::read_to_string(config_home.join(".env")).expect("dotenv should remain");
+        assert!(banner.contains("Claw Code"));
+        assert!(banner.contains("/login"));
+        assert_eq!(dotenv, "KEEP_ME=1\n");
+        assert!(std::env::var("OPENAI_API_KEY").is_err());
+        assert!(std::env::var("OPENAI_BASE_URL").is_err());
+        assert!(std::env::var("CLAW_ENDPOINT_TYPE").is_err());
+
+        match original_config_home {
+            Some(value) => std::env::set_var("CLAW_CONFIG_HOME", value),
+            None => std::env::remove_var("CLAW_CONFIG_HOME"),
+        }
+        fs::remove_dir_all(root).expect("cleanup root");
+        fs::remove_dir_all(config_home).expect("cleanup config");
     }
 
     #[test]
@@ -12426,7 +13289,7 @@ mod tests {
 
         let line = format_connected_line(model);
 
-        assert_eq!(line, "Connected: claude-sonnet-4-6 via anthropic");
+        assert_eq!(line, "Ready · claude-sonnet-4-6 via anthropic");
     }
 
     #[test]
@@ -12435,7 +13298,7 @@ mod tests {
 
         let line = format_connected_line(model);
 
-        assert_eq!(line, "Connected: grok-3 via xai");
+        assert_eq!(line, "Ready · grok-3 via xai");
     }
 
     #[test]
@@ -12606,20 +13469,20 @@ mod tests {
         let mut help = Vec::new();
         print_help_to(&mut help).expect("help should render");
         let help = String::from_utf8(help).expect("help should be utf8");
-        assert!(help.contains("claw help"));
-        assert!(help.contains("claw version"));
-        assert!(help.contains("claw status"));
-        assert!(help.contains("claw sandbox"));
-        assert!(help.contains("claw init"));
-        assert!(help.contains("claw acp [serve]"));
-        assert!(help.contains("claw agents"));
-        assert!(help.contains("claw mcp"));
-        assert!(help.contains("claw skills"));
-        assert!(help.contains("claw /skills"));
+        assert!(help.contains("clawcli help"));
+        assert!(help.contains("clawcli version"));
+        assert!(help.contains("clawcli status"));
+        assert!(help.contains("clawcli sandbox"));
+        assert!(help.contains("clawcli init"));
+        assert!(help.contains("clawcli acp [serve]"));
+        assert!(help.contains("clawcli agents"));
+        assert!(help.contains("clawcli mcp"));
+        assert!(help.contains("clawcli skills"));
+        assert!(help.contains("clawcli /skills"));
         assert!(help.contains("ultraworkers/claw-code"));
         assert!(help.contains("cargo install claw-code"));
-        assert!(!help.contains("claw login"));
-        assert!(!help.contains("claw logout"));
+        assert!(!help.contains("clawcli login"));
+        assert!(!help.contains("clawcli logout"));
     }
 
     #[test]
@@ -12743,7 +13606,7 @@ mod tests {
                 },
                 TmuxPaneSnapshot {
                     pane_id: "%2".to_string(),
-                    current_command: "claw".to_string(),
+                    current_command: "clawcli".to_string(),
                     current_path: workspace.join("rust"),
                 },
             ],
@@ -12751,7 +13614,7 @@ mod tests {
 
         assert_eq!(lifecycle.kind, SessionLifecycleKind::RunningProcess);
         assert_eq!(lifecycle.pane_id.as_deref(), Some("%2"));
-        assert_eq!(lifecycle.pane_command.as_deref(), Some("claw"));
+        assert_eq!(lifecycle.pane_command.as_deref(), Some("clawcli"));
         assert!(!lifecycle.abandoned);
     }
 
@@ -12830,7 +13693,7 @@ mod tests {
             session_lifecycle: SessionLifecycleSummary {
                 kind: SessionLifecycleKind::RunningProcess,
                 pane_id: Some("%9".to_string()),
-                pane_command: Some("claw".to_string()),
+                pane_command: Some("clawcli".to_string()),
                 pane_path: Some(PathBuf::from("/tmp/project")),
                 workspace_dirty: false,
                 abandoned: false,
@@ -12860,7 +13723,7 @@ mod tests {
         );
         assert_eq!(
             value["workspace"]["session_lifecycle"]["pane_command"],
-            "claw"
+            "clawcli"
         );
         assert_eq!(value["workspace"]["session_lifecycle"]["abandoned"], false);
     }
@@ -13180,10 +14043,10 @@ UU conflicted.rs",
         let mut help = Vec::new();
         print_help_to(&mut help).expect("help should render");
         let help = String::from_utf8(help).expect("help should be utf8");
-        assert!(help.contains("claw --resume [SESSION.jsonl|session-id|latest]"));
+        assert!(help.contains("clawcli --resume [SESSION.jsonl|session-id|latest]"));
         assert!(help.contains("Use `latest` with --resume, /resume, or /session switch"));
-        assert!(help.contains("claw --resume latest"));
-        assert!(help.contains("claw --resume latest /status /diff /export notes.txt"));
+        assert!(help.contains("clawcli --resume latest"));
+        assert!(help.contains("clawcli --resume latest /status /diff /export notes.txt"));
     }
 
     #[test]

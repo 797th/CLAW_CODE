@@ -1,8 +1,11 @@
 use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::BTreeSet;
+use std::fs;
 use std::io::{self, IsTerminal, Write};
+use std::path::{Path, PathBuf};
 
+use crossterm::style::{style, Color, Stylize};
 use rustyline::completion::{Completer, Pair};
 use rustyline::error::ReadlineError;
 use rustyline::highlight::{CmdKind, Highlighter};
@@ -61,6 +64,10 @@ impl Completer for SlashCommandHelper {
         pos: usize,
         _ctx: &Context<'_>,
     ) -> rustyline::Result<(usize, Vec<Self::Candidate>)> {
+        if let Some((start, matches)) = complete_path_argument(line, pos) {
+            return Ok((start, matches));
+        }
+
         let Some(prefix) = slash_command_prefix(line, pos) else {
             return Ok((0, Vec::new()));
         };
@@ -79,6 +86,8 @@ impl Completer for SlashCommandHelper {
     }
 }
 
+const PATH_COMPLETION_COMMAND_PREFIXES: &[&str] = &["/export ", "/resume "];
+
 impl Hinter for SlashCommandHelper {
     type Hint = String;
 }
@@ -86,7 +95,7 @@ impl Hinter for SlashCommandHelper {
 impl Highlighter for SlashCommandHelper {
     fn highlight<'l>(&self, line: &'l str, _pos: usize) -> Cow<'l, str> {
         self.set_current_line(line);
-        Cow::Borrowed(line)
+        Cow::Owned(highlight_slash_command(line))
     }
 
     fn highlight_char(&self, line: &str, _pos: usize, _kind: CmdKind) -> bool {
@@ -97,6 +106,16 @@ impl Highlighter for SlashCommandHelper {
 
 impl Validator for SlashCommandHelper {}
 impl Helper for SlashCommandHelper {}
+
+fn highlight_slash_command(line: &str) -> String {
+    if !line.starts_with('/') {
+        return line.to_string();
+    }
+
+    let command_len = line.find(char::is_whitespace).unwrap_or(line.len());
+    let (command, remainder) = line.split_at(command_len);
+    format!("{}{remainder}", style(command).with(Color::Blue))
+}
 
 pub struct LineEditor {
     prompt: String,
@@ -211,6 +230,119 @@ fn slash_command_prefix(line: &str, pos: usize) -> Option<&str> {
     Some(prefix)
 }
 
+fn complete_path_argument(line: &str, pos: usize) -> Option<(usize, Vec<Pair>)> {
+    if pos != line.len() || !line.starts_with('/') {
+        return None;
+    }
+
+    for command_prefix in PATH_COMPLETION_COMMAND_PREFIXES {
+        let Some(path_fragment) = line.strip_prefix(command_prefix) else {
+            continue;
+        };
+
+        let matches = path_completion_candidates(path_fragment)
+            .into_iter()
+            .map(|candidate| Pair {
+                display: candidate.display,
+                replacement: candidate.replacement,
+            })
+            .collect();
+        return Some((command_prefix.len(), matches));
+    }
+
+    None
+}
+
+fn path_completion_candidates(path_fragment: &str) -> Vec<PathCompletionCandidate> {
+    let Ok((search_dir, prefix, base_display)) = resolve_path_completion_context(path_fragment)
+    else {
+        return Vec::new();
+    };
+
+    let Ok(entries) = fs::read_dir(&search_dir) else {
+        return Vec::new();
+    };
+
+    let mut candidates = BTreeSet::new();
+    for entry in entries.flatten() {
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+
+        let file_name = entry.file_name();
+        let file_name = file_name.to_string_lossy();
+        if !file_name.starts_with(&prefix) {
+            continue;
+        }
+
+        let mut replacement = format!("{base_display}{file_name}");
+        if file_type.is_dir() {
+            replacement.push('/');
+        }
+        candidates.insert(replacement);
+    }
+
+    candidates
+        .into_iter()
+        .map(|replacement| PathCompletionCandidate {
+            display: replacement.clone(),
+            replacement,
+        })
+        .collect()
+}
+
+fn resolve_path_completion_context(
+    path_fragment: &str,
+) -> io::Result<(PathBuf, String, String)> {
+    if path_fragment.is_empty() {
+        return Ok((PathBuf::from("."), String::new(), String::new()));
+    }
+
+    if path_fragment.ends_with('/') {
+        let search_dir = PathBuf::from(path_fragment);
+        let base_display = normalize_path_completion_prefix(path_fragment);
+        return Ok((search_dir, String::new(), base_display));
+    }
+
+    let path = Path::new(path_fragment);
+    let prefix = path
+        .file_name()
+        .map(|value| value.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let search_dir = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."));
+    let base_display = path_completion_base_display(&search_dir);
+
+    Ok((search_dir, prefix, base_display))
+}
+
+fn path_completion_base_display(search_dir: &Path) -> String {
+    if search_dir == Path::new(".") {
+        String::new()
+    } else if search_dir == Path::new("/") {
+        "/".to_string()
+    } else {
+        format!("{}/", search_dir.display())
+    }
+}
+
+fn normalize_path_completion_prefix(path_fragment: &str) -> String {
+    if path_fragment == "/" {
+        "/".to_string()
+    } else {
+        path_fragment.to_string()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct PathCompletionCandidate {
+    display: String,
+    replacement: String,
+}
+
 fn normalize_completions(completions: Vec<String>) -> Vec<String> {
     let mut seen = BTreeSet::new();
     completions
@@ -222,7 +354,13 @@ fn normalize_completions(completions: Vec<String>) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{slash_command_prefix, LineEditor, SlashCommandHelper};
+    use super::{
+        highlight_slash_command, path_completion_candidates, slash_command_prefix, LineEditor,
+        SlashCommandHelper,
+    };
+    use std::fs;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
     use rustyline::completion::Completer;
     use rustyline::highlight::Highlighter;
     use rustyline::history::{DefaultHistory, History};
@@ -308,6 +446,14 @@ mod tests {
     }
 
     #[test]
+    fn highlights_slash_command_token_in_blue() {
+        let highlighted = highlight_slash_command("/login later");
+
+        assert!(highlighted.contains("\u{1b}[38;5;12m/login\u{1b}[39m"));
+        assert!(highlighted.ends_with(" later"));
+    }
+
+    #[test]
     fn push_history_ignores_blank_entries() {
         let mut editor = LineEditor::new("> ", vec!["/help".to_string()]);
         editor.push_history("   ");
@@ -327,5 +473,57 @@ mod tests {
 
         let helper = editor.editor.helper().expect("helper should exist");
         assert_eq!(helper.completions, vec!["/model opus".to_string()]);
+    }
+
+    #[test]
+    fn completes_export_paths_from_filesystem() {
+        let temp_dir = unique_test_dir("export-paths");
+        fs::create_dir_all(&temp_dir).expect("temp dir should exist");
+        fs::write(temp_dir.join("notes.txt"), "hi").expect("file should be created");
+        fs::create_dir_all(temp_dir.join("nested")).expect("nested dir should be created");
+
+        let helper = SlashCommandHelper::new(Vec::new());
+        let history = DefaultHistory::new();
+        let ctx = Context::new(&history);
+        let line = format!("/export {}/n", temp_dir.display());
+        let (start, matches) = helper
+            .complete(&line, line.len(), &ctx)
+            .expect("completion should work");
+
+        assert_eq!(start, "/export ".len());
+        assert_eq!(matches.len(), 2);
+        assert_eq!(matches[0].replacement, format!("{}/nested/", temp_dir.display()));
+        assert_eq!(matches[1].replacement, format!("{}/notes.txt", temp_dir.display()));
+
+        fs::remove_dir_all(&temp_dir).expect("temp dir should be removed");
+    }
+
+    #[test]
+    fn path_completion_candidates_include_trailing_slash_for_directories() {
+        let temp_dir = unique_test_dir("path-candidates");
+        fs::create_dir_all(temp_dir.join("alpha")).expect("dir should be created");
+        fs::write(temp_dir.join("alpine.txt"), "hi").expect("file should be created");
+
+        let candidates = path_completion_candidates(&format!("{}/al", temp_dir.display()));
+        assert_eq!(
+            candidates
+                .into_iter()
+                .map(|candidate| candidate.replacement)
+                .collect::<Vec<_>>(),
+            vec![
+                format!("{}/alpha/", temp_dir.display()),
+                format!("{}/alpine.txt", temp_dir.display()),
+            ]
+        );
+
+        fs::remove_dir_all(&temp_dir).expect("temp dir should be removed");
+    }
+
+    fn unique_test_dir(label: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time should move forward")
+            .as_nanos();
+        std::env::temp_dir().join(format!("clawcli-input-{label}-{nanos}"))
     }
 }
