@@ -3732,7 +3732,16 @@ fn repl_permission_label(permission_mode: PermissionMode) -> &'static str {
     }
 }
 
-fn format_repl_prompt(model: &str, permission_mode: PermissionMode) -> String {
+fn format_repl_prompt(_model: &str, _permission_mode: PermissionMode) -> String {
+    let muted = Color::Rgb {
+        r: 148,
+        g: 163,
+        b: 184,
+    };
+    format!("{} ", style_ui("╭─", muted, false))
+}
+
+fn format_repl_footer(model: &str, permission_mode: PermissionMode) -> String {
     let accent = Color::Rgb {
         r: 129,
         g: 140,
@@ -3744,12 +3753,11 @@ fn format_repl_prompt(model: &str, permission_mode: PermissionMode) -> String {
         b: 184,
     };
     format!(
-        "{} {} {} {}\n{} ",
-        style_ui("╭─", muted, false),
+        "{} {} {} {}",
+        style_ui("╰─", muted, false),
         style_ui(model, accent, false),
         style_ui("·", muted, false),
         style_ui(repl_permission_label(permission_mode), muted, false),
-        style_ui("╰─", muted, false),
     )
 }
 
@@ -7692,6 +7700,7 @@ fn run_repl(
 
     loop {
         editor.set_prompt(format_repl_prompt(&cli.model, cli.permission_mode));
+        editor.set_footer(format_repl_footer(&cli.model, cli.permission_mode));
         editor.set_completions(cli.repl_completion_candidates().unwrap_or_default());
         match editor.read_line()? {
             input::ReadOutcome::Submit(input) => {
@@ -7700,6 +7709,7 @@ fn run_repl(
                     continue;
                 }
                 if matches!(trimmed.as_str(), "/exit" | "/quit") {
+                    editor.finish()?;
                     cli.persist_session()?;
                     break;
                 }
@@ -15313,7 +15323,7 @@ mod tests {
         render_config_report, render_diff_report, render_diff_report_for, render_help_topic,
         render_help_topic_json, render_memory_report, render_prompt_history_report,
         render_repl_help, render_repl_response, render_resume_usage, render_session_list,
-        render_session_markdown, format_repl_prompt, resolve_model_alias,
+        render_session_markdown, format_repl_footer, format_repl_prompt, resolve_model_alias,
         resolve_model_alias_with_config, resolve_repl_model,
         resolve_session_reference, response_to_events, resume_supported_slash_commands,
         run_resume_command, short_tool_id, slash_command_completion_candidates_with_sessions,
@@ -18596,13 +18606,17 @@ mod tests {
     }
 
     #[test]
-    fn repl_prompt_keeps_model_footer_and_input_marker_together() {
+    fn repl_prompt_places_input_before_static_model_footer() {
         let prompt = format_repl_prompt("custom-model", PermissionMode::DangerFullAccess);
+        let footer = format_repl_footer("custom-model", PermissionMode::DangerFullAccess);
 
-        assert!(prompt.contains("custom-model"));
-        assert!(prompt.contains("full access"));
-        assert!(prompt.contains('\n'));
-        assert!(prompt.lines().last().is_some_and(|line| line.contains("╰─")));
+        assert!(prompt.contains("╭─"));
+        assert!(!prompt.contains("custom-model"));
+        assert!(!prompt.contains('\n'));
+        assert!(footer.contains("custom-model"));
+        assert!(footer.contains("full access"));
+        assert!(footer.contains("╰─"));
+        assert!(!footer.contains('\n'));
     }
 
     #[test]

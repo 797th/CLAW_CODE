@@ -6,6 +6,7 @@ use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 
 use crossterm::style::{style, Color, Stylize};
+use crossterm::terminal;
 use rustyline::completion::{Completer, Pair};
 use rustyline::error::ReadlineError;
 use rustyline::highlight::{CmdKind, Highlighter};
@@ -119,6 +120,8 @@ fn highlight_slash_command(line: &str) -> String {
 
 pub struct LineEditor {
     prompt: String,
+    footer: String,
+    footer_active: bool,
     editor: Editor<SlashCommandHelper, DefaultHistory>,
 }
 
@@ -138,6 +141,8 @@ impl LineEditor {
 
         Self {
             prompt: prompt.into(),
+            footer: String::new(),
+            footer_active: false,
             editor,
         }
     }
@@ -161,32 +166,63 @@ impl LineEditor {
         self.prompt = prompt.into();
     }
 
+    pub fn set_footer(&mut self, footer: impl Into<String>) {
+        self.footer = footer.into();
+    }
+
     pub fn read_line(&mut self) -> io::Result<ReadOutcome> {
         if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
             return self.read_line_fallback();
         }
 
+        self.prepare_footer()?;
+
         if let Some(helper) = self.editor.helper_mut() {
             helper.reset_current_line();
         }
 
-        match self.editor.readline(&self.prompt) {
+        let result = match self.editor.readline(&self.prompt) {
             Ok(line) => Ok(ReadOutcome::Submit(line)),
             Err(ReadlineError::Interrupted) => {
                 let has_input = !self.current_line().is_empty();
-                self.finish_interrupted_read()?;
                 if has_input {
                     Ok(ReadOutcome::Cancel)
                 } else {
                     Ok(ReadOutcome::Exit)
                 }
             }
-            Err(ReadlineError::Eof) => {
-                self.finish_interrupted_read()?;
-                Ok(ReadOutcome::Exit)
-            }
+            Err(ReadlineError::Eof) => Ok(ReadOutcome::Exit),
             Err(error) => Err(io::Error::other(error)),
+        };
+
+        self.finish_prompt_read()?;
+        if matches!(result, Ok(ReadOutcome::Cancel | ReadOutcome::Exit)) {
+            self.finish_interrupted_read()?;
         }
+        if matches!(result, Ok(ReadOutcome::Exit)) {
+            self.finish()?;
+        }
+        result
+    }
+
+    pub fn finish(&mut self) -> io::Result<()> {
+        if !self.footer_active {
+            return Ok(());
+        }
+
+        let rows = terminal::size().map(|(_, rows)| rows).unwrap_or_default();
+        let mut stdout = io::stdout();
+        if rows < 3 {
+            write!(stdout, "\r\x1b[2K")?;
+            stdout.flush()?;
+            self.footer_active = false;
+            return Ok(());
+        }
+
+        write!(stdout, "\x1b[r\x1b[{rows};1H\x1b[2K\x1b[{rows};1H")?;
+        stdout.flush()?;
+        self.footer_active = false;
+        Ok(())
     }
 
     fn current_line(&self) -> String {
@@ -203,6 +239,45 @@ impl LineEditor {
         writeln!(stdout)
     }
 
+    fn prepare_footer(&mut self) -> io::Result<()> {
+        if self.footer.is_empty() {
+            return Ok(());
+        }
+
+        let rows = terminal::size().map(|(_, rows)| rows).unwrap_or_default();
+        if rows < 3 {
+            return self.prepare_relative_footer();
+        }
+
+        let mut stdout = io::stdout();
+        let input_row = rows - 1;
+        write!(
+            stdout,
+            "\x1b[1;{input_row}r\x1b[{rows};1H\x1b[2K{}\x1b[{input_row};1H\x1b[2K",
+            self.footer
+        )?;
+        stdout.flush().map(|()| self.footer_active = true)
+    }
+
+    fn prepare_relative_footer(&mut self) -> io::Result<()> {
+        let mut stdout = io::stdout();
+        writeln!(stdout)?;
+        write!(stdout, "{}\x1b[1A\x1b[1G", self.footer)?;
+        stdout.flush()?;
+        self.footer_active = true;
+        Ok(())
+    }
+
+    fn finish_prompt_read(&self) -> io::Result<()> {
+        if self.footer.is_empty() || !self.footer_active {
+            return Ok(());
+        }
+
+        let mut stdout = io::stdout();
+        write!(stdout, "\r")?;
+        stdout.flush()
+    }
+
     fn read_line_fallback(&self) -> io::Result<ReadOutcome> {
         let mut stdout = io::stdout();
         write!(stdout, "{}", self.prompt)?;
@@ -217,7 +292,19 @@ impl LineEditor {
         while matches!(buffer.chars().last(), Some('\n' | '\r')) {
             buffer.pop();
         }
+
+        if !self.footer.is_empty() {
+            writeln!(stdout)?;
+            writeln!(stdout, "{}", self.footer)?;
+            stdout.flush()?;
+        }
         Ok(ReadOutcome::Submit(buffer))
+    }
+}
+
+impl Drop for LineEditor {
+    fn drop(&mut self) {
+        let _ = self.finish();
     }
 }
 
