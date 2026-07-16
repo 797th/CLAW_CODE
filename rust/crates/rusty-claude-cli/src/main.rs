@@ -8232,10 +8232,11 @@ fn run_repl(
                                 cli.runtime.usage().cumulative_usage(),
                             );
                             editor.begin_working()?;
+                            let composer_column = editor.composer_cursor_column();
                             if is_superpowers_invocation(&prompt) {
                                 print_superpowers_checklist();
                             }
-                            cli.run_turn(&prompt)?;
+                            cli.run_turn_with_composer(&prompt, composer_column)?;
                         } else if cli.handle_repl_command(command, &custom_commands)? {
                             cli.persist_session()?;
                         }
@@ -8260,10 +8261,11 @@ fn run_repl(
                         cli.runtime.usage().cumulative_usage(),
                     );
                     editor.begin_working()?;
+                    let composer_column = editor.composer_cursor_column();
                     if is_superpowers_invocation(&prompt) {
                         print_superpowers_checklist();
                     }
-                    cli.run_turn(&prompt)?;
+                    cli.run_turn_with_composer(&prompt, composer_column)?;
                     continue;
                 }
                 editor.push_history(input);
@@ -8274,7 +8276,8 @@ fn run_repl(
                     cli.runtime.usage().cumulative_usage(),
                 );
                 editor.begin_working()?;
-                cli.run_turn(&trimmed)?;
+                let composer_column = editor.composer_cursor_column();
+                cli.run_turn_with_composer(&trimmed, composer_column)?;
             }
             input::ReadOutcome::Cancel => {}
             input::ReadOutcome::Exit => {
@@ -9192,13 +9195,22 @@ impl LiveCli {
     }
 
     fn run_turn(&mut self, input: &str) -> Result<(), Box<dyn std::error::Error>> {
-        self.run_turn_internal(input, true)
+        self.run_turn_internal(input, true, None)
+    }
+
+    fn run_turn_with_composer(
+        &mut self,
+        input: &str,
+        composer_column: Option<u16>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        self.run_turn_internal(input, true, composer_column)
     }
 
     fn run_turn_internal(
         &mut self,
         input: &str,
         clean_interactive_output: bool,
+        composer_column: Option<u16>,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let (mut runtime, hook_abort_monitor) =
             self.prepare_turn_runtime(!clean_interactive_output)?;
@@ -9211,6 +9223,7 @@ impl LiveCli {
             self.live_usage_reporter
                 .as_ref()
                 .map(LiveUsageReporter::footer_store),
+            composer_column,
             &mut stdout,
         )?;
         let mut permission_prompter = CliPermissionPrompter::new(self.permission_mode);
@@ -9473,7 +9486,7 @@ impl LiveCli {
         match output_format {
             CliOutputFormat::Json if compact => self.run_prompt_compact_json(input),
             CliOutputFormat::Text if compact => self.run_prompt_compact(input),
-            CliOutputFormat::Text => self.run_turn_internal(input, false),
+            CliOutputFormat::Text => self.run_turn_internal(input, false, None),
             CliOutputFormat::Json => self.run_prompt_json(input),
         }
     }

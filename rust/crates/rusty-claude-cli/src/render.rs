@@ -6,7 +6,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use crate::input::FooterStore;
-use crossterm::cursor::{MoveTo, MoveToColumn};
+use crossterm::cursor::{Hide, MoveTo, MoveToColumn, Show};
 use crossterm::style::{Color, Print, ResetColor, SetForegroundColor, Stylize};
 use crossterm::terminal::{self, Clear, ClearType};
 use crossterm::{execute, queue};
@@ -241,12 +241,13 @@ impl LiveSpinner {
         label: impl Into<String>,
         theme: ColorTheme,
         footer_store: Option<FooterStore>,
+        composer_column: Option<u16>,
     ) -> io::Result<Self> {
         let label = label.into();
         let (stop_tx, stop_rx) = mpsc::channel();
         let join_handle = thread::Builder::new()
             .name("claw-live-spinner".to_string())
-            .spawn(move || animate_spinner(label, theme, footer_store, stop_rx))
+            .spawn(move || animate_spinner(label, theme, footer_store, composer_column, stop_rx))
             .map_err(io::Error::other)?;
 
         Ok(Self {
@@ -281,6 +282,7 @@ fn animate_spinner(
     label: String,
     theme: ColorTheme,
     footer_store: Option<FooterStore>,
+    composer_column: Option<u16>,
     stop_rx: Receiver<()>,
 ) -> io::Result<()> {
     let mut spinner = Spinner::new();
@@ -289,10 +291,13 @@ fn animate_spinner(
 
     loop {
         if let Some((activity_row, input_row)) = activity_cursor_rows() {
-            // Keep the terminal cursor parked in the composer while the
-            // activity line is redrawn above it. The saved position is the
-            // composer position established by `LineEditor::begin_working`.
-            write!(stdout, "\x1b7")?;
+            // The terminal cursor is hidden for the entire redraw. This is
+            // deliberate: save/restore sequences still expose a tiny window
+            // where the cursor sits on the activity row, and some terminals
+            // do not reliably restore DEC cursor state across concurrent
+            // writes. Explicitly move it back to the composer before showing
+            // it so the visible cursor can never land beside "Working".
+            queue!(stdout, Hide)?;
             queue!(stdout, MoveTo(0, activity_row))?;
             spinner.tick_elapsed(&label, started_at.elapsed(), &theme, &mut stdout)?;
             if let Some(footer) = footer_store
@@ -309,7 +314,11 @@ fn animate_spinner(
                     Print(footer)
                 )?;
             }
-            write!(stdout, "\x1b8")?;
+            queue!(
+                stdout,
+                MoveTo(composer_column.unwrap_or_default(), input_row),
+                Show
+            )?;
             stdout.flush()?;
         } else {
             spinner.tick_elapsed(&label, started_at.elapsed(), &theme, &mut stdout)?;
@@ -353,10 +362,16 @@ impl ActivityIndicator {
         theme: ColorTheme,
         animated: bool,
         footer_store: Option<FooterStore>,
+        composer_column: Option<u16>,
         out: &mut impl Write,
     ) -> io::Result<Self> {
         if animated {
-            Ok(Self::Live(LiveSpinner::start(label, theme, footer_store)?))
+            Ok(Self::Live(LiveSpinner::start(
+                label,
+                theme,
+                footer_store,
+                composer_column,
+            )?))
         } else {
             let mut spinner = Spinner::new();
             spinner.tick(label, &theme, out)?;

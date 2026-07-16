@@ -52,15 +52,10 @@ fn repl_keeps_working_indicator_above_composer_and_model_footer() {
         model_footer < working,
         "activity should render after the cursor is moved to the row above the composer: {terminal_output:?}"
     );
-    let activity_move = terminal_output[..working]
-        .rfind("\x1b[22;1H")
-        .expect("activity frame should move to the reserved working row");
-    let cursor_save = terminal_output[..activity_move]
-        .rfind("\x1b7")
-        .expect("activity frame should save the composer cursor");
+    let frame_count = assert_cursor_rehomed_for_every_frame(&terminal_output);
     assert!(
-        cursor_save < activity_move && terminal_output[working..].contains("\x1b8"),
-        "activity redraw should restore the composer cursor after painting the working row: {terminal_output:?}"
+        frame_count >= 2,
+        "PTY run should capture multiple cursor-safe spinner frames, got {frame_count}: {terminal_output:?}"
     );
     assert!(
         terminal_output.contains("0 tok"),
@@ -159,4 +154,42 @@ fn unique_temp_dir(label: &str) -> PathBuf {
         "claw-{label}-{}-{millis}-{counter}",
         std::process::id()
     ))
+}
+
+fn assert_cursor_rehomed_for_every_frame(output: &str) -> usize {
+    const HIDE: &str = "\x1b[?25l";
+    const ACTIVITY: &str = "\x1b[22;1H";
+    const COMPOSER: &str = "\x1b[23;3H";
+    const SHOW: &str = "\x1b[?25h";
+
+    let mut search_from = 0;
+    let mut frame_count = 0;
+    while let Some(relative_hide) = output[search_from..].find(HIDE) {
+        let hide = search_from + relative_hide;
+        let activity = hide
+            + output[hide..]
+                .find(ACTIVITY)
+                .expect("every hidden frame should move to the working row");
+        let composer = activity
+            + output[activity..]
+                .find(COMPOSER)
+                .expect("every hidden frame should move back to the composer row");
+        let show = composer
+            + output[composer..]
+                .find(SHOW)
+                .expect("every hidden frame should show the cursor after the composer move");
+
+        assert!(
+            hide < activity && activity < composer && composer < show,
+            "cursor frame order must be hide -> working row -> composer row -> show: {output:?}"
+        );
+        assert!(
+            !output[hide..show].contains("\x1b8"),
+            "cursor frame must not depend on DEC restore while repainting: {output:?}"
+        );
+
+        frame_count += 1;
+        search_from = show + SHOW.len();
+    }
+    frame_count
 }

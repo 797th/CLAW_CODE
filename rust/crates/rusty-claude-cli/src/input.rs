@@ -425,6 +425,16 @@ impl LineEditor {
         Arc::clone(&self.footer_state.footer)
     }
 
+    /// Return the zero-based column where the editor parks the cursor after
+    /// its prompt. The activity renderer uses this explicit position when it
+    /// temporarily hides the cursor to repaint the working row, so it never
+    /// has to rely on terminal save/restore state.
+    #[must_use]
+    pub fn composer_cursor_column(&self) -> Option<u16> {
+        let (_, rows) = terminal::size().ok()?;
+        (rows >= 4).then_some(prompt_cursor_column(&self.prompt).saturating_sub(1))
+    }
+
     pub fn set_permission_mode(&mut self, mode: &str) {
         self.footer_state.set_mode(mode);
         self.sync_footer();
