@@ -26,5 +26,28 @@ rust/.claw/
 status-help.txt
 tmp-cliclaw-bin/
 .env
+# Local environment files and credentials. Keep only explicitly named
+# examples/templates under version control.
+.env.*
+!.env.example
+**/.env
+**/.env.*
+!**/.env.example
+.claw/.env
+**/.claw/.env
+
+# Private key and certificate containers.
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Common local credential/config exports.
+**/credentials.json
+**/credentials.local.json
+**/*-credentials.json
+**/secrets.json
+**/secrets.local.json
+
 dream.log
 memory_state.json

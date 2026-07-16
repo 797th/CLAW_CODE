@@ -3448,7 +3448,8 @@ fn resolve_model_alias_with_config(model: &str) -> String {
 }
 
 /// Validate model syntax at parse time.
-/// Accepts: known aliases (opus, sonnet, haiku) or provider/model pattern.
+/// Accepts: known aliases (opus, sonnet, haiku), provider/model patterns, or
+/// provider-native names when an OpenAI-compatible endpoint is configured.
 /// Rejects: empty, whitespace-only, strings with spaces, or invalid chars.
 fn validate_model_syntax(model: &str) -> Result<(), String> {
     let trimmed = model.trim();
@@ -3472,7 +3473,7 @@ fn validate_model_syntax(model: &str) -> Result<(), String> {
     if is_bare_provider_model(trimmed) {
         return Ok(());
     }
-    if is_local_openai_model_syntax(trimmed) {
+    if is_openai_compatible_model_syntax(trimmed) {
         return Ok(());
     }
     // Check provider/model format: provider_id/model_id
@@ -3508,11 +3509,14 @@ fn is_bare_provider_model(model: &str) -> bool {
     model.starts_with("claude-") || model.starts_with("gpt-")
 }
 
-fn is_local_openai_model_syntax(model: &str) -> bool {
+fn is_openai_compatible_model_syntax(model: &str) -> bool {
     if let Some(rest) = model.strip_prefix("local/") {
         return !rest.is_empty() && rest.split('/').all(|segment| !segment.is_empty());
     }
-    std::env::var_os("OPENAI_BASE_URL").is_some() && (model.contains(':') || model.contains('.'))
+    api::has_configured_value("OPENAI_BASE_URL")
+        && model
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || "-_.:/".contains(character))
 }
 
 fn config_alias_for_current_dir(alias: &str) -> Option<String> {
@@ -17268,6 +17272,18 @@ mod tests {
         .expect("Ollama-style tag should parse when OPENAI_BASE_URL is set")
         {
             CliAction::Prompt { model, .. } => assert_eq!(model, "qwen2.5-coder:7b"),
+            other => panic!("expected CliAction::Prompt, got: {other:?}"),
+        }
+        let custom_model = "custom-model-name";
+        match parse_args(&[
+            "prompt".to_string(),
+            "test".to_string(),
+            "--model".to_string(),
+            custom_model.to_string(),
+        ])
+        .expect("custom OpenAI-compatible model names should parse")
+        {
+            CliAction::Prompt { model, .. } => assert_eq!(model, custom_model),
             other => panic!("expected CliAction::Prompt, got: {other:?}"),
         }
         match parse_args(&[

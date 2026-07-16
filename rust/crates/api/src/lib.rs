@@ -22,8 +22,9 @@ pub use prompt_cache::{
 pub use providers::anthropic::{AnthropicClient, AnthropicClient as ApiClient, AuthSource};
 pub use providers::openai_compat::{
     build_chat_completion_request, flatten_tool_result_content, is_reasoning_model,
-    has_api_key, model_rejects_is_error_field, model_requires_reasoning_content_in_history,
-    translate_message, OpenAiCompatClient, OpenAiCompatConfig,
+    has_api_key, has_configured_value, model_rejects_is_error_field,
+    model_requires_reasoning_content_in_history, translate_message, OpenAiCompatClient,
+    OpenAiCompatConfig,
 };
 pub use providers::{
     configured_provider_kind, detect_provider_kind, max_tokens_for_model,
