@@ -37,6 +37,15 @@ Canonical scenario map: `rust/mock_parity_scenarios.json`
 - File tools — harness-validated flows
 - Streaming response support validated by the mock parity harness
 
+## Agentic harness parity
+
+Claw now adds native project harness surfaces beyond the Claude Code-compatible
+core: lifecycle hook events (`SessionStart`, `SessionEnd`, `UserPromptSubmit`,
+`Stop`, and `PreCompact`), JSON hook decisions, `.claw/commands`,
+`.claw/skills`, `.claw/agents`, and optional `workflow_gates` enforcement. These
+are Claw extensions, so they are not claimed as Claude Code parity; see
+[docs/harness.md](docs/harness.md) for the protocol and configuration.
+
 ## 9-lane checkpoint
 
 | Lane | Status | Feature commit | Merge commit | Evidence |

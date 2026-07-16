@@ -4456,6 +4456,13 @@ fn render_doctor_report(
             check_config_health(&config_loader, config.as_ref()),
             check_mcp_validation_health(&mcp_validation),
             check_hook_validation_health(&hook_validation),
+            check_harness_health(
+                &cwd,
+                config.as_ref().ok().map_or(
+                    runtime::WorkflowGateMode::Off,
+                    runtime::RuntimeConfig::workflow_gates,
+                ),
+            ),
             check_install_source_health(),
             check_workspace_health(&context),
             check_memory_health(&context),
@@ -4982,6 +4989,73 @@ fn check_hook_validation_health(summary: &HookValidationSummary) -> DiagnosticCh
             Value::Array(invalid_hooks_json(&summary.invalid_hooks)),
         ),
     ]))
+}
+
+fn workflow_gate_mode_label(mode: runtime::WorkflowGateMode) -> &'static str {
+    match mode {
+        runtime::WorkflowGateMode::Off => "off",
+        runtime::WorkflowGateMode::Advisory => "advisory",
+        runtime::WorkflowGateMode::Enforced => "enforced",
+    }
+}
+
+fn check_harness_health(
+    cwd: &Path,
+    workflow_gate_mode: runtime::WorkflowGateMode,
+) -> DiagnosticCheck {
+    let assets = runtime::harness_assets::discover(cwd);
+    let warning_count = assets.warnings.len();
+    let mut details = vec![
+        format!("Skills            {}", assets.skills.len()),
+        format!("Commands          {}", assets.commands.len()),
+        format!("Agents            {}", assets.agents.len()),
+        format!(
+            "Workflow gates    {}",
+            workflow_gate_mode_label(workflow_gate_mode)
+        ),
+        format!("Frontmatter warns {}", warning_count),
+    ];
+    details.extend(
+        assets
+            .warnings
+            .iter()
+            .map(|warning| format!("Frontmatter warning  {warning}")),
+    );
+
+    let status = if warning_count == 0 {
+        DiagnosticLevel::Ok
+    } else {
+        DiagnosticLevel::Warn
+    };
+    let summary = if warning_count == 0 {
+        "harness assets discovered successfully"
+    } else {
+        "harness assets discovered with frontmatter warnings"
+    };
+    let warning_values = assets.warnings;
+    DiagnosticCheck::new("Harness", status, summary)
+        .with_details(details)
+        .with_data(Map::from_iter([
+            ("skills".to_string(), json!(assets.skills.len())),
+            ("commands".to_string(), json!(assets.commands.len())),
+            ("agents".to_string(), json!(assets.agents.len())),
+            ("skills_count".to_string(), json!(assets.skills.len())),
+            ("commands_count".to_string(), json!(assets.commands.len())),
+            ("agents_count".to_string(), json!(assets.agents.len())),
+            (
+                "workflow_gates".to_string(),
+                json!(workflow_gate_mode_label(workflow_gate_mode)),
+            ),
+            (
+                "workflow_mode".to_string(),
+                json!(workflow_gate_mode_label(workflow_gate_mode)),
+            ),
+            (
+                "frontmatter_warning_count".to_string(),
+                json!(warning_count),
+            ),
+            ("frontmatter_warnings".to_string(), json!(warning_values)),
+        ]))
 }
 
 fn check_permission_health(permission_mode: PermissionModeProvenance) -> DiagnosticCheck {
@@ -11642,7 +11716,7 @@ fn render_help_topic(topic: LocalHelpTopic) -> String {
         LocalHelpTopic::Doctor => "Doctor
   Usage            claw doctor [--output-format <format>]
   Usage            clawcli doctor [--output-format <format>]
-  Purpose          diagnose local auth, config, workspace, sandbox, and build metadata
+  Purpose          diagnose local auth, config, harness assets, workspace, sandbox, and build metadata
   Output           local-only health report; no provider request or session resume required
   Formats          text (default), json
   Related          /doctor · clawcli --resume latest /doctor"
@@ -11656,8 +11730,8 @@ fn render_help_topic(topic: LocalHelpTopic) -> String {
   Related          ROADMAP #64a (discoverability) · ROADMAP #76 (real ACP support) · clawcli --help"
             .to_string(),
         LocalHelpTopic::Init => "Init
-  Usage            clawcli init [--output-format <format>]
-  Purpose          create .claw/, .claw.json, .gitignore, and CLAUDE.md in the current project
+  Usage            clawcli init [--harness] [--output-format <format>]
+  Purpose          create project guidance, config, and optionally the .claw harness starter pack
   Output           list of created vs. skipped files (idempotent: safe to re-run)
   Formats          text (default), json
   Related          clawcli status · clawcli doctor"
@@ -11932,7 +12006,7 @@ fn render_doctor_help_json() -> serde_json::Value {
         "command": "doctor",
         "schema_version": "1.0",
         "usage": "claw doctor [--output-format <format>]",
-        "purpose": "diagnose local auth, config, workspace memory, permissions, sandbox, boot preflight, and build metadata",
+        "purpose": "diagnose local auth, config, harness assets, workspace memory, permissions, sandbox, boot preflight, and build metadata",
         "formats": ["text", "json"],
         "local_only": true,
         "requires_credentials": false,
@@ -11940,7 +12014,7 @@ fn render_doctor_help_json() -> serde_json::Value {
         "requires_session_resume": false,
         "mutates_workspace": false,
         "output_fields": ["kind", "action", "status", "message", "report", "has_failures", "summary", "checks", "allowed_tools"],
-        "check_names": ["auth", "config", "mcp validation", "hook validation", "install source", "workspace", "memory", "boot preflight", "sandbox", "permissions", "system"],
+        "check_names": ["auth", "base urls", "config", "mcp validation", "hook validation", "harness", "install source", "workspace", "memory", "boot preflight", "sandbox", "permissions", "system"],
         "status_values": ["ok", "warn", "fail"],
         "options": [
             {

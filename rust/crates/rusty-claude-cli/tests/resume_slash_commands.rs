@@ -335,7 +335,11 @@ fn resumed_status_command_emits_structured_json_when_requested() {
     assert_eq!(parsed["kind"], "status");
     // model is null in resume mode (not known without --model flag)
     assert!(parsed["model"].is_null());
-    assert_eq!(parsed["permission_mode"], "workspace-write");
+    assert_eq!(
+        parsed["permission_mode"],
+        "danger-full-access",
+        "resume status should reflect the current default bypass posture"
+    );
     assert_eq!(parsed["usage"]["messages"], 1);
     assert!(parsed["usage"]["turns"].is_number());
     assert!(parsed["workspace"]["cwd"].as_str().is_some());

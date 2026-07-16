@@ -5,6 +5,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use runtime::Session;
+use serde_json::Value;
 
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -211,6 +212,84 @@ fn doctor_command_runs_as_a_local_shell_entrypoint() {
     assert!(stdout.contains("Workspace"));
     assert!(stdout.contains("Sandbox"));
     assert!(!stdout.contains("Thinking"));
+
+    fs::remove_dir_all(temp_dir).expect("cleanup temp dir");
+}
+
+#[test]
+fn doctor_reports_harness_assets_warnings_and_workflow_mode() {
+    let temp_dir = unique_temp_dir("doctor-harness");
+    let config_home = temp_dir.join("home").join(".claw");
+    let claw_dir = temp_dir.join(".claw");
+    fs::create_dir_all(&config_home).expect("config home should exist");
+    fs::create_dir_all(claw_dir.join("skills").join("review"))
+        .expect("skill directory should exist");
+    fs::create_dir_all(claw_dir.join("commands")).expect("commands directory should exist");
+    fs::create_dir_all(claw_dir.join("agents")).expect("agents directory should exist");
+
+    fs::write(
+        temp_dir.join(".claw.json"),
+        r#"{"workflow_gates":"advisory"}"#,
+    )
+    .expect("workflow config should write");
+    fs::write(
+        claw_dir.join("skills").join("review").join("SKILL.md"),
+        "---\nname: review\ndescription: Review changes\n---\nReview the diff.\n",
+    )
+    .expect("skill should write");
+    fs::write(
+        claw_dir.join("commands").join("ship.md"),
+        "---\nname: ship\ndescription: Ship changes\n---\nRun the release checks.\n",
+    )
+    .expect("command should write");
+    fs::write(
+        claw_dir.join("agents").join("qas.md"),
+        "---\nname: qas\ndescription: Verify changes\nrole: gate\n---\nVerify the result.\n",
+    )
+    .expect("agent should write");
+    fs::write(
+        claw_dir.join("commands").join("broken.md"),
+        "This command has no frontmatter.\n",
+    )
+    .expect("invalid command should write");
+
+    let text_output = offline_command_in(&temp_dir, &config_home)
+        .arg("doctor")
+        .output()
+        .expect("text doctor should launch");
+    assert_success(&text_output);
+    let text = String::from_utf8(text_output.stdout).expect("doctor text should be utf8");
+    assert!(text.contains("Harness"), "doctor text:\n{text}");
+    assert!(text.contains("Skills            1"), "doctor text:\n{text}");
+    assert!(text.contains("Commands          1"), "doctor text:\n{text}");
+    assert!(text.contains("Agents            1"), "doctor text:\n{text}");
+    assert!(
+        text.contains("Workflow gates    advisory"),
+        "doctor text:\n{text}"
+    );
+    assert!(text.contains("Frontmatter warning"), "doctor text:\n{text}");
+
+    let json_output = offline_command_in(&temp_dir, &config_home)
+        .args(["--output-format", "json", "doctor"])
+        .output()
+        .expect("JSON doctor should launch");
+    assert_success(&json_output);
+    let report: Value = serde_json::from_slice(&json_output.stdout).expect("doctor JSON");
+    let harness = report["checks"]
+        .as_array()
+        .expect("doctor checks")
+        .iter()
+        .find(|check| check["name"] == "harness")
+        .expect("harness check");
+    assert_eq!(harness["skills"], 1);
+    assert_eq!(harness["commands"], 1);
+    assert_eq!(harness["agents"], 1);
+    assert_eq!(harness["skills_count"], 1);
+    assert_eq!(harness["commands_count"], 1);
+    assert_eq!(harness["agents_count"], 1);
+    assert_eq!(harness["workflow_gates"], "advisory");
+    assert_eq!(harness["frontmatter_warning_count"], 1);
+    assert_eq!(harness["status"], "warn");
 
     fs::remove_dir_all(temp_dir).expect("cleanup temp dir");
 }

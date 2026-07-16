@@ -79,6 +79,18 @@ The installer copies `cliclaw` into a user-level bin directory and adds that dir
 
 ## Quick start
 
+### Project harness
+
+For repeatable, quality-gated agent work, initialize Claw's project harness:
+
+```bash
+./target/debug/clawcli init --harness
+```
+
+This adds project commands, skills, a gate agent, and a session-start hook
+without overwriting existing files. See [docs/harness.md](docs/harness.md) for
+the asset layout, hook protocol, and workflow gate modes.
+
 ### First-run doctor check
 
 ```bash
