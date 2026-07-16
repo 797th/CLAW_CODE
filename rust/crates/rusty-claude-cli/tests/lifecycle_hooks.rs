@@ -8,7 +8,7 @@
 //! runtime function directly.
 
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -114,10 +114,51 @@ fn user_prompt_submit_block_cancels_the_turn_before_any_model_call() {
     );
 }
 
+/// `SessionEnd` fires fire-and-forget from `Drop for LiveCli` (main.rs), so
+/// it should run on the normal one-shot exit path even though nothing in the
+/// turn loop itself calls it directly.
+#[test]
+fn session_end_hook_runs_on_process_exit() {
+    let workspace = unique_temp_dir("session-end-hook");
+    let config_home = workspace.join("config-home");
+    let home = workspace.join("home");
+    fs::create_dir_all(&workspace).expect("workspace should exist");
+    fs::create_dir_all(&config_home).expect("config home should exist");
+    fs::create_dir_all(&home).expect("home should exist");
+
+    fs::write(
+        workspace.join(".claw.json"),
+        r#"{"hooks":{"SessionEnd":["touch session_end_ran.marker"]}}"#,
+    )
+    .expect("hook config should write");
+
+    let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
+    let server = runtime
+        .block_on(MockAnthropicService::spawn())
+        .expect("mock service should start");
+    let base_url = server.base_url();
+
+    let output = run_claw_one_shot(&workspace, &config_home, &home, &base_url);
+    assert!(
+        output.status.success(),
+        "stdout:\n{}\n\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    assert!(
+        workspace.join("session_end_ran.marker").exists(),
+        "SessionEnd hook should have run (fire-and-forget) as the process exited; \
+         stdout:\n{}\n\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 fn run_claw_one_shot(
-    workspace: &PathBuf,
-    config_home: &PathBuf,
-    home: &PathBuf,
+    workspace: &Path,
+    config_home: &Path,
+    home: &Path,
     base_url: &str,
 ) -> Output {
     let mut command = Command::new(env!("CARGO_BIN_EXE_clawcli"));
@@ -144,7 +185,7 @@ fn run_claw_one_shot(
 /// Reads the sole session transcript file written under
 /// `<workspace>/.claw/sessions/<workspace-fingerprint>/` (`SessionStore::from_cwd`):
 /// one-shot mode creates exactly one session per invocation.
-fn read_only_session_transcript(workspace: &PathBuf) -> String {
+fn read_only_session_transcript(workspace: &Path) -> String {
     let sessions_root = workspace.join(".claw").join("sessions");
     let mut entries: Vec<PathBuf> = Vec::new();
     collect_jsonl_files(&sessions_root, &mut entries);
@@ -156,7 +197,7 @@ fn read_only_session_transcript(workspace: &PathBuf) -> String {
     fs::read_to_string(entries.remove(0)).expect("session transcript should be readable")
 }
 
-fn collect_jsonl_files(dir: &PathBuf, out: &mut Vec<PathBuf>) {
+fn collect_jsonl_files(dir: &Path, out: &mut Vec<PathBuf>) {
     let Ok(read_dir) = fs::read_dir(dir) else {
         return;
     };

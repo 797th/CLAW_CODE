@@ -8878,6 +8878,7 @@ impl LiveCli {
         let result = runtime.run_turn(input, Some(&mut permission_prompter));
         hook_abort_monitor.stop();
         let summary = result?;
+        print_lifecycle_warnings(&summary);
         self.replace_runtime(runtime)?;
         self.persist_session()?;
         let final_text = final_assistant_text(&summary);

@@ -959,7 +959,7 @@ mod tests {
         StaticToolExecutor, ToolExecutor, DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD,
     };
     use crate::compact::CompactionConfig;
-    use crate::config::{RuntimeFeatureConfig, RuntimeHookConfig};
+    use crate::config::{RuntimeFeatureConfig, RuntimeHookCommand, RuntimeHookConfig};
     use crate::permissions::{
         PermissionMode, PermissionPolicy, PermissionPromptDecision, PermissionPrompter,
         PermissionRequest,
@@ -1979,5 +1979,88 @@ mod tests {
 
         // then
         assert_eq!(error.to_string(), "upstream failed");
+    }
+
+    /// Task 3 fix: a `Stop` hook that always blocks must re-prompt the model
+    /// (feeding the block reason back as a user turn) rather than ending the
+    /// turn, but must not loop forever — the loop tolerates exactly
+    /// `MAX_CONSECUTIVE_STOP_BLOCKS` (3) consecutive blocks and then forces a
+    /// stop, surfacing a warning via `TurnSummary::lifecycle_warnings`.
+    #[test]
+    fn stop_hook_block_reprompts_the_model_capped_at_three_consecutive_blocks() {
+        struct AlwaysRespondsApiClient {
+            call_count: usize,
+        }
+
+        impl ApiClient for AlwaysRespondsApiClient {
+            fn stream(&mut self, _request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                self.call_count += 1;
+                // No tool calls, ever: every response looks like a natural
+                // stopping point, forcing the `Stop` hook to fire on every
+                // iteration.
+                Ok(vec![
+                    AssistantEvent::TextDelta(format!("response #{}", self.call_count)),
+                    AssistantEvent::MessageStop,
+                ])
+            }
+        }
+
+        let stop_hooks = vec![RuntimeHookCommand::new(shell_snippet(
+            r#"echo '{"decision":"block","reason":"verification incomplete"}'"#,
+        ))];
+        let feature_config = RuntimeFeatureConfig::default().with_hooks(
+            RuntimeHookConfig::default().with_lifecycle_hook_commands(
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                stop_hooks,
+                Vec::new(),
+            ),
+        );
+
+        let mut runtime = ConversationRuntime::new_with_features(
+            Session::new(),
+            AlwaysRespondsApiClient { call_count: 0 },
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+            &feature_config,
+        );
+
+        let summary = runtime
+            .run_turn("do the thing", None)
+            .expect("a capped Stop-block loop should still resolve to a successful turn");
+
+        // The model was called once for the original turn, then re-prompted
+        // once per tolerated block (3), then a 4th time whose Stop-block hit
+        // the cap and was forcibly allowed: 4 iterations total.
+        assert_eq!(summary.iterations, 4);
+
+        // The block reason was fed back to the model as a user turn, exactly
+        // 3 times (once per tolerated block) — not zero (proving re-prompt
+        // happened) and not unboundedly (proving the cap held).
+        let reprompt_count = runtime
+            .session()
+            .messages
+            .iter()
+            .filter(|message| {
+                message.role == MessageRole::User
+                    && message.blocks.iter().any(|block| matches!(
+                        block,
+                        ContentBlock::Text { text } if text.contains("verification incomplete")
+                    ))
+            })
+            .count();
+        assert_eq!(reprompt_count, 3);
+
+        // The forced-stop-after-cap warning is surfaced, not silently dropped.
+        assert!(
+            summary
+                .lifecycle_warnings
+                .iter()
+                .any(|warning| warning.contains("3 consecutive times")),
+            "expected a forced-stop warning, got: {:?}",
+            summary.lifecycle_warnings
+        );
     }
 }
