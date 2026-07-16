@@ -7,8 +7,7 @@
 //! overwrites a file the user has already created or edited).
 
 pub(crate) const QAS_AGENT: &str = include_str!("harness_templates/qas_agent.md");
-pub(crate) const START_WORK_COMMAND: &str =
-    include_str!("harness_templates/start_work_command.md");
+pub(crate) const START_WORK_COMMAND: &str = include_str!("harness_templates/start_work_command.md");
 pub(crate) const PRE_PR_COMMAND: &str = include_str!("harness_templates/pre_pr_command.md");
 pub(crate) const END_WORK_COMMAND: &str = include_str!("harness_templates/end_work_command.md");
 pub(crate) const PATTERN_DISCOVERY_SKILL: &str =

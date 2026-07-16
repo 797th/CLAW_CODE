@@ -12361,7 +12361,10 @@ fn init_claude_md() -> Result<String, Box<dyn std::error::Error>> {
     Ok(initialize_repo(&cwd)?.render())
 }
 
-fn run_init(output_format: CliOutputFormat, harness: bool) -> Result<(), Box<dyn std::error::Error>> {
+fn run_init(
+    output_format: CliOutputFormat,
+    harness: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
     let cwd = env::current_dir()?;
     let mut report = initialize_repo(&cwd)?;
     if harness {

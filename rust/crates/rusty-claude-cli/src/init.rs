@@ -198,6 +198,13 @@ const SESSION_START_HOOK_COMMAND: &str =
 /// merged into `.claw.json`. Write-if-absent only — an existing file (even
 /// one the user has since edited or deleted-then-recreated differently) is
 /// never overwritten; a second run only fills in whatever is still missing.
+///
+/// If an I/O error aborts this function partway through (e.g. disk full
+/// after the agent file but before the commands directory), the artifacts
+/// written so far are left in place rather than rolled back: that's safe
+/// because every step here is write-if-absent, so simply re-running
+/// `init --harness` after fixing the underlying error fills in exactly
+/// what's still missing without touching what already landed.
 pub(crate) fn initialize_harness(cwd: &Path) -> Result<InitReport, Box<dyn std::error::Error>> {
     let mut artifacts = Vec::new();
 

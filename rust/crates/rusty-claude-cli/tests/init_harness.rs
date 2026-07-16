@@ -105,7 +105,11 @@ fn init_harness_creates_full_tree_and_assets_parse() {
         .iter()
         .find(|agent| agent.name == "qas")
         .expect("qas agent should be discovered");
-    assert_eq!(qas.role, AgentRole::Gate, "qas.md should parse as role: gate");
+    assert_eq!(
+        qas.role,
+        AgentRole::Gate,
+        "qas.md should parse as role: gate"
+    );
 
     for name in ["start-work", "pre-pr", "end-work"] {
         assert!(
@@ -161,7 +165,8 @@ fn init_harness_is_idempotent_and_preserves_user_edits() {
     assert_success(&run_init_harness(&workspace));
 
     let qas_path = workspace.join(".claw/agents/qas.md");
-    let edited = "---\nname: qas\ndescription: user-customized gate\nrole: gate\n---\nUser's own words.\n";
+    let edited =
+        "---\nname: qas\ndescription: user-customized gate\nrole: gate\n---\nUser's own words.\n";
     fs::write(&qas_path, edited).expect("user edit should write");
 
     // Re-run init --harness: must be a no-op for files that already exist.
