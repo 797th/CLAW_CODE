@@ -17,6 +17,7 @@
 mod init;
 mod input;
 mod mao;
+mod picker;
 mod render;
 mod setup_wizard;
 
@@ -9327,22 +9328,47 @@ impl LiveCli {
     }
 
     fn choose_model_interactively(&mut self) -> Result<bool, Box<dyn std::error::Error>> {
+        const ALIASES: [&str; 4] = ["opus", "sonnet", "haiku", "gpt-oss"];
+
+        let mut items: Vec<picker::PickerItem> = ALIASES
+            .iter()
+            .map(|alias| picker::PickerItem::new(*alias, resolve_model_alias_with_config(alias)))
+            .collect();
+        items.push(picker::PickerItem::new("custom…", "type a provider/model"));
+
+        let initial = ALIASES
+            .iter()
+            .position(|alias| resolve_model_alias_with_config(alias) == self.model)
+            .unwrap_or(0);
+
         println!();
-        println!("Model selection");
-        println!("  Current          {}", self.model);
-        println!("  Aliases          opus · sonnet · haiku · gpt-oss");
-        print!("  Provider/model   ");
-        io::stdout().flush()?;
+        match picker::select_from_list("Select model", &items, initial)? {
+            picker::PickerOutcome::Cancelled => {
+                println!("Model unchanged.");
+                Ok(false)
+            }
+            picker::PickerOutcome::Selected(index) if index < ALIASES.len() => {
+                self.set_model(Some(ALIASES[index].to_string()))
+            }
+            // The "custom…" row, or a non-interactive session (piped stdin):
+            // fall back to a typed provider/model prompt.
+            picker::PickerOutcome::Selected(_) | picker::PickerOutcome::NotInteractive => {
+                println!("Model selection");
+                println!("  Current          {}", self.model);
+                println!("  Aliases          opus · sonnet · haiku · gpt-oss");
+                print!("  Provider/model   ");
+                io::stdout().flush()?;
 
-        let mut input = String::new();
-        io::stdin().read_line(&mut input)?;
-        let model = input.trim();
-        if model.is_empty() {
-            println!("Model unchanged.");
-            return Ok(false);
+                let mut input = String::new();
+                io::stdin().read_line(&mut input)?;
+                let model = input.trim();
+                if model.is_empty() {
+                    println!("Model unchanged.");
+                    return Ok(false);
+                }
+                self.set_model(Some(model.to_string()))
+            }
         }
-
-        self.set_model(Some(model.to_string()))
     }
 
     fn set_model(&mut self, model: Option<String>) -> Result<bool, Box<dyn std::error::Error>> {
