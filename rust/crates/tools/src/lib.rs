@@ -4159,9 +4159,13 @@ fn record_skill_invocation(skill: &str) {
     let Ok(cwd) = std::env::current_dir() else {
         return;
     };
+    // Normalize the same way `resolve_skill_path` does (commands::resolve_skill_path)
+    // so invocations like "$plan" or "/handoff" are recorded under the
+    // canonical name and don't fragment ledger entries.
+    let canonical = skill.trim().trim_start_matches('/').trim_start_matches('$');
     let weaver = runtime::skill_weaver::weaver_dir(&cwd);
     let mut ledger = runtime::skill_weaver::SkillLedger::load(&weaver);
-    ledger.record(skill, runtime::skill_weaver::SkillOutcome::Invoked);
+    ledger.record(canonical, runtime::skill_weaver::SkillOutcome::Invoked);
     let _ = ledger.save(&weaver);
 }
 
@@ -9042,6 +9046,35 @@ mod tests {
                 .expect("ledger entry should exist")
                 .invocations,
             1
+        );
+
+        // Real invocations arrive with `$`/`/` prefixes (see
+        // `skill_resolves_project_local_skills_and_legacy_commands` above).
+        // `resolve_skill_path` normalizes those away before matching, so
+        // the ledger must record under the same stripped, canonical name —
+        // otherwise "$demo-skill" and "demo-skill" fragment into separate
+        // ledger entries and break weave/quarantine/`/skills stats`, which
+        // key on canonical names.
+        let output = execute_skill(SkillInput {
+            skill: "$demo-skill".to_string(),
+            args: None,
+        })
+        .expect("execute_skill should succeed for $-prefixed invocation");
+        assert_eq!(output.skill, "$demo-skill");
+
+        let ledger =
+            runtime::skill_weaver::SkillLedger::load(&runtime::skill_weaver::weaver_dir(&root));
+        assert_eq!(
+            ledger
+                .entry("demo-skill")
+                .expect("ledger entry should exist under the canonical name")
+                .invocations,
+            2,
+            "$-prefixed invocation must accumulate under the same canonical ledger entry"
+        );
+        assert!(
+            ledger.entry("$demo-skill").is_none(),
+            "ledger must not fragment entries by raw, unnormalized skill name"
         );
 
         std::env::set_current_dir(&original_dir).expect("restore cwd");
