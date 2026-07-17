@@ -2,7 +2,7 @@ use ratatui::style::{Color, Modifier, Style};
 
 /// Claw Code's visual signature: cool cyan and indigo accents, warm orange
 /// emphasis, mint code, and slate structure. Keep this small and explicit so
-/// the standalone TUI can evolve without inheriting renderer internals.
+/// the full-screen renderer can evolve independently from the inline renderer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Theme {
     pub background: Color,

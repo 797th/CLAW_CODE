@@ -281,7 +281,11 @@ fn login_dialog(mode: LoginMode) -> LoginDialog {
     let base_url = current
         .base_url
         .unwrap_or_else(|| provider_base_url(&provider).to_string());
-    let model = current.model.unwrap_or_default();
+    let model = if crate::config::credentials_configured() {
+        current.model.unwrap_or_default()
+    } else {
+        String::new()
+    };
     LoginDialog {
         mode,
         field: LoginField::Provider,
@@ -316,7 +320,7 @@ pub struct App {
 
 pub fn run() -> io::Result<()> {
     let (mut terminal, mut guard) = open_terminal()?;
-    let mut app = App::demo();
+    let mut app = App::empty();
     let result = run_loop(&mut terminal, &mut app);
     guard.restore();
     result
@@ -338,36 +342,6 @@ fn run_loop(terminal: &mut crate::terminal::TuiTerminal, app: &mut App) -> io::R
 }
 
 impl App {
-    fn demo() -> Self {
-        let mut app = Self::empty();
-        app.messages.push(Message::new(
-            MessageKind::User,
-            "You",
-            "Please inspect `src/auth/token.rs`, verify expired bearer-token behavior, and keep the public API unchanged.",
-        ));
-        app.todos = vec![
-            Todo {
-                label: "Trace request validation".to_string(),
-                done: false,
-            },
-            Todo {
-                label: "Preserve error contract".to_string(),
-                done: false,
-            },
-            Todo {
-                label: "Add regression test".to_string(),
-                done: false,
-            },
-        ];
-        if app.model_available() {
-            app.start_stream("inspect auth middleware");
-        } else {
-            app.messages.clear();
-            app.todos.clear();
-        }
-        app
-    }
-
     fn empty() -> Self {
         Self {
             theme: Theme::default(),
@@ -663,7 +637,7 @@ impl App {
     }
 
     fn model_available(&self) -> bool {
-        !self.status.model.trim().is_empty()
+        !self.status.model.trim().is_empty() && crate::config::credentials_configured()
     }
 
     fn command_suggestions(&self) -> Vec<crate::slash::CommandSpec> {
@@ -747,7 +721,7 @@ impl App {
             "cost" | "stats" | "usage" => self.show_cost(),
             "version" => self.add_command_message(
                 "/version",
-                "CLAW_CODE TUI standalone demo. Runtime command handlers remain compatible with the parent CLI.",
+                "CLAW_CODE full-screen terminal interface.",
             ),
             "model" => self.handle_model_command(&args),
             "login" => self.open_login_dialog(LoginMode::Endpoint),
@@ -772,7 +746,7 @@ impl App {
             _ => self.add_command_message(
                 format!("/{name}"),
                 format!(
-                    "Recognized /{name}. It stayed on the command path and was not sent as a model prompt.\n\n{}\n\nThis standalone demo will use the production handler when the runtime bridge is connected.",
+                    "Recognized /{name}. It stayed on the command path and was not sent as a model prompt.\n\n{}",
                     command_summary(&name)
                 ),
             ),
@@ -1080,6 +1054,10 @@ impl App {
             self.show_notice("Switch model", "Model cannot be empty.");
             return;
         }
+        if !crate::config::credentials_configured() {
+            self.show_notice("Switch model", "Run /login before selecting a model.");
+            return;
+        }
         let previous = self.status.model.clone();
         self.status.model = resolved.clone();
         self.add_command_message(
@@ -1181,10 +1159,16 @@ impl App {
 
     fn logout(&mut self) {
         match crate::config::clear_provider() {
-            Ok(()) => self.add_command_message(
-                "/logout",
-                "Stored provider credentials and model settings removed.",
-            ),
+            Ok(()) => {
+                self.status.model.clear();
+                self.status.input_tokens = 0;
+                self.status.output_tokens = 0;
+                self.status.cost_cents = 0;
+                self.add_command_message(
+                    "/logout",
+                    "Stored provider credentials and model settings removed.",
+                );
+            }
             Err(error) => self.show_notice("Logout", error.to_string()),
         }
     }

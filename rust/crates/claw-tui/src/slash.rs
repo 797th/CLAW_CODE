@@ -1,8 +1,8 @@
-//! Slash-command parsing and command-surface metadata shared by the TUI demo.
+//! Slash-command parsing and command-surface metadata for the TUI.
 //!
 //! The names mirror the command registry in `CLAW_CODE/rust/crates/commands`.
 //! Keeping parsing here means a slash command is never accidentally sent as a
-//! normal model prompt while the full-screen frontend is still standalone.
+//! normal model prompt while the full-screen frontend owns the interactive surface.
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SlashCommand {

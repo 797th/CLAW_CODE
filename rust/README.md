@@ -14,8 +14,11 @@ cargo run -p rusty-claude-cli --bin clawcli -- --help
 # Build the workspace
 cargo build --workspace
 
-# Run the full-screen TUI demo
-cargo run -p claw-tui
+# Run the full-screen TUI (this is the default for `clawcli`)
+cargo run -p rusty-claude-cli --bin clawcli --
+
+# Use the legacy line-based REPL when needed
+cargo run -p rusty-claude-cli --bin clawcli -- --repl
 
 # Run the interactive REPL
 cargo run -p rusty-claude-cli --bin clawcli -- --model openai/gpt-oss-120b
@@ -30,9 +33,10 @@ cargo run -p rusty-claude-cli --bin clawcli -- --output-format json prompt "summ
 cargo run -p rusty-claude-cli --bin cliclaw --
 ```
 
-The workspace emits two entrypoints from the same `main.rs`:
+The workspace emits three entrypoints from the same `main.rs`:
 
 - `clawcli`: canonical binary name used by the docs and tests
+- `claw`: compatibility launcher
 - `cliclaw`: convenience launcher — same binary under a name that relaxes the working-directory guard (handy for global, run-from-anywhere installs)
 
 To install **both** binaries on macOS, Linux, or Windows, use the repo-root installer (see `../README.md`):
@@ -221,7 +225,7 @@ rust/
 ├── Cargo.lock
 └── crates/
     ├── api/                # Provider clients + streaming + request preflight
-    ├── claw-tui/           # Full-screen ratatui TUI demo
+    ├── claw-tui/           # Full-screen ratatui TUI frontend library
     ├── commands/           # Shared slash-command registry + help rendering
     ├── compat-harness/     # Compatibility/parity harness utilities
     ├── mock-anthropic-service/ # Deterministic local Anthropic-compatible mock
@@ -248,7 +252,7 @@ rust/
 
 - **~20K lines** of Rust
 - **10 crates** in workspace
-- **Binary names:** `clawcli`, `cliclaw`, `claw-tui`
+- **Binary names:** `clawcli`, `claw`, `cliclaw`
 - **Default model:** `openai/gpt-oss-120b`
 - **Default permissions:** `danger-full-access`
 

@@ -328,6 +328,8 @@ const CLI_OPTION_SUGGESTIONS: &[&str] = &[
     "-acp",
     "--print",
     "--compact",
+    "--tui",
+    "--repl",
     "--base-commit",
     "--allow-broad-cwd",
     "-p",
@@ -900,6 +902,8 @@ fn global_flag_without_value(flag: &str) -> bool {
             | "--dangerously-skip-permissions"
             | "--skip-permissions"
             | "--compact"
+            | "--tui"
+            | "--repl"
             | "--allow-broad-cwd"
             | "--print"
             | "--acp"
@@ -1561,18 +1565,38 @@ fn run_setup() -> Result<(), Box<dyn std::error::Error>> {
     setup_wizard::run_setup_wizard()
 }
 
+fn should_launch_tui(args: &[String]) -> bool {
+    if matches!(args, [argument] if argument == "--tui") {
+        return true;
+    }
+    args.is_empty() && io::stdin().is_terminal() && io::stdout().is_terminal()
+}
+
 #[allow(clippy::too_many_lines)]
 fn run() -> Result<(), Box<dyn std::error::Error>> {
-    let args: Vec<String> = env::args().skip(1).collect();
+    let raw_args: Vec<String> = env::args().skip(1).collect();
     // #824: suppress config deprecation prose warnings to stderr when JSON
     // output mode is active.  Scan the raw argv before parse_args so the
     // suppression is in place before any settings file is loaded.
-    let json_mode = raw_args_request_json_output(&args);
+    let json_mode = raw_args_request_json_output(&raw_args);
     if json_mode {
         runtime::suppress_config_warnings_for_json_mode();
     }
-    let (args, cwd) = split_global_cwd_args(&args)?;
+    let (mut args, cwd) = split_global_cwd_args(&raw_args)?;
     apply_global_cwd(cwd)?;
+
+    // The full-screen frontend is the normal interactive experience. Keep the
+    // proven line REPL available behind --repl for scripts, troubleshooting,
+    // and users who explicitly want the legacy interface.
+    if should_launch_tui(&args) {
+        enforce_broad_cwd_policy(launcher_defaults().allow_broad_cwd, CliOutputFormat::Text)?;
+        claw_tui::run()?;
+        return Ok(());
+    }
+    if args.first().is_some_and(|argument| argument == "--repl") {
+        args.remove(0);
+    }
+
     match parse_args(&args)? {
         CliAction::DumpManifests {
             output_format,
@@ -16356,7 +16380,8 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
         out,
         "  {command_name} [--model MODEL] [--allowedTools TOOL[,TOOL...]]"
     )?;
-    writeln!(out, "      Start the interactive REPL")?;
+    writeln!(out, "      Start the full-screen TUI (default interactive experience)")?;
+    writeln!(out, "      Use {command_name} --repl for the line-based REPL")?;
     writeln!(
         out,
         "  {command_name} [--model MODEL] [--output-format text|json] prompt TEXT"
@@ -16426,6 +16451,14 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
     writeln!(
         out,
         "  --model MODEL              Override the active model"
+    )?;
+    writeln!(
+        out,
+        "  --tui                      Launch the full-screen terminal interface"
+    )?;
+    writeln!(
+        out,
+        "  --repl                     Use the legacy line-based REPL"
     )?;
     writeln!(
         out,
@@ -17093,6 +17126,13 @@ mod tests {
                 allow_broad_cwd: false,
             }
         );
+    }
+
+    #[test]
+    fn tui_and_repl_launcher_flags_are_distinct() {
+        assert!(super::should_launch_tui(&["--tui".to_string()]));
+        assert!(!super::should_launch_tui(&["--repl".to_string()]));
+        assert!(!super::should_launch_tui(&["--tui".to_string(), "extra".to_string()]));
     }
 
     #[test]

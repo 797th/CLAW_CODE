@@ -19,6 +19,7 @@ path = "src/main.rs"
 
 [dependencies]
 api = { path = "../api" }
+claw-tui = { path = "../claw-tui" }
 commands = { path = "../commands" }
 crossterm = "0.28"
 pulldown-cmark = "0.13"

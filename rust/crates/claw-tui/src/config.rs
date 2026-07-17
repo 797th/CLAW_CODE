@@ -1,8 +1,8 @@
-//! Small config bridge used while the TUI is still a standalone application.
+//! Config bridge for the full-screen frontend.
 //!
 //! The production CLI stores model aliases in JSON and `/login` credentials in
 //! an owner-only `.env`. This module mirrors those keys and locations so the
-//! standalone TUI behaves predictably before the runtime is wired in.
+//! frontend follows the same configuration contract.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -86,7 +86,7 @@ impl ProviderConfig {
 
 #[must_use]
 pub fn configured_model() -> Option<String> {
-    [
+    let model = [
         "CLAW_MODEL",
         "NVIDIA_NIM_MODEL",
         "OPENAI_MODEL",
@@ -100,7 +100,35 @@ pub fn configured_model() -> Option<String> {
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty())
     })
-    .or_else(|| load_provider().model)
+    .or_else(|| load_provider().model);
+    model.filter(|_| credentials_configured())
+}
+
+#[must_use]
+pub fn credentials_configured() -> bool {
+    if load_provider()
+        .api_key
+        .is_some_and(|key| !key.trim().is_empty())
+    {
+        return true;
+    }
+
+    let dotenv = load_dotenv_values(&config_home().join(".env"));
+    [
+        "OPENAI_API_KEY",
+        "ANTHROPIC_API_KEY",
+        "ANTHROPIC_AUTH_TOKEN",
+        "XAI_API_KEY",
+        "NVIDIA_API_KEY",
+        "DASHSCOPE_API_KEY",
+    ]
+    .into_iter()
+    .any(|key| {
+        nonempty_env(key).is_some()
+            || dotenv
+                .get(key)
+                .is_some_and(|value| !value.trim().is_empty())
+    })
 }
 
 #[must_use]
