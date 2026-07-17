@@ -191,7 +191,12 @@ pub fn collect_episodes(
             continue;
         };
         if content.len() > budget {
-            break;
+            // This file alone would blow the remaining budget. Skip it and
+            // keep scanning older files rather than aborting the whole scan
+            // — otherwise a single oversize newest session starves weaving
+            // forever (`.last-weave` never advances since callers treat an
+            // empty result as `NoEpisodes` and bail before writing it).
+            continue;
         }
         budget -= content.len();
         episodes.push(Episode {
@@ -326,10 +331,52 @@ pub fn synthesize_skills(
     parse_weaver_output(&raw)
 }
 
+/// Whether `skills_root/learned/<name>` currently has a quarantined
+/// (parked) `SKILL.md.quarantined` file. Structural check only — mirrors
+/// the guard `hone()` uses, but keyed off `skills_root` (`.claw/skills`)
+/// rather than `cwd`, since that's what `write_learned_skills` already has
+/// in hand.
+fn learned_skill_is_quarantined(skills_root: &Path, name: &str) -> bool {
+    skills_root
+        .join(LEARNED_DIR_NAME)
+        .join(name)
+        .join(format!("SKILL.md.{QUARANTINE_SUFFIX}"))
+        .is_file()
+}
+
+/// Names of learned skills currently quarantined under
+/// `cwd/.claw/skills/learned/<name>/SKILL.md.quarantined`.
+///
+/// `harness_assets::discover` only sees live `SKILL.md` files, so a
+/// quarantined name silently drops off its "existing skills" list — the
+/// weaver provider would then be free to re-propose the same name, and
+/// (without the write-boundary guard in `write_learned_skills`) resurrect
+/// it as a live skill sitting right next to its own quarantine record.
+/// Call sites fold this into the "do not duplicate" hint alongside
+/// `discover(cwd)`'s names.
+#[must_use]
+pub fn quarantined_learned_skill_names(cwd: &Path) -> Vec<String> {
+    let learned_root = cwd.join(".claw").join("skills").join(LEARNED_DIR_NAME);
+    let mut names = Vec::new();
+    let Ok(entries) = fs::read_dir(&learned_root) else {
+        return names;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() || !path.join(format!("SKILL.md.{QUARANTINE_SUFFIX}")).is_file() {
+            continue;
+        }
+        if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+            names.push(name.to_string());
+        }
+    }
+    names
+}
+
 pub fn write_learned_skills(
     skills: &[WovenSkill],
     skills_root: &Path,
-) -> Result<Vec<PathBuf>, WeaverError> {
+) -> Result<(Vec<PathBuf>, Vec<String>), WeaverError> {
     // Two-phase write: stage every skill's tmp file first; only rename any
     // of them into place once every tmp write in the batch has succeeded.
     // This keeps a failure partway through a multi-skill pass from leaving
@@ -337,6 +384,7 @@ pub fn write_learned_skills(
     // Err (mirrors dreamer.rs's atomic_write discipline, extended to a
     // whole-batch guarantee).
     let mut staged: Vec<(PathBuf, PathBuf)> = Vec::new(); // (tmp, dest)
+    let mut skipped_quarantined: Vec<String> = Vec::new();
 
     let stage_result = (|| -> Result<(), WeaverError> {
         for skill in skills {
@@ -345,6 +393,18 @@ pub fn write_learned_skills(
                     "invalid skill name '{}'",
                     skill.name
                 )));
+            }
+            // Write-boundary guard for I4: the "do not duplicate" hint
+            // handed to the provider can still be ignored (or racing with
+            // a hone pass), so re-check here before ever touching disk.
+            // Skipping (not failing the whole batch) matches how the rest
+            // of this function treats a single bad skill as a fatal error
+            // only when it would silently overwrite/corrupt state — here
+            // nothing is corrupted by leaving the quarantined file alone,
+            // so we drop this one skill and keep the rest of the pass.
+            if learned_skill_is_quarantined(skills_root, &skill.name) {
+                skipped_quarantined.push(skill.name.clone());
+                continue;
             }
             let dir = skills_root.join(LEARNED_DIR_NAME).join(&skill.name);
             fs::create_dir_all(&dir)?;
@@ -373,13 +433,17 @@ pub fn write_learned_skills(
         fs::rename(&tmp, &dest)?;
         written.push(dest);
     }
-    Ok(written)
+    Ok((written, skipped_quarantined))
 }
 
 #[derive(Debug)]
 pub struct WeaveRun {
     pub files_written: Vec<PathBuf>,
     pub episode_count: usize,
+    /// Skill names the provider re-proposed that are currently quarantined
+    /// (`learned/<name>/SKILL.md.quarantined`); skipped rather than
+    /// resurrected as a live `SKILL.md`. See I4.
+    pub skipped_quarantined: Vec<String>,
 }
 
 pub fn run_weave_pass(
@@ -396,18 +460,25 @@ pub fn run_weave_pass(
     if episodes.is_empty() {
         return Err(WeaverError::NoEpisodes);
     }
-    let existing: Vec<String> = crate::harness_assets::discover(cwd)
+    let mut existing: Vec<String> = crate::harness_assets::discover(cwd)
         .skills
         .into_iter()
         .map(|s| s.name)
         .collect();
+    // Quarantined learned skills drop out of `discover()` (it only sees
+    // live SKILL.md files), so fold them back into the "do not duplicate"
+    // hint explicitly — otherwise the provider is free to re-propose a
+    // name that's already parked. write_learned_skills enforces this at
+    // the write boundary too, in case the hint is ignored.
+    existing.extend(quarantined_learned_skill_names(cwd));
     let skills = synthesize_skills(&episodes, &existing, client)?;
     let skills_root = cwd.join(".claw").join("skills");
-    let files_written = write_learned_skills(&skills, &skills_root)?;
+    let (files_written, skipped_quarantined) = write_learned_skills(&skills, &skills_root)?;
     fs::write(weaver.join(LAST_WEAVE_FILENAME), b"")?;
     Ok(WeaveRun {
         files_written,
         episode_count: episodes.len(),
+        skipped_quarantined,
     })
 }
 
@@ -681,6 +752,26 @@ mod tests {
     }
 
     #[test]
+    fn collect_episodes_skips_oversize_newest_file_and_keeps_older_ones() {
+        // Regression for I2: an oversize *newest* session must not zero out
+        // the whole result. The scan should skip it and keep filling the
+        // budget from older, smaller files instead of bailing out early.
+        let dir = tempfile::tempdir().unwrap();
+        let sessions = crate::session::workspace_sessions_dir(dir.path()).unwrap();
+        fs::create_dir_all(&sessions).unwrap();
+        let small = "old small session\n";
+        fs::write(sessions.join("a-old.jsonl"), small).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let oversize = "x".repeat(small.len() + 1);
+        fs::write(sessions.join("b-new.jsonl"), &oversize).unwrap();
+
+        // Budget large enough for the small file but not the oversize newest one.
+        let episodes = collect_episodes(dir.path(), None, small.len()).unwrap();
+        assert_eq!(episodes.len(), 1);
+        assert!(episodes[0].content.contains("old small session"));
+    }
+
+    #[test]
     fn collect_episodes_since_filters_old_sessions() {
         let dir = tempfile::tempdir().unwrap();
         let sessions = crate::session::workspace_sessions_dir(dir.path()).unwrap();
@@ -784,6 +875,57 @@ body
     }
 
     #[test]
+    fn write_learned_skills_skips_quarantined_name_without_resurrecting_it() {
+        // Regression for I4: re-proposing a quarantined skill's name must
+        // not write a live SKILL.md next to the SKILL.md.quarantined park
+        // file. The write boundary is the last line of defense even if the
+        // "do not duplicate" hint sent to the provider was ignored.
+        let dir = tempfile::tempdir().unwrap();
+        let skills_root = dir.path();
+        let learned = skills_root.join(LEARNED_DIR_NAME).join("flaky-skill");
+        fs::create_dir_all(&learned).unwrap();
+        fs::write(
+            learned.join("SKILL.md.quarantined"),
+            "---\nname: flaky-skill\ndescription: test\n---\nbody\n",
+        )
+        .unwrap();
+
+        let skills = vec![WovenSkill {
+            name: "flaky-skill".to_string(),
+            markdown: "---\nname: flaky-skill\ndescription: reproposed\n---\nnew body\n"
+                .to_string(),
+        }];
+        let (written, skipped) = write_learned_skills(&skills, skills_root).unwrap();
+        assert!(written.is_empty());
+        assert_eq!(skipped, vec!["flaky-skill".to_string()]);
+        assert!(!learned.join("SKILL.md").exists());
+        // Parked file must be untouched.
+        assert_eq!(
+            fs::read_to_string(learned.join("SKILL.md.quarantined")).unwrap(),
+            "---\nname: flaky-skill\ndescription: test\n---\nbody\n"
+        );
+    }
+
+    #[test]
+    fn quarantined_learned_skill_names_lists_parked_skills() {
+        let dir = tempfile::tempdir().unwrap();
+        let skill_dir = dir.path().join(".claw/skills/learned/flaky-skill");
+        fs::create_dir_all(&skill_dir).unwrap();
+        fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: flaky-skill\ndescription: test\n---\nbody\n",
+        )
+        .unwrap();
+        assert!(quarantined_learned_skill_names(dir.path()).is_empty());
+
+        quarantine_skill(dir.path(), "flaky-skill").unwrap();
+        assert_eq!(
+            quarantined_learned_skill_names(dir.path()),
+            vec!["flaky-skill".to_string()]
+        );
+    }
+
+    #[test]
     fn parse_weaver_output_rejects_duplicate_skill_names() {
         let dup = r#"<skill name="foo-bar-baz">
 ---
@@ -870,11 +1012,19 @@ body two
         // Hand-written skill outside learned/.
         let hand = dir.path().join(".claw/skills/manual-skill");
         fs::create_dir_all(&hand).unwrap();
-        fs::write(hand.join("SKILL.md"), "---\nname: manual-skill\ndescription: x\n---\nbody\n").unwrap();
+        fs::write(
+            hand.join("SKILL.md"),
+            "---\nname: manual-skill\ndescription: x\n---\nbody\n",
+        )
+        .unwrap();
         // Learned skill with too few invocations.
         let fresh = dir.path().join(".claw/skills/learned/fresh-skill");
         fs::create_dir_all(&fresh).unwrap();
-        fs::write(fresh.join("SKILL.md"), "---\nname: fresh-skill\ndescription: x\n---\nbody\n").unwrap();
+        fs::write(
+            fresh.join("SKILL.md"),
+            "---\nname: fresh-skill\ndescription: x\n---\nbody\n",
+        )
+        .unwrap();
 
         let mut ledger = SkillLedger::load(&weaver_dir(dir.path()));
         ledger.record("manual-skill", SkillOutcome::Invoked);
