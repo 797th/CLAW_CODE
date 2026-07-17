@@ -89,6 +89,88 @@ impl SkillLedger {
     }
 }
 
+#[derive(Debug)]
+pub enum WeaverError {
+    Io(io::Error),
+    Api(String),
+    InvalidOutput(String),
+    NoEpisodes,
+    Locked,
+}
+
+impl std::fmt::Display for WeaverError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            WeaverError::Io(e) => write!(f, "io error: {e}"),
+            WeaverError::Api(e) => write!(f, "provider error: {e}"),
+            WeaverError::InvalidOutput(e) => write!(f, "invalid weaver output: {e}"),
+            WeaverError::NoEpisodes => write!(f, "no session episodes to weave"),
+            WeaverError::Locked => write!(f, "another weave pass is running"),
+        }
+    }
+}
+
+impl std::error::Error for WeaverError {}
+
+impl From<io::Error> for WeaverError {
+    fn from(e: io::Error) -> Self {
+        WeaverError::Io(e)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct Episode {
+    pub session_file: PathBuf,
+    pub content: String,
+    pub modified: SystemTime,
+}
+
+pub fn collect_episodes(
+    cwd: &Path,
+    since: Option<SystemTime>,
+    max_total_bytes: usize,
+) -> Result<Vec<Episode>, WeaverError> {
+    let sessions_dir = crate::session::workspace_sessions_dir(cwd)
+        .map_err(|e| WeaverError::Io(io::Error::other(e.to_string())))?;
+    let mut files: Vec<(PathBuf, SystemTime)> = Vec::new();
+    let entries = match fs::read_dir(&sessions_dir) {
+        Ok(entries) => entries,
+        Err(_) => return Ok(Vec::new()),
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().is_some_and(|e| e == "jsonl") {
+            let modified = entry
+                .metadata()
+                .and_then(|m| m.modified())
+                .unwrap_or(UNIX_EPOCH);
+            if since.is_none_or(|cutoff| modified > cutoff) {
+                files.push((path, modified));
+            }
+        }
+    }
+    // Newest first.
+    files.sort_by_key(|a| std::cmp::Reverse(a.1));
+
+    let mut episodes = Vec::new();
+    let mut budget = max_total_bytes;
+    for (path, modified) in files {
+        let Ok(content) = fs::read_to_string(&path) else {
+            continue;
+        };
+        if content.len() > budget {
+            break;
+        }
+        budget -= content.len();
+        episodes.push(Episode {
+            session_file: path,
+            content,
+            modified,
+        });
+    }
+    Ok(episodes)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -119,5 +201,38 @@ mod tests {
         fs::create_dir_all(&weaver).unwrap();
         fs::write(weaver.join(STATS_FILENAME), "{not json").unwrap();
         assert!(SkillLedger::load(&weaver).is_empty());
+    }
+
+    #[test]
+    fn collect_episodes_reads_newest_first_and_respects_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let sessions = crate::session::workspace_sessions_dir(dir.path()).unwrap();
+        fs::create_dir_all(&sessions).unwrap();
+        fs::write(sessions.join("a.jsonl"), "old session\n").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        fs::write(sessions.join("b.jsonl"), "new session\n").unwrap();
+
+        let episodes = collect_episodes(dir.path(), None, 1024).unwrap();
+        assert_eq!(episodes.len(), 2);
+        assert!(episodes[0].content.contains("new session"));
+
+        // Budget smaller than both files keeps only the newest.
+        let episodes = collect_episodes(dir.path(), None, "new session\n".len()).unwrap();
+        assert_eq!(episodes.len(), 1);
+    }
+
+    #[test]
+    fn collect_episodes_since_filters_old_sessions() {
+        let dir = tempfile::tempdir().unwrap();
+        let sessions = crate::session::workspace_sessions_dir(dir.path()).unwrap();
+        fs::create_dir_all(&sessions).unwrap();
+        fs::write(sessions.join("a.jsonl"), "old\n").unwrap();
+        let cutoff = SystemTime::now();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        fs::write(sessions.join("b.jsonl"), "new\n").unwrap();
+
+        let episodes = collect_episodes(dir.path(), Some(cutoff), 1024).unwrap();
+        assert_eq!(episodes.len(), 1);
+        assert!(episodes[0].content.contains("new"));
     }
 }
