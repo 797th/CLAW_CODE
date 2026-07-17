@@ -13,6 +13,8 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, List, ListItem, Paragraph, Wrap};
 use ratatui::Frame;
 
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+
 use crate::markdown::render_markdown;
 use crate::terminal::open_terminal;
 use crate::theme::Theme;
@@ -50,6 +52,41 @@ fn resolve_model_alias_with_config(model: &str) -> String {
         resolved = next.trim().to_string();
     }
     resolved
+}
+
+/// Column width for picker labels: the widest label present, bounded so one
+/// very long model name cannot push the detail column off screen.
+fn model_picker_label_width(items: &[ModelChoice]) -> usize {
+    const MIN_LABEL_WIDTH: usize = 10;
+    const MAX_LABEL_WIDTH: usize = 34;
+    items
+        .iter()
+        .map(|item| UnicodeWidthStr::width(item.label.as_str()))
+        .max()
+        .unwrap_or(MIN_LABEL_WIDTH)
+        .clamp(MIN_LABEL_WIDTH, MAX_LABEL_WIDTH)
+}
+
+/// Pad `label` to `width` columns, truncating with an ellipsis when it does not
+/// fit. Measured in display columns, not chars, so wide glyphs still line up.
+fn pad_label(label: &str, width: usize) -> String {
+    let label_width = UnicodeWidthStr::width(label);
+    if label_width <= width {
+        return format!("{label}{:pad$}  ", "", pad = width - label_width);
+    }
+    let mut truncated = String::new();
+    let mut used = 0;
+    for character in label.chars() {
+        let char_width = UnicodeWidthChar::width(character).unwrap_or(0);
+        if used + char_width > width.saturating_sub(1) {
+            break;
+        }
+        truncated.push(character);
+        used += char_width;
+    }
+    truncated.push('…');
+    used += 1;
+    format!("{truncated}{:pad$}  ", "", pad = width.saturating_sub(used))
 }
 
 /// The last stretch of reasoning, collapsed to one line.
@@ -1205,10 +1242,33 @@ impl App {
         }
     }
 
-    /// Ask the configured endpoint which models it serves, on a worker thread
-    /// so the frame loop keeps running. `poll_model_list` installs the picker
-    /// once the answer lands.
+    /// Open the picker, reusing the endpoint's model list if it is already
+    /// cached.
+    ///
+    /// The list is fetched once per session and kept in `model_list_state`.
+    /// Re-fetching on every open made the rows visibly rebuild underneath the
+    /// cursor; `/login` invalidates the cache instead, since that is what can
+    /// actually change the answer.
     fn open_model_picker(&mut self) {
+        let cached = match &self.model_list_state {
+            ModelListState::Loaded(models) => Some(models.clone()),
+            ModelListState::Idle | ModelListState::Loading | ModelListState::Failed(_) => None,
+        };
+
+        if let Some(models) = cached {
+            let items = self.model_picker_items(&models);
+            let selected = items
+                .iter()
+                .position(|item| item.value == self.status.model)
+                .unwrap_or(0);
+            self.overlay = Some(Overlay::ModelPicker {
+                title: self.model_picker_title(),
+                items,
+                selected,
+            });
+            return;
+        }
+
         self.model_list_state = ModelListState::Loading;
         self.overlay = Some(Overlay::ModelPicker {
             title: self.model_picker_title(),
@@ -1224,6 +1284,14 @@ impl App {
             let _ = tx.send(result);
         });
         self.model_list_rx = Some(rx);
+    }
+
+    /// Drop the cached model list so the next `/model` re-asks the endpoint.
+    /// Credentials or base URL changing is the one thing that changes the
+    /// answer.
+    fn invalidate_model_list_cache(&mut self) {
+        self.model_list_state = ModelListState::Idle;
+        self.model_list_rx = None;
     }
 
     /// Rebuild picker rows from the endpoint's models plus local aliases.
@@ -1567,6 +1635,9 @@ impl App {
                 match result {
                     Ok(path) => {
                         self.status.model = resolve_model_alias_with_config(&dialog.model);
+                        // New credentials or base URL mean a different endpoint,
+                        // so the cached model list no longer describes it.
+                        self.invalidate_model_list_cache();
                         let command_name = if dialog.mode == LoginMode::Endpoint {
                             "/login"
                         } else {
@@ -2258,6 +2329,9 @@ impl App {
                 items,
                 selected,
             } => {
+                // Pad to the widest label present: a fixed width collided with
+                // the detail column as soon as a model name outgrew it.
+                let label_width = model_picker_label_width(items);
                 let lines = items
                     .iter()
                     .enumerate()
@@ -2270,7 +2344,7 @@ impl App {
                         };
                         Line::from(vec![
                             Span::styled(marker, self.theme.accent),
-                            Span::styled(format!("{:<16}", item.label), label_style),
+                            Span::styled(pad_label(&item.label, label_width), label_style),
                             Span::styled(item.detail.clone(), self.theme.muted()),
                         ])
                     })
@@ -2561,9 +2635,11 @@ mod tests {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use ratatui::{backend::TestBackend, Terminal};
 
+    use super::UnicodeWidthStr;
     use super::{
         model_label, reasoning_tail, resolve_model_alias_with_config, App, LoginMode, Message,
-        MessageKind, ModelChoiceAction, ModelListState, Overlay, StreamEvent, ToolState,
+        MessageKind, ModelChoice, ModelChoiceAction, ModelListState, Overlay, StreamEvent,
+        ToolState,
     };
 
     #[test]
@@ -2655,6 +2731,114 @@ mod tests {
         let second = app.spinner();
 
         assert_ne!(first, second, "the reasoning glyph should animate");
+    }
+
+    #[test]
+    fn reopening_the_picker_reuses_the_cached_list_instead_of_refetching() {
+        let mut app = App::empty();
+        app.status.model = "gpt-4.1".to_string();
+        app.model_list_state = ModelListState::Loaded(vec!["o3-mini".to_string()]);
+
+        app.open_model_picker();
+
+        // No fetch was started: a refetch is what made the rows rebuild
+        // underneath the cursor on every open.
+        assert!(
+            app.model_list_rx.is_none(),
+            "a cached list must not trigger another lookup"
+        );
+        assert!(matches!(app.model_list_state, ModelListState::Loaded(_)));
+        let Some(Overlay::ModelPicker { items, .. }) = &app.overlay else {
+            panic!("picker should be open");
+        };
+        assert!(
+            items.iter().any(|item| item.value == "o3-mini"),
+            "cached models must show immediately"
+        );
+    }
+
+    #[test]
+    fn an_uncached_picker_still_fetches() {
+        let mut app = App::empty();
+        app.model_list_state = ModelListState::Idle;
+
+        app.open_model_picker();
+
+        assert!(
+            app.model_list_rx.is_some(),
+            "first open must ask the endpoint"
+        );
+        assert!(matches!(app.model_list_state, ModelListState::Loading));
+    }
+
+    #[test]
+    fn logging_in_drops_the_cached_list_because_the_endpoint_changed() {
+        let mut app = App::empty();
+        app.model_list_state = ModelListState::Loaded(vec!["old-endpoint-model".to_string()]);
+
+        app.invalidate_model_list_cache();
+
+        assert!(matches!(app.model_list_state, ModelListState::Idle));
+        assert!(app.model_list_rx.is_none());
+    }
+
+    #[test]
+    fn picker_labels_pad_to_the_widest_name_so_details_stay_aligned() {
+        let items = vec![
+            ModelChoice {
+                label: "current".to_string(),
+                value: "a".to_string(),
+                detail: "active".to_string(),
+                action: ModelChoiceAction::Switch,
+            },
+            ModelChoice {
+                label: "Ternary-Bonsai-27B-NX5".to_string(),
+                value: "b".to_string(),
+                detail: "available".to_string(),
+                action: ModelChoiceAction::Switch,
+            },
+        ];
+
+        let width = super::model_picker_label_width(&items);
+        assert_eq!(
+            width,
+            "Ternary-Bonsai-27B-NX5".len(),
+            "widest label sets the column"
+        );
+
+        // Every row's detail must start at the same column.
+        let short = super::pad_label("current", width);
+        let long = super::pad_label("Ternary-Bonsai-27B-NX5", width);
+        assert_eq!(
+            UnicodeWidthStr::width(short.as_str()),
+            UnicodeWidthStr::width(long.as_str()),
+            "short and long labels must occupy the same width"
+        );
+        assert!(
+            long.ends_with("  "),
+            "a long label still needs a gap: {long:?}"
+        );
+    }
+
+    #[test]
+    fn an_absurdly_long_model_name_is_truncated_rather_than_shoving_details_offscreen() {
+        let width = super::model_picker_label_width(&[ModelChoice {
+            label: "x".repeat(80),
+            value: "x".to_string(),
+            detail: "d".to_string(),
+            action: ModelChoiceAction::Switch,
+        }]);
+        assert!(
+            width <= 34,
+            "the label column must stay bounded, got {width}"
+        );
+
+        let padded = super::pad_label(&"x".repeat(80), width);
+        assert!(
+            padded.contains('…'),
+            "truncation should be marked: {padded:?}"
+        );
+        assert_eq!(UnicodeWidthStr::width(padded.as_str()), width + 2);
     }
 
     #[test]
