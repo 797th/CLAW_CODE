@@ -9,6 +9,7 @@ mod bash;
 pub mod bash_validation;
 mod bootstrap;
 pub mod branch_lock;
+pub mod caveman;
 mod compact;
 mod config;
 pub mod config_validate;
@@ -70,6 +71,10 @@ pub use compact::{
     compact_session, compact_session_to_target, estimate_session_tokens, format_compact_summary,
     get_compact_continuation_message, should_compact, CompactionConfig, CompactionResult,
     DEFAULT_COMPACTION_KEEP_RECENT_TOKENS,
+};
+pub use caveman::{
+    caveman_enabled, compress_caveman, estimate_tokens, fidelity_percent, measure_caveman,
+    CavemanMetrics, CAVEMAN_ENV_VAR,
 };
 pub use config::{
     ConfigEntry, ConfigError, ConfigFileReport, ConfigFileStatus, ConfigInspection, ConfigLoader,

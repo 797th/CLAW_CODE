@@ -122,7 +122,7 @@ fn compact_flag_streaming_text_only_emits_final_message_text() {
     );
     let stdout = String::from_utf8(output.stdout).expect("stdout should be utf8");
     assert_eq!(
-        stdout, "Mock streaming says hello from the parity harness.\n",
+        stdout, "Mock streaming says hello from parity harness.\n",
         "compact streaming stdout should contain only the final assistant text"
     );
 
@@ -172,7 +172,7 @@ fn text_prompt_mode_prints_final_assistant_text_after_spinner() {
     let stdout = String::from_utf8(output.stdout).expect("stdout should be utf8");
     let plain_stdout = strip_ansi_codes(&stdout);
     assert!(
-        plain_stdout.contains("Mock streaming says hello from the parity harness."),
+        plain_stdout.contains("Mock streaming says hello from parity harness."),
         "text prompt stdout should include the assistant text ({stdout:?})"
     );
     assert!(
@@ -182,7 +182,7 @@ fn text_prompt_mode_prints_final_assistant_text_after_spinner() {
     assert!(
         plain_stdout
             .lines()
-            .any(|line| line == "Mock streaming says hello from the parity harness."),
+            .any(|line| line == "Mock streaming says hello from parity harness."),
         "text prompt stdout should print the assistant text as its own line ({stdout:?})"
     );
 
@@ -237,7 +237,7 @@ stderr:
     let parsed: Value = serde_json::from_str(&stdout).expect("compact json stdout should parse");
     assert_eq!(
         parsed["message"],
-        "Mock streaming says hello from the parity harness."
+        "Mock streaming says hello from parity harness."
     );
     assert_eq!(parsed["compact"], true);
     assert_eq!(parsed["model"], "claude-sonnet-4-6");
@@ -289,7 +289,7 @@ fn prompt_subcommand_reads_prompt_from_stdin_when_no_positional_arg_423() {
     let parsed: Value = serde_json::from_slice(&output.stdout).expect("stdout should parse");
     assert_eq!(
         parsed["message"],
-        "Mock streaming says hello from the parity harness."
+        "Mock streaming says hello from parity harness."
     );
     let captured = runtime.block_on(server.captured_requests());
     assert!(
