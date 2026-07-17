@@ -22,18 +22,30 @@ pub struct TerminalGuard {
     restored: bool,
 }
 
+/// Mouse capture routes drags to the app, which stops the terminal's own
+/// click-drag selection — so text in the transcript cannot be highlighted or
+/// copied. Selection is worth more than wheel scrolling (keys cover that), so
+/// capture is opt-in via `CLAW_MOUSE_CAPTURE=1`.
+pub fn mouse_capture_requested() -> bool {
+    std::env::var("CLAW_MOUSE_CAPTURE")
+        .map(|value| matches!(value.trim(), "1" | "true" | "yes"))
+        .unwrap_or(false)
+}
+
 impl TerminalGuard {
     pub fn enter() -> io::Result<Self> {
         enable_raw_mode()?;
         let mut stdout = io::stdout();
-        if let Err(error) = execute!(
-            stdout,
-            EnterAlternateScreen,
-            event::EnableMouseCapture,
-            cursor::Hide
-        ) {
+        if let Err(error) = execute!(stdout, EnterAlternateScreen, cursor::Hide) {
             let _ = disable_raw_mode();
             return Err(error);
+        }
+        if mouse_capture_requested() {
+            if let Err(error) = execute!(stdout, event::EnableMouseCapture) {
+                let _ = execute!(stdout, cursor::Show, LeaveAlternateScreen);
+                let _ = disable_raw_mode();
+                return Err(error);
+            }
         }
 
         let previous_hook = Arc::new(Mutex::new(Some(panic::take_hook())));
@@ -92,10 +104,51 @@ pub fn open_terminal() -> io::Result<(TuiTerminal, TerminalGuard)> {
 fn restore_terminal() {
     let _ = disable_raw_mode();
     let mut stdout = io::stdout();
+    // Disabling capture that was never enabled is a no-op, so this stays
+    // unconditional and still cleans up after `CLAW_MOUSE_CAPTURE=1` runs.
     let _ = execute!(
         stdout,
         cursor::Show,
         event::DisableMouseCapture,
         LeaveAlternateScreen
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::mouse_capture_requested;
+
+    /// Serializes the env mutation below against other tests in this binary.
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    #[test]
+    fn mouse_capture_stays_off_unless_explicitly_requested() {
+        let _guard = env_lock();
+
+        std::env::remove_var("CLAW_MOUSE_CAPTURE");
+        assert!(
+            !mouse_capture_requested(),
+            "default must leave selection/copy working"
+        );
+
+        for value in ["0", "false", "", "no"] {
+            std::env::set_var("CLAW_MOUSE_CAPTURE", value);
+            assert!(
+                !mouse_capture_requested(),
+                "{value:?} should not enable capture"
+            );
+        }
+
+        for value in ["1", "true", "yes", " 1 "] {
+            std::env::set_var("CLAW_MOUSE_CAPTURE", value);
+            assert!(mouse_capture_requested(), "{value:?} should enable capture");
+        }
+
+        std::env::remove_var("CLAW_MOUSE_CAPTURE");
+    }
 }
