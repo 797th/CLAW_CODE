@@ -5,7 +5,7 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use crate::input::FooterStore;
+use crate::input::{FooterStore, WorkingInputStore};
 use crossterm::cursor::{Hide, MoveTo, MoveToColumn, Show};
 use crossterm::style::{Color, Print, ResetColor, SetForegroundColor, Stylize};
 use crossterm::terminal::{self, Clear, ClearType};
@@ -242,12 +242,22 @@ impl LiveSpinner {
         theme: ColorTheme,
         footer_store: Option<FooterStore>,
         composer_column: Option<u16>,
+        working_input: Option<WorkingInputStore>,
     ) -> io::Result<Self> {
         let label = label.into();
         let (stop_tx, stop_rx) = mpsc::channel();
         let join_handle = thread::Builder::new()
             .name("claw-live-spinner".to_string())
-            .spawn(move || animate_spinner(label, theme, footer_store, composer_column, stop_rx))
+            .spawn(move || {
+                animate_spinner(
+                    label,
+                    theme,
+                    footer_store,
+                    composer_column,
+                    working_input,
+                    stop_rx,
+                )
+            })
             .map_err(io::Error::other)?;
 
         Ok(Self {
@@ -283,6 +293,7 @@ fn animate_spinner(
     theme: ColorTheme,
     footer_store: Option<FooterStore>,
     composer_column: Option<u16>,
+    working_input: Option<WorkingInputStore>,
     stop_rx: Receiver<()>,
 ) -> io::Result<()> {
     let mut spinner = Spinner::new();
@@ -314,9 +325,28 @@ fn animate_spinner(
                     Print(footer)
                 )?;
             }
+            let cursor_column = if let Some(working_input) = working_input.as_ref() {
+                if let Some(snapshot) = working_input
+                    .lock()
+                    .ok()
+                    .map(|state| state.snapshot())
+                {
+                    queue!(
+                        stdout,
+                        MoveTo(0, input_row),
+                        Clear(ClearType::CurrentLine),
+                        Print(snapshot.rendered_line())
+                    )?;
+                    snapshot.cursor_column()
+                } else {
+                    composer_column.unwrap_or_default()
+                }
+            } else {
+                composer_column.unwrap_or_default()
+            };
             queue!(
                 stdout,
-                MoveTo(composer_column.unwrap_or_default(), input_row),
+                MoveTo(cursor_column, input_row),
                 Show
             )?;
             stdout.flush()?;
@@ -363,6 +393,7 @@ impl ActivityIndicator {
         animated: bool,
         footer_store: Option<FooterStore>,
         composer_column: Option<u16>,
+        working_input: Option<WorkingInputStore>,
         out: &mut impl Write,
     ) -> io::Result<Self> {
         if animated {
@@ -371,6 +402,7 @@ impl ActivityIndicator {
                 theme,
                 footer_store,
                 composer_column,
+                working_input,
             )?))
         } else {
             let mut spinner = Spinner::new();

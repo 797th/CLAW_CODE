@@ -22,7 +22,7 @@ mod picker;
 mod render;
 mod setup_wizard;
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, VecDeque};
 use std::env;
 use std::fs;
 use std::io::{self, IsTerminal, Read, Write};
@@ -8168,6 +8168,8 @@ fn run_repl(
     );
     let live_usage_reporter = LiveUsageReporter::new(editor.footer_store());
     cli.set_live_usage_reporter(live_usage_reporter.clone());
+    let mut pending_inputs: VecDeque<String> = VecDeque::new();
+    let mut pending_draft: Option<String> = None;
     if cli.is_connected() {
         println!("{}", cli.startup_banner());
         println!("{}", format_connected_line(&cli.model));
@@ -8180,7 +8182,14 @@ fn run_repl(
         editor.set_permission_mode(cli.permission_mode.as_str());
         editor.set_footer(cli.repl_footer());
         editor.set_completions(cli.repl_completion_candidates().unwrap_or_default());
-        let read_outcome = editor.read_line()?;
+        let read_outcome = if let Some(input) = pending_inputs.pop_front() {
+            editor.show_queued_input(&input)?;
+            input::ReadOutcome::Submit(input)
+        } else if let Some(draft) = pending_draft.take() {
+            editor.read_line_with_initial(Some(&draft))?
+        } else {
+            editor.read_line()?
+        };
         let requested_permission_mode = editor.permission_mode();
         if requested_permission_mode != cli.permission_mode.as_str() {
             cli.set_permissions(Some(requested_permission_mode))?;
@@ -8236,7 +8245,16 @@ fn run_repl(
                             if is_superpowers_invocation(&prompt) {
                                 print_superpowers_checklist();
                             }
-                            cli.run_turn_with_composer(&prompt, composer_column)?;
+                            queue_working_input_result(
+                                &mut pending_inputs,
+                                &mut pending_draft,
+                                run_interactive_turn_after_begin(
+                                    &mut cli,
+                                    &editor,
+                                    &prompt,
+                                    composer_column,
+                                )?,
+                            );
                         } else if cli.handle_repl_command(command, &custom_commands)? {
                             cli.persist_session()?;
                         }
@@ -8265,7 +8283,16 @@ fn run_repl(
                     if is_superpowers_invocation(&prompt) {
                         print_superpowers_checklist();
                     }
-                    cli.run_turn_with_composer(&prompt, composer_column)?;
+                    queue_working_input_result(
+                        &mut pending_inputs,
+                        &mut pending_draft,
+                        run_interactive_turn_after_begin(
+                            &mut cli,
+                            &editor,
+                            &prompt,
+                            composer_column,
+                        )?,
+                    );
                     continue;
                 }
                 editor.push_history(input);
@@ -8277,7 +8304,16 @@ fn run_repl(
                 );
                 editor.begin_working()?;
                 let composer_column = editor.composer_cursor_column();
-                cli.run_turn_with_composer(&trimmed, composer_column)?;
+                queue_working_input_result(
+                    &mut pending_inputs,
+                    &mut pending_draft,
+                    run_interactive_turn_after_begin(
+                        &mut cli,
+                        &editor,
+                        &trimmed,
+                        composer_column,
+                    )?,
+                );
             }
             input::ReadOutcome::Cancel => {}
             input::ReadOutcome::Exit => {
@@ -8288,6 +8324,34 @@ fn run_repl(
     }
 
     Ok(())
+}
+
+fn run_interactive_turn_after_begin(
+    cli: &mut LiveCli,
+    editor: &input::LineEditor,
+    prompt: &str,
+    composer_column: Option<u16>,
+) -> Result<input::WorkingInputResult, Box<dyn std::error::Error>> {
+    let mut working_input = editor.start_working_input()?;
+    let turn_result = cli.run_turn_with_composer(
+        prompt,
+        composer_column,
+        Some(working_input.store()),
+    );
+    let queued_inputs = working_input.finish()?;
+    turn_result?;
+    Ok(queued_inputs)
+}
+
+fn queue_working_input_result(
+    pending_inputs: &mut VecDeque<String>,
+    pending_draft: &mut Option<String>,
+    result: input::WorkingInputResult,
+) {
+    pending_inputs.extend(result.queued);
+    if !result.draft.is_empty() {
+        *pending_draft = Some(result.draft);
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -9195,15 +9259,16 @@ impl LiveCli {
     }
 
     fn run_turn(&mut self, input: &str) -> Result<(), Box<dyn std::error::Error>> {
-        self.run_turn_internal(input, true, None)
+        self.run_turn_internal(input, true, None, None)
     }
 
     fn run_turn_with_composer(
         &mut self,
         input: &str,
         composer_column: Option<u16>,
+        working_input: Option<input::WorkingInputStore>,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        self.run_turn_internal(input, true, composer_column)
+        self.run_turn_internal(input, true, composer_column, working_input)
     }
 
     fn run_turn_internal(
@@ -9211,6 +9276,7 @@ impl LiveCli {
         input: &str,
         clean_interactive_output: bool,
         composer_column: Option<u16>,
+        working_input: Option<input::WorkingInputStore>,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let (mut runtime, hook_abort_monitor) =
             self.prepare_turn_runtime(!clean_interactive_output)?;
@@ -9224,6 +9290,7 @@ impl LiveCli {
                 .as_ref()
                 .map(LiveUsageReporter::footer_store),
             composer_column,
+            working_input,
             &mut stdout,
         )?;
         let mut permission_prompter = CliPermissionPrompter::new(self.permission_mode);
@@ -9486,7 +9553,7 @@ impl LiveCli {
         match output_format {
             CliOutputFormat::Json if compact => self.run_prompt_compact_json(input),
             CliOutputFormat::Text if compact => self.run_prompt_compact(input),
-            CliOutputFormat::Text => self.run_turn_internal(input, false, None),
+            CliOutputFormat::Text => self.run_turn_internal(input, false, None, None),
             CliOutputFormat::Json => self.run_prompt_json(input),
         }
     }

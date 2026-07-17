@@ -1,12 +1,14 @@
 use std::borrow::Cow;
 use std::cell::RefCell;
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, VecDeque};
 use std::env;
 use std::fs;
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
+use std::thread::{self, JoinHandle};
+use std::time::Duration;
 
 use crossterm::style::{style, Color, Stylize};
 use crossterm::terminal;
@@ -32,6 +34,188 @@ pub enum ReadOutcome {
 /// flight. Keeping the string behind a mutex lets the stream callback update
 /// usage without competing with the spinner thread for terminal ownership.
 pub type FooterStore = Arc<Mutex<String>>;
+
+/// Shared state for the composer that stays active while a model turn is
+/// running. The spinner renders this state; the input worker only mutates it
+/// from terminal key events, so neither side has to compete for stdout.
+pub type WorkingInputStore = Arc<Mutex<WorkingInputState>>;
+
+#[derive(Debug, Default)]
+pub struct WorkingInputState {
+    prompt: String,
+    buffer: String,
+    queued: VecDeque<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkingInputSnapshot {
+    prompt: String,
+    buffer: String,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct WorkingInputResult {
+    pub queued: Vec<String>,
+    pub draft: String,
+}
+
+impl WorkingInputState {
+    pub(crate) fn snapshot(&self) -> WorkingInputSnapshot {
+        WorkingInputSnapshot {
+            prompt: self.prompt.clone(),
+            buffer: self.buffer.clone(),
+        }
+    }
+}
+
+impl WorkingInputSnapshot {
+    #[must_use]
+    pub fn rendered_line(&self) -> String {
+        format!("{}{}", self.prompt, self.buffer)
+    }
+
+    /// Return the zero-based cursor column after the current working buffer.
+    #[must_use]
+    pub fn cursor_column(&self) -> u16 {
+        let buffer_width = u16::try_from(self.buffer.chars().count()).unwrap_or(u16::MAX);
+        prompt_cursor_column(&self.prompt)
+            .saturating_sub(1)
+            .saturating_add(buffer_width)
+    }
+}
+
+/// Owns the short-lived key-event reader used during a model turn. Pressing
+/// Enter queues a complete prompt for the next turn; ordinary characters are
+/// kept in the visible bottom composer until submitted.
+pub struct WorkingInputSession {
+    store: WorkingInputStore,
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    join_handle: Option<JoinHandle<io::Result<()>>>,
+}
+
+impl WorkingInputSession {
+    pub fn start(prompt: impl Into<String>) -> io::Result<Self> {
+        let store = Arc::new(Mutex::new(WorkingInputState {
+            prompt: prompt.into(),
+            ..WorkingInputState::default()
+        }));
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
+            return Ok(Self {
+                store,
+                stop,
+                join_handle: None,
+            });
+        }
+
+        use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+
+        terminal::enable_raw_mode().map_err(io::Error::other)?;
+        let worker_store = Arc::clone(&store);
+        let worker_stop = Arc::clone(&stop);
+        let join_handle = match thread::Builder::new()
+            .name("claw-working-input".to_string())
+            .spawn(move || {
+                let result = (|| {
+                    while !worker_stop.load(std::sync::atomic::Ordering::Acquire) {
+                        if !event::poll(Duration::from_millis(40)).map_err(io::Error::other)? {
+                            continue;
+                        }
+                        let event = event::read().map_err(io::Error::other)?;
+                        match event {
+                            Event::Paste(text) => {
+                                if let Ok(mut state) = worker_store.lock() {
+                                    state.buffer.push_str(&text);
+                                }
+                            }
+                            Event::Key(key) if key.kind == KeyEventKind::Press => {
+                                if let Ok(mut state) = worker_store.lock() {
+                                    match key.code {
+                                        KeyCode::Char(character)
+                                            if !key.modifiers.intersects(
+                                                KeyModifiers::CONTROL | KeyModifiers::ALT,
+                                            ) =>
+                                        {
+                                            state.buffer.push(character);
+                                        }
+                                        KeyCode::Backspace => {
+                                            state.buffer.pop();
+                                        }
+                                        KeyCode::Enter
+                                            if key.modifiers.contains(KeyModifiers::SHIFT) =>
+                                        {
+                                            state.buffer.push('\n');
+                                        }
+                                        KeyCode::Enter => {
+                                            let entry = std::mem::take(&mut state.buffer);
+                                            if !entry.trim().is_empty() {
+                                                state.queued.push_back(entry);
+                                            }
+                                        }
+                                        KeyCode::Esc => state.buffer.clear(),
+                                        _ => {}
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    Ok(())
+                })();
+                let restore = terminal::disable_raw_mode().map_err(io::Error::other);
+                match (result, restore) {
+                    (Ok(()), Ok(())) => Ok(()),
+                    (Err(error), Ok(())) => Err(error),
+                    (Ok(()), Err(error)) | (Err(_), Err(error)) => Err(error),
+                }
+            })
+        {
+            Ok(join_handle) => join_handle,
+            Err(error) => {
+                let _ = terminal::disable_raw_mode();
+                return Err(error);
+            }
+        };
+
+        Ok(Self {
+            store,
+            stop,
+            join_handle: Some(join_handle),
+        })
+    }
+
+    #[must_use]
+    pub fn store(&self) -> WorkingInputStore {
+        Arc::clone(&self.store)
+    }
+
+    pub fn finish(&mut self) -> io::Result<WorkingInputResult> {
+        self.stop
+            .store(true, std::sync::atomic::Ordering::Release);
+        if let Some(join_handle) = self.join_handle.take() {
+            match join_handle.join() {
+                Ok(result) => result?,
+                Err(_) => return Err(io::Error::other("working input thread panicked")),
+            }
+        }
+
+        let mut state = self
+            .store
+            .lock()
+            .map_err(|_| io::Error::other("working input state poisoned"))?;
+        Ok(WorkingInputResult {
+            queued: state.queued.drain(..).collect(),
+            draft: std::mem::take(&mut state.buffer),
+        })
+    }
+}
+
+impl Drop for WorkingInputSession {
+    fn drop(&mut self) {
+        let _ = self.finish();
+    }
+}
 
 // Shift+Tab cycles through four REPL permission/workspace modes, mirroring
 // Claude Code's default/plan/auto-accept/bypass rotation. "plan" is not a
@@ -435,6 +619,33 @@ impl LineEditor {
         (rows >= 4).then_some(prompt_cursor_column(&self.prompt).saturating_sub(1))
     }
 
+    /// Start the input listener used while the current model turn is working.
+    pub fn start_working_input(&self) -> io::Result<WorkingInputSession> {
+        WorkingInputSession::start(self.prompt.clone())
+    }
+
+    /// Paint a prompt that was submitted from the working-state queue before
+    /// reserving the next activity row. This keeps queued prompts visible in
+    /// the transcript even though rustyline was not reading the line.
+    pub fn show_queued_input(&mut self, input: &str) -> io::Result<()> {
+        self.working_active = false;
+        let rows = terminal::size().map(|(_, rows)| rows).unwrap_or_default();
+        if rows < 3 {
+            return Ok(());
+        }
+
+        let input_row = rows - 1;
+        let cursor_column = prompt_cursor_column(&self.prompt)
+            .saturating_add(u16::try_from(input.chars().count()).unwrap_or(u16::MAX));
+        let mut stdout = io::stdout();
+        write!(
+            stdout,
+            "\x1b[r\x1b[{input_row};1H\x1b[2K{}{input}\x1b[{rows};1H\x1b[2K{}\x1b[{input_row};{cursor_column}G",
+            self.prompt, self.footer
+        )?;
+        stdout.flush()
+    }
+
     pub fn set_permission_mode(&mut self, mode: &str) {
         self.footer_state.set_mode(mode);
         self.sync_footer();
@@ -452,6 +663,10 @@ impl LineEditor {
     }
 
     pub fn read_line(&mut self) -> io::Result<ReadOutcome> {
+        self.read_line_with_initial(None)
+    }
+
+    pub fn read_line_with_initial(&mut self, initial: Option<&str>) -> io::Result<ReadOutcome> {
         if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
             return self.read_line_fallback();
         }
@@ -462,7 +677,13 @@ impl LineEditor {
             helper.reset_current_line();
         }
 
-        let result = match self.editor.readline(&self.prompt) {
+        let readline_result = match initial {
+            Some(initial) => self
+                .editor
+                .readline_with_initial(&self.prompt, (initial, "")),
+            None => self.editor.readline(&self.prompt),
+        };
+        let result = match readline_result {
             Ok(line) => Ok(ReadOutcome::Submit(line)),
             Err(ReadlineError::Interrupted) => {
                 let has_input = !self.current_line().is_empty();

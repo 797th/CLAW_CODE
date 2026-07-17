@@ -23,6 +23,14 @@ fn repl_keeps_working_indicator_above_composer_and_model_footer() {
     );
 
     let terminal_output = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        terminal_output.contains("queued while working"),
+        "working composer should render keystrokes while the model turn is active: {terminal_output:?}"
+    );
+    assert!(
+        terminal_output.contains("\x1b[23;1H\x1b[2K> queued while working"),
+        "typed text should be painted on the bottom composer row: {terminal_output:?}"
+    );
     let working_region = terminal_output.find("\x1b[1;22r").unwrap_or_else(|| {
         panic!("working state should set the transcript scroll region: {terminal_output:?}")
     });
@@ -125,6 +133,11 @@ def drain(seconds):
 # submit a prompt. The local refused port keeps the model request offline.
 drain(1.5)
 os.write(master, b"hello?\r")
+# The REPL should keep a second composer active while the first request is
+# working. Do not press Enter here: the assertion below proves plain typing is
+# accepted and painted in the bottom input line.
+time.sleep(0.2)
+os.write(master, b"queued while working")
 drain(3.0)
 
 if child.poll() is None:
@@ -159,7 +172,7 @@ fn unique_temp_dir(label: &str) -> PathBuf {
 fn assert_cursor_rehomed_for_every_frame(output: &str) -> usize {
     const HIDE: &str = "\x1b[?25l";
     const ACTIVITY: &str = "\x1b[22;1H";
-    const COMPOSER: &str = "\x1b[23;3H";
+    const COMPOSER_ROW: &str = "\x1b[23;";
     const SHOW: &str = "\x1b[?25h";
 
     let mut search_from = 0;
@@ -170,14 +183,14 @@ fn assert_cursor_rehomed_for_every_frame(output: &str) -> usize {
             + output[hide..]
                 .find(ACTIVITY)
                 .expect("every hidden frame should move to the working row");
-        let composer = activity
+        let show = activity
             + output[activity..]
-                .find(COMPOSER)
-                .expect("every hidden frame should move back to the composer row");
-        let show = composer
-            + output[composer..]
                 .find(SHOW)
                 .expect("every hidden frame should show the cursor after the composer move");
+        let composer = activity
+            + output[activity..show]
+                .rfind(COMPOSER_ROW)
+                .expect("every hidden frame should move back to the composer row");
 
         assert!(
             hide < activity && activity < composer && composer < show,
