@@ -436,6 +436,79 @@ impl Drop for WeaveLock {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Honing pass: quarantine failing learned skills
+// ---------------------------------------------------------------------------
+
+pub const QUARANTINE_MIN_INVOCATIONS: u64 = 3;
+pub const QUARANTINE_MAX_SUCCESS_RATE: f64 = 0.34;
+const QUARANTINE_SUFFIX: &str = "quarantined";
+
+fn learned_skill_file(cwd: &Path, name: &str) -> Option<PathBuf> {
+    if !valid_skill_name(name) {
+        return None;
+    }
+    Some(
+        cwd.join(".claw")
+            .join("skills")
+            .join(LEARNED_DIR_NAME)
+            .join(name)
+            .join("SKILL.md"),
+    )
+}
+
+pub fn quarantine_skill(cwd: &Path, name: &str) -> Result<PathBuf, WeaverError> {
+    let live = learned_skill_file(cwd, name)
+        .ok_or_else(|| WeaverError::InvalidOutput(format!("invalid skill name '{name}'")))?;
+    if !live.is_file() {
+        return Err(WeaverError::InvalidOutput(format!(
+            "no learned skill '{name}' to quarantine"
+        )));
+    }
+    let parked = live.with_extension(format!("md.{QUARANTINE_SUFFIX}"));
+    fs::rename(&live, &parked)?;
+    Ok(parked)
+}
+
+pub fn restore_skill(cwd: &Path, name: &str) -> Result<PathBuf, WeaverError> {
+    let live = learned_skill_file(cwd, name)
+        .ok_or_else(|| WeaverError::InvalidOutput(format!("invalid skill name '{name}'")))?;
+    let parked = live.with_extension(format!("md.{QUARANTINE_SUFFIX}"));
+    if !parked.is_file() {
+        return Err(WeaverError::InvalidOutput(format!(
+            "no quarantined skill '{name}' to restore"
+        )));
+    }
+    fs::rename(&parked, &live)?;
+    Ok(live)
+}
+
+/// Quarantine learned skills whose observed success rate is unacceptable.
+/// Hand-written skills (outside `learned/`) are never touched: the guard is
+/// structural — we only ever rename files under `learned/<name>/`.
+pub fn hone(cwd: &Path, ledger: &SkillLedger) -> Result<Vec<String>, WeaverError> {
+    let mut quarantined = Vec::new();
+    for (name, record) in ledger.iter() {
+        if record.invocations < QUARANTINE_MIN_INVOCATIONS {
+            continue;
+        }
+        let judged = record.successes + record.failures;
+        if judged == 0 {
+            continue;
+        }
+        let rate = record.successes as f64 / judged as f64;
+        if rate > QUARANTINE_MAX_SUCCESS_RATE {
+            continue;
+        }
+        // Structural guard: only learned skills have a file here.
+        if learned_skill_file(cwd, name).is_some_and(|p| p.is_file()) {
+            quarantine_skill(cwd, name)?;
+            quarantined.push(name.clone());
+        }
+    }
+    Ok(quarantined)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -639,5 +712,58 @@ body two
         // Skill one must NOT have been left live: no live SKILL.md, only
         // (at most) a cleaned-up tmp state.
         assert!(!learned.join("skill-one").join("SKILL.md").is_file());
+    }
+
+    #[test]
+    fn hone_quarantines_failing_learned_skill_and_restore_reverses() {
+        let dir = tempfile::tempdir().unwrap();
+        let skill_dir = dir.path().join(".claw/skills/learned/flaky-skill");
+        fs::create_dir_all(&skill_dir).unwrap();
+        fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: flaky-skill\ndescription: test\n---\nbody\n",
+        )
+        .unwrap();
+
+        let mut ledger = SkillLedger::load(&weaver_dir(dir.path()));
+        for _ in 0..3 {
+            ledger.record("flaky-skill", SkillOutcome::Invoked);
+            ledger.record("flaky-skill", SkillOutcome::Failure);
+        }
+
+        let quarantined = hone(dir.path(), &ledger).unwrap();
+        assert_eq!(quarantined, vec!["flaky-skill".to_string()]);
+        assert!(!skill_dir.join("SKILL.md").exists());
+        assert!(skill_dir.join("SKILL.md.quarantined").exists());
+        // Discovery no longer sees it.
+        let assets = crate::harness_assets::discover(dir.path());
+        assert!(!assets.skills.iter().any(|s| s.name == "flaky-skill"));
+
+        restore_skill(dir.path(), "flaky-skill").unwrap();
+        assert!(skill_dir.join("SKILL.md").exists());
+    }
+
+    #[test]
+    fn hone_never_touches_hand_written_or_low_sample_skills() {
+        let dir = tempfile::tempdir().unwrap();
+        // Hand-written skill outside learned/.
+        let hand = dir.path().join(".claw/skills/manual-skill");
+        fs::create_dir_all(&hand).unwrap();
+        fs::write(hand.join("SKILL.md"), "---\nname: manual-skill\ndescription: x\n---\nbody\n").unwrap();
+        // Learned skill with too few invocations.
+        let fresh = dir.path().join(".claw/skills/learned/fresh-skill");
+        fs::create_dir_all(&fresh).unwrap();
+        fs::write(fresh.join("SKILL.md"), "---\nname: fresh-skill\ndescription: x\n---\nbody\n").unwrap();
+
+        let mut ledger = SkillLedger::load(&weaver_dir(dir.path()));
+        ledger.record("manual-skill", SkillOutcome::Invoked);
+        ledger.record("manual-skill", SkillOutcome::Failure);
+        ledger.record("fresh-skill", SkillOutcome::Invoked);
+        ledger.record("fresh-skill", SkillOutcome::Failure);
+
+        let quarantined = hone(dir.path(), &ledger).unwrap();
+        assert!(quarantined.is_empty());
+        assert!(hand.join("SKILL.md").exists());
+        assert!(fresh.join("SKILL.md").exists());
     }
 }
