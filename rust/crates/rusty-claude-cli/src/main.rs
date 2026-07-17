@@ -49,7 +49,8 @@ use api::{
 #[cfg(test)]
 use claw_engine::convert_messages_with_mode;
 use claw_engine::{
-    convert_messages, filter_tool_specs, format_user_visible_api_error, NEEDS_LOGIN_HINT,
+    convert_messages, filter_tool_specs, format_user_visible_api_error, EngineClient,
+    EngineToolExecutor, RuntimeMcpState, NEEDS_LOGIN_HINT,
 };
 use commands::{
     classify_skills_slash_command, handle_agents_slash_command, handle_agents_slash_command_json,
@@ -8407,26 +8408,23 @@ struct RuntimePluginState {
     mcp_state: Option<Arc<Mutex<RuntimeMcpState>>>,
 }
 
-struct RuntimeMcpState {
-    runtime: tokio::runtime::Runtime,
-    manager: McpServerManager,
-    pending_servers: Vec<String>,
-    degraded_report: Option<runtime::McpDegradedReport>,
-}
-
 struct BuiltRuntime {
-    runtime: Option<ConversationRuntime<AnthropicRuntimeClient, CliToolExecutor>>,
+    runtime: Option<ConversationRuntime<EngineClient, EngineToolExecutor>>,
     plugin_registry: PluginRegistry,
     plugins_active: bool,
     mcp_state: Option<Arc<Mutex<RuntimeMcpState>>>,
     mcp_active: bool,
+    /// Set only when this runtime draws output; `/status` installs the live
+    /// usage reporter through it after construction.
+    live_usage: Option<LiveUsageHandle>,
 }
 
 impl BuiltRuntime {
     fn new(
-        runtime: ConversationRuntime<AnthropicRuntimeClient, CliToolExecutor>,
+        runtime: ConversationRuntime<EngineClient, EngineToolExecutor>,
         plugin_registry: PluginRegistry,
         mcp_state: Option<Arc<Mutex<RuntimeMcpState>>>,
+        live_usage: Option<LiveUsageHandle>,
     ) -> Self {
         Self {
             runtime: Some(runtime),
@@ -8434,6 +8432,16 @@ impl BuiltRuntime {
             plugins_active: true,
             mcp_state,
             mcp_active: true,
+            live_usage,
+        }
+    }
+
+    /// Install the live usage reporter into the sink already inside the client.
+    fn set_live_usage_reporter(&self, reporter: Option<LiveUsageReporter>) {
+        if let Some(handle) = &self.live_usage {
+            *handle
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = reporter;
         }
     }
 
@@ -8469,7 +8477,7 @@ impl BuiltRuntime {
 }
 
 impl Deref for BuiltRuntime {
-    type Target = ConversationRuntime<AnthropicRuntimeClient, CliToolExecutor>;
+    type Target = ConversationRuntime<EngineClient, EngineToolExecutor>;
 
     fn deref(&self) -> &Self::Target {
         self.runtime
@@ -8490,226 +8498,6 @@ impl Drop for BuiltRuntime {
     fn drop(&mut self) {
         let _ = self.shutdown_mcp();
         let _ = self.shutdown_plugins();
-    }
-}
-
-#[derive(Debug, Deserialize)]
-struct ToolSearchRequest {
-    query: String,
-    max_results: Option<usize>,
-}
-
-#[derive(Debug, Deserialize)]
-struct McpToolRequest {
-    #[serde(rename = "qualifiedName")]
-    qualified_name: Option<String>,
-    tool: Option<String>,
-    arguments: Option<serde_json::Value>,
-}
-
-#[derive(Debug, Deserialize)]
-struct ListMcpResourcesRequest {
-    server: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct ReadMcpResourceRequest {
-    server: String,
-    uri: String,
-}
-
-impl RuntimeMcpState {
-    fn new(
-        runtime_config: &runtime::RuntimeConfig,
-    ) -> Result<Option<(Self, runtime::McpToolDiscoveryReport)>, Box<dyn std::error::Error>> {
-        let mut manager = McpServerManager::from_runtime_config(runtime_config);
-        if manager.server_names().is_empty() && manager.unsupported_servers().is_empty() {
-            return Ok(None);
-        }
-
-        let runtime = tokio::runtime::Runtime::new()?;
-        let discovery = runtime.block_on(manager.discover_tools_best_effort());
-        let pending_servers = discovery
-            .failed_servers
-            .iter()
-            .map(|failure| failure.server_name.clone())
-            .chain(
-                discovery
-                    .unsupported_servers
-                    .iter()
-                    .map(|server| server.server_name.clone()),
-            )
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .collect::<Vec<_>>();
-        let available_tools = discovery
-            .tools
-            .iter()
-            .map(|tool| tool.qualified_name.clone())
-            .collect::<Vec<_>>();
-        let failed_server_names = pending_servers.iter().cloned().collect::<BTreeSet<_>>();
-        let working_servers = manager
-            .server_names()
-            .into_iter()
-            .filter(|server_name| !failed_server_names.contains(server_name))
-            .collect::<Vec<_>>();
-        let failed_servers =
-            discovery
-                .failed_servers
-                .iter()
-                .map(|failure| runtime::McpFailedServer {
-                    server_name: failure.server_name.clone(),
-                    phase: runtime::McpLifecyclePhase::ToolDiscovery,
-                    error: runtime::McpErrorSurface::new(
-                        runtime::McpLifecyclePhase::ToolDiscovery,
-                        Some(failure.server_name.clone()),
-                        failure.error.clone(),
-                        std::collections::BTreeMap::from([(
-                            "required".to_string(),
-                            failure.required.to_string(),
-                        )]),
-                        true,
-                    ),
-                })
-                .chain(discovery.unsupported_servers.iter().map(|server| {
-                    runtime::McpFailedServer {
-                        server_name: server.server_name.clone(),
-                        phase: runtime::McpLifecyclePhase::ServerRegistration,
-                        error: runtime::McpErrorSurface::new(
-                            runtime::McpLifecyclePhase::ServerRegistration,
-                            Some(server.server_name.clone()),
-                            server.reason.clone(),
-                            std::collections::BTreeMap::from([
-                                (
-                                    "transport".to_string(),
-                                    format!("{:?}", server.transport).to_ascii_lowercase(),
-                                ),
-                                ("required".to_string(), server.required.to_string()),
-                            ]),
-                            false,
-                        ),
-                    }
-                }))
-                .collect::<Vec<_>>();
-        let degraded_report = (!failed_servers.is_empty()).then(|| {
-            runtime::McpDegradedReport::new(
-                working_servers,
-                failed_servers,
-                available_tools.clone(),
-                available_tools,
-            )
-        });
-
-        Ok(Some((
-            Self {
-                runtime,
-                manager,
-                pending_servers,
-                degraded_report,
-            },
-            discovery,
-        )))
-    }
-
-    fn shutdown(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        self.runtime.block_on(self.manager.shutdown())?;
-        Ok(())
-    }
-
-    fn pending_servers(&self) -> Option<Vec<String>> {
-        (!self.pending_servers.is_empty()).then(|| self.pending_servers.clone())
-    }
-
-    fn degraded_report(&self) -> Option<runtime::McpDegradedReport> {
-        self.degraded_report.clone()
-    }
-
-    fn server_names(&self) -> Vec<String> {
-        self.manager.server_names()
-    }
-
-    fn call_tool(
-        &mut self,
-        qualified_tool_name: &str,
-        arguments: Option<serde_json::Value>,
-    ) -> Result<String, ToolError> {
-        let response = self
-            .runtime
-            .block_on(self.manager.call_tool(qualified_tool_name, arguments))
-            .map_err(|error| ToolError::new(error.to_string()))?;
-        if let Some(error) = response.error {
-            return Err(ToolError::new(format!(
-                "MCP tool `{qualified_tool_name}` returned JSON-RPC error: {} ({})",
-                error.message, error.code
-            )));
-        }
-
-        let result = response.result.ok_or_else(|| {
-            ToolError::new(format!(
-                "MCP tool `{qualified_tool_name}` returned no result payload"
-            ))
-        })?;
-        serde_json::to_string_pretty(&result).map_err(|error| ToolError::new(error.to_string()))
-    }
-
-    fn list_resources_for_server(&mut self, server_name: &str) -> Result<String, ToolError> {
-        let result = self
-            .runtime
-            .block_on(self.manager.list_resources(server_name))
-            .map_err(|error| ToolError::new(error.to_string()))?;
-        serde_json::to_string_pretty(&json!({
-            "server": server_name,
-            "resources": result.resources,
-        }))
-        .map_err(|error| ToolError::new(error.to_string()))
-    }
-
-    fn list_resources_for_all_servers(&mut self) -> Result<String, ToolError> {
-        let mut resources = Vec::new();
-        let mut failures = Vec::new();
-
-        for server_name in self.server_names() {
-            match self
-                .runtime
-                .block_on(self.manager.list_resources(&server_name))
-            {
-                Ok(result) => resources.push(json!({
-                    "server": server_name,
-                    "resources": result.resources,
-                })),
-                Err(error) => failures.push(json!({
-                    "server": server_name,
-                    "error": error.to_string(),
-                })),
-            }
-        }
-
-        if resources.is_empty() && !failures.is_empty() {
-            let message = failures
-                .iter()
-                .filter_map(|failure| failure.get("error").and_then(serde_json::Value::as_str))
-                .collect::<Vec<_>>()
-                .join("; ");
-            return Err(ToolError::new(message));
-        }
-
-        serde_json::to_string_pretty(&json!({
-            "resources": resources,
-            "failures": failures,
-        }))
-        .map_err(|error| ToolError::new(error.to_string()))
-    }
-
-    fn read_resource(&mut self, server_name: &str, uri: &str) -> Result<String, ToolError> {
-        let result = self
-            .runtime
-            .block_on(self.manager.read_resource(server_name, uri))
-            .map_err(|error| ToolError::new(error.to_string()))?;
-        serde_json::to_string_pretty(&json!({
-            "server": server_name,
-            "contents": result.contents,
-        }))
-        .map_err(|error| ToolError::new(error.to_string()))
     }
 }
 
@@ -8920,9 +8708,7 @@ impl LiveCli {
 
     fn set_live_usage_reporter(&mut self, reporter: LiveUsageReporter) {
         self.live_usage_reporter = Some(reporter.clone());
-        self.runtime
-            .api_client_mut()
-            .set_live_usage_reporter(Some(reporter));
+        self.runtime.set_live_usage_reporter(Some(reporter));
     }
 
     /// Whether the live runtime has real credentials configured. False until
@@ -9104,9 +8890,7 @@ impl LiveCli {
             self.permission_mode,
             None,
         )?;
-        runtime
-            .api_client_mut()
-            .set_live_usage_reporter(self.live_usage_reporter.clone());
+        runtime.set_live_usage_reporter(self.live_usage_reporter.clone());
         let runtime = runtime.with_hook_abort_signal(hook_abort_signal.clone());
         let hook_abort_monitor = HookAbortMonitor::spawn(hook_abort_signal);
 
@@ -14475,22 +14259,35 @@ fn build_runtime_with_plugin_state(
     plugin_registry.initialize()?;
     let policy = permission_policy(permission_mode, &feature_config, &tool_registry)
         .map_err(std::io::Error::other)?;
+    // `emit_output == false` (JSON output, piped runs) still executes the turn;
+    // it just draws nothing, so the sink is the only thing that changes.
+    let (client_sink, live_usage): (Box<dyn claw_engine::TurnSink + Send>, _) = if emit_output {
+        let (sink, handle) = CliSink::new(progress_reporter);
+        (Box::new(sink), Some(handle))
+    } else {
+        (Box::new(claw_engine::NullSink), None)
+    };
+    let tool_sink: Box<dyn claw_engine::TurnSink + Send> = if emit_output {
+        let (sink, _) = CliSink::new(None);
+        Box::new(sink)
+    } else {
+        Box::new(claw_engine::NullSink)
+    };
     let mut runtime = ConversationRuntime::new_with_features(
         session,
-        AnthropicRuntimeClient::new(
+        EngineClient::new(
             session_id,
             model,
             enable_tools,
-            emit_output,
             allowed_tools.clone(),
             tool_registry.clone(),
-            progress_reporter,
+            client_sink,
         )?,
-        CliToolExecutor::new(
+        EngineToolExecutor::new(
             allowed_tools.clone(),
-            emit_output,
             tool_registry.clone(),
             mcp_state.clone(),
+            tool_sink,
         ),
         policy,
         system_prompt,
@@ -14500,7 +14297,12 @@ fn build_runtime_with_plugin_state(
     if emit_output {
         runtime = runtime.with_hook_progress_reporter(Box::new(CliHookProgressReporter));
     }
-    Ok(BuiltRuntime::new(runtime, plugin_registry, mcp_state))
+    Ok(BuiltRuntime::new(
+        runtime,
+        plugin_registry,
+        mcp_state,
+        live_usage,
+    ))
 }
 
 struct CliHookProgressReporter;
@@ -14591,123 +14393,6 @@ impl runtime::PermissionPrompter for CliPermissionPrompter {
 // `detect_provider_kind(&model)`. The struct name is kept to avoid
 // churning `BuiltRuntime` and every Deref/DerefMut site that references
 // it. See ROADMAP #29 for the provider-dispatch routing fix.
-struct AnthropicRuntimeClient {
-    runtime: tokio::runtime::Runtime,
-    client: ApiProviderClient,
-    // True when the client was built without real credentials (the REPL
-    // boots credential-free and asks the user to run `/login`). The first
-    // request against a client built this way returns a clear error instead
-    // of being sent with empty auth.
-    needs_credentials: bool,
-    session_id: String,
-    model: String,
-    enable_tools: bool,
-    emit_output: bool,
-    allowed_tools: Option<AllowedToolSet>,
-    tool_registry: GlobalToolRegistry,
-    progress_reporter: Option<InternalPromptProgressReporter>,
-    live_usage_reporter: Option<LiveUsageReporter>,
-    reasoning_effort: Option<String>,
-}
-
-impl AnthropicRuntimeClient {
-    fn new(
-        session_id: &str,
-        model: String,
-        enable_tools: bool,
-        emit_output: bool,
-        allowed_tools: Option<AllowedToolSet>,
-        tool_registry: GlobalToolRegistry,
-        progress_reporter: Option<InternalPromptProgressReporter>,
-    ) -> Result<Self, Box<dyn std::error::Error>> {
-        // Dispatch to the correct provider at construction time.
-        // `ApiProviderClient` (exposed by the api crate as
-        // `ProviderClient`) is an enum over Anthropic / xAI / OpenAI
-        // variants, where xAI and OpenAI both use the OpenAI-compat
-        // wire format under the hood. We consult
-        // `detect_provider_kind(&resolved_model)` so model-name prefix
-        // routing (`openai/`, `gpt-`, `grok`, `qwen/`) wins over
-        // env-var presence.
-        //
-        // For Anthropic we build the client directly instead of going
-        // through `ApiProviderClient::from_model_with_anthropic_auth`
-        // so we can explicitly apply `api::read_base_url()` — that
-        // reads `ANTHROPIC_BASE_URL` and is required for the local
-        // mock-server test harness
-        // (`crates/rusty-claude-cli/tests/compact_output.rs`) to point
-        // clawcli at its fake Anthropic endpoint. We also attach a
-        // session-scoped prompt cache on the Anthropic path; the
-        // prompt cache is Anthropic-only so non-Anthropic variants
-        // skip it.
-        let resolved_model = api::resolve_model_alias(&model);
-        let provider_kind = detect_provider_kind(&resolved_model);
-        let has_credentials = credentials_present_for_kind(provider_kind);
-        let client = match provider_kind {
-            ProviderKind::Anthropic => {
-                // Fall back to `AuthSource::None` when no credentials are
-                // present so the REPL can boot credential-free. The request
-                // path returns a clear "run /login" error before sending.
-                let inner = AnthropicClient::from_auth(
-                    resolve_cli_auth_source().unwrap_or(AuthSource::None),
-                )
-                .with_base_url(api::read_base_url())
-                .with_prompt_cache(PromptCache::new(session_id));
-                ApiProviderClient::Anthropic(inner)
-            }
-            ProviderKind::Xai | ProviderKind::OpenAi | ProviderKind::NvidiaNim => {
-                // The api crate's `ProviderClient::from_model_with_anthropic_auth`
-                // with `None` for the anthropic auth routes via
-                // `detect_provider_kind` and builds an
-                // `OpenAiCompatClient::from_env` with the matching
-                // `OpenAiCompatConfig` (openai / xai / dashscope / nvidia_nim).
-                // That reads the correct API-key env var and BASE_URL
-                // override internally, so this one call covers OpenAI,
-                // OpenRouter, xAI, DashScope, NVIDIA NIM, Ollama, and any
-                // other OpenAI-compat endpoint users configure via env vars.
-                //
-                // When credentials are missing, `from_env` errors; construct
-                // a placeholder OpenAI-compat client directly so the REPL
-                // boots credential-free and the request path surfaces the
-                // "run /login" error instead.
-                if has_credentials {
-                    ApiProviderClient::from_model_with_anthropic_auth(&resolved_model, None)?
-                } else {
-                    ApiProviderClient::OpenAi(openai_compat_placeholder_client(&resolved_model))
-                }
-            }
-        };
-        Ok(Self {
-            runtime: tokio::runtime::Runtime::new()?,
-            client,
-            needs_credentials: !has_credentials,
-            session_id: session_id.to_string(),
-            model,
-            enable_tools,
-            emit_output,
-            allowed_tools,
-            tool_registry,
-            progress_reporter,
-            live_usage_reporter: None,
-            reasoning_effort: None,
-        })
-    }
-
-    fn set_reasoning_effort(&mut self, effort: Option<String>) {
-        self.reasoning_effort = effort;
-    }
-
-    fn set_live_usage_reporter(&mut self, reporter: Option<LiveUsageReporter>) {
-        self.live_usage_reporter = reporter;
-    }
-
-    /// True when this client was built without real credentials. The REPL
-    /// surfaces a "run /login" hint instead of a "Ready" line while this is
-    /// set; `/login` rebuilds the runtime with a real client and clears it.
-    #[must_use]
-    fn needs_credentials(&self) -> bool {
-        self.needs_credentials
-    }
-}
 
 fn resolve_cli_auth_source() -> Result<AuthSource, Box<dyn std::error::Error>> {
     Ok(resolve_cli_auth_source_for_cwd()?)
@@ -14722,309 +14407,12 @@ fn resolve_cli_auth_source_for_cwd() -> Result<AuthSource, api::ApiError> {
 /// model name). The REPL boots credential-free and prompts for `/login`, so
 /// `AnthropicRuntimeClient::new` uses this to decide between a real client
 /// and a placeholder that surfaces a "run /login" error at request time.
-fn credentials_present_for_kind(kind: ProviderKind) -> bool {
-    match kind {
-        ProviderKind::Anthropic => api::resolve_startup_auth_source(|| Ok(None)).is_ok(),
-        ProviderKind::Xai => api::has_api_key("XAI_API_KEY"),
-        ProviderKind::NvidiaNim => api::has_api_key("NVIDIA_API_KEY"),
-        ProviderKind::OpenAi => api::has_api_key("OPENAI_API_KEY"),
-    }
-}
 
 /// Build a placeholder OpenAI-compatible client for the credential-free boot
 /// path. It carries an empty key; the first request returns a clear
 /// "run /login" error before any network call. The chosen config is the
 /// generic OpenAI one — `/login` re-runs provider detection after the user
 /// supplies real credentials, so this never actually sends a request.
-fn openai_compat_placeholder_client(_model: &str) -> OpenAiCompatClient {
-    OpenAiCompatClient::new(String::new(), OpenAiCompatConfig::openai())
-}
-
-impl ApiClient for AnthropicRuntimeClient {
-    #[allow(clippy::too_many_lines)]
-    fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
-        // Credential-free boot path: the REPL started before `/login` was run.
-        // Fail fast with a clear hint instead of sending a request with empty
-        // auth. Once `/login` completes it rebuilds the runtime, so this client
-        // is replaced and the flag no longer trips.
-        if self.needs_credentials {
-            return Err(RuntimeError::new(NEEDS_LOGIN_HINT));
-        }
-        if let Some(progress_reporter) = &self.progress_reporter {
-            progress_reporter.mark_model_phase();
-        }
-        let is_post_tool = request_ends_with_tool_result(&request);
-        let message_request = MessageRequest {
-            model: self.model.clone(),
-            max_tokens: max_tokens_for_model(&self.model),
-            messages: convert_messages(&request.messages),
-            system: (!request.system_prompt.is_empty()).then(|| request.system_prompt.join("\n\n")),
-            tools: self
-                .enable_tools
-                .then(|| filter_tool_specs(&self.tool_registry, self.allowed_tools.as_ref())),
-            tool_choice: self.enable_tools.then_some(ToolChoice::Auto),
-            stream: true,
-            reasoning_effort: self.reasoning_effort.clone(),
-            ..Default::default()
-        };
-
-        self.runtime.block_on(async {
-            // When resuming after tool execution, apply a stall timeout on the
-            // first stream event.  If the model does not respond within the
-            // deadline we drop the stalled connection and re-send the request as
-            // a continuation nudge (one retry only).
-            let max_attempts: usize = if is_post_tool { 2 } else { 1 };
-
-            for attempt in 1..=max_attempts {
-                let result = self
-                    .consume_stream(&message_request, is_post_tool && attempt == 1)
-                    .await;
-                match result {
-                    Ok(events) => return Ok(events),
-                    Err(error)
-                        if error.to_string().contains("post-tool stall")
-                            && attempt < max_attempts =>
-                    {
-                        // Stalled after tool completion — nudge the model by
-                        // re-sending the same request.
-                    }
-                    Err(error) => return Err(error),
-                }
-            }
-
-            Err(RuntimeError::new("post-tool continuation nudge exhausted"))
-        })
-    }
-}
-
-impl AnthropicRuntimeClient {
-    /// Consume a single streaming response, optionally applying a stall
-    /// timeout on the first event for post-tool continuations.
-    #[allow(clippy::too_many_lines)]
-    async fn consume_stream(
-        &self,
-        message_request: &MessageRequest,
-        apply_stall_timeout: bool,
-    ) -> Result<Vec<AssistantEvent>, RuntimeError> {
-        let mut stream = self
-            .client
-            .stream_message(message_request)
-            .await
-            .map_err(|error| {
-                RuntimeError::new(format_user_visible_api_error(&self.session_id, &error))
-            })?;
-        let mut stdout = io::stdout();
-        let mut sink = io::sink();
-        let out: &mut dyn Write = if self.emit_output {
-            &mut stdout
-        } else {
-            &mut sink
-        };
-        let renderer = TerminalRenderer::new();
-        let mut markdown_stream = MarkdownStreamState::default();
-        let caveman_output = runtime::caveman_enabled();
-        let mut pending_output_text = String::new();
-        let mut events = Vec::new();
-        let mut pending_tool: Option<(String, String, String)> = None;
-        // 累积 reasoning_content 到 Thinking 块（修复 DeepSeek V4 reasoning_content 协议 bug）
-        let mut pending_thinking: Option<(String, Option<String>)> = None;
-        let mut block_has_thinking_summary = false;
-        let mut saw_stop = false;
-        let mut received_any_event = false;
-
-        loop {
-            let next = if apply_stall_timeout && !received_any_event {
-                match tokio::time::timeout(POST_TOOL_STALL_TIMEOUT, stream.next_event()).await {
-                    Ok(inner) => inner.map_err(|error| {
-                        RuntimeError::new(format_user_visible_api_error(&self.session_id, &error))
-                    })?,
-                    Err(_elapsed) => {
-                        return Err(RuntimeError::new(
-                            "post-tool stall: model did not respond within timeout",
-                        ));
-                    }
-                }
-            } else {
-                stream.next_event().await.map_err(|error| {
-                    RuntimeError::new(format_user_visible_api_error(&self.session_id, &error))
-                })?
-            };
-
-            let Some(event) = next else {
-                break;
-            };
-            received_any_event = true;
-
-            match event {
-                ApiStreamEvent::MessageStart(start) => {
-                    for block in start.message.content {
-                        push_output_block(
-                            block,
-                            out,
-                            &mut events,
-                            &mut pending_tool,
-                            true,
-                            &mut block_has_thinking_summary,
-                            caveman_output,
-                            &mut pending_output_text,
-                        )?;
-                    }
-                }
-                ApiStreamEvent::ContentBlockStart(start) => {
-                    // 特判 Thinking 块：初始化 pending_thinking（用于累积后续 ThinkingDelta）
-                    if let OutputContentBlock::Thinking {
-                        thinking,
-                        signature,
-                    } = &start.content_block
-                    {
-                        pending_thinking = Some((thinking.clone(), signature.clone()));
-                    }
-                    push_output_block(
-                        start.content_block,
-                        out,
-                        &mut events,
-                        &mut pending_tool,
-                        true,
-                        &mut block_has_thinking_summary,
-                        caveman_output,
-                        &mut pending_output_text,
-                    )?;
-                }
-                ApiStreamEvent::ContentBlockDelta(delta) => match delta.delta {
-                    ContentBlockDelta::TextDelta { text } => {
-                        if !text.is_empty() {
-                            if let Some(live_usage_reporter) = &self.live_usage_reporter {
-                                live_usage_reporter.record_output_estimate(&text);
-                            }
-                            if let Some(progress_reporter) = &self.progress_reporter {
-                                progress_reporter.mark_text_phase(&text);
-                            }
-                            if caveman_output {
-                                pending_output_text.push_str(&text);
-                            } else if let Some(rendered) = markdown_stream.push(&renderer, &text) {
-                                write!(out, "{rendered}")
-                                    .and_then(|()| out.flush())
-                                    .map_err(|error| RuntimeError::new(error.to_string()))?;
-                            }
-                            events.push(AssistantEvent::TextDelta(text));
-                        }
-                    }
-                    ContentBlockDelta::InputJsonDelta { partial_json } => {
-                        if let Some((_, _, input)) = &mut pending_tool {
-                            input.push_str(&partial_json);
-                        }
-                    }
-                    ContentBlockDelta::ThinkingDelta { thinking } => {
-                        if let Some(live_usage_reporter) = &self.live_usage_reporter {
-                            live_usage_reporter.record_output_estimate(&thinking);
-                        }
-                        if !block_has_thinking_summary {
-                            render_thinking_block_summary(out, None, false)?;
-                            block_has_thinking_summary = true;
-                        }
-                        // 累积 thinking 文本到 pending_thinking（让 session 持久化能拿到）
-                        if let Some((t, _)) = &mut pending_thinking {
-                            t.push_str(&thinking);
-                        }
-                    }
-                    ContentBlockDelta::SignatureDelta { signature } => {
-                        // 累积 signature 到 pending_thinking
-                        if let Some((_, sig)) = &mut pending_thinking {
-                            sig.get_or_insert_with(String::new).push_str(&signature);
-                        }
-                    }
-                },
-                ApiStreamEvent::ContentBlockStop(_) => {
-                    block_has_thinking_summary = false;
-                    if caveman_output {
-                        flush_caveman_output(&mut pending_output_text, out)?;
-                    } else if let Some(rendered) = markdown_stream.flush(&renderer) {
-                        write!(out, "{rendered}")
-                            .and_then(|()| out.flush())
-                            .map_err(|error| RuntimeError::new(error.to_string()))?;
-                    }
-                    // 把累积的 thinking 转成 AssistantEvent::Thinking（让 build_assistant_message 写入 session）
-                    if let Some((thinking, signature)) = pending_thinking.take() {
-                        events.push(AssistantEvent::Thinking {
-                            thinking,
-                            signature,
-                        });
-                    }
-                    if let Some((id, name, input)) = pending_tool.take() {
-                        if let Some(progress_reporter) = &self.progress_reporter {
-                            progress_reporter.mark_tool_phase(&name, &input);
-                        }
-                        // Display tool call now that input is fully accumulated
-                        writeln!(out, "\n{}", format_tool_call_start(&name, &input))
-                            .and_then(|()| out.flush())
-                            .map_err(|error| RuntimeError::new(error.to_string()))?;
-                        events.push(AssistantEvent::ToolUse { id, name, input });
-                    }
-                }
-                ApiStreamEvent::MessageDelta(delta) => {
-                    let usage = delta.usage.token_usage();
-                    if let Some(live_usage_reporter) = &self.live_usage_reporter {
-                        live_usage_reporter.record_usage(usage);
-                    }
-                    events.push(AssistantEvent::Usage(usage));
-                }
-                ApiStreamEvent::MessageStop(_) => {
-                    saw_stop = true;
-                    if caveman_output {
-                        flush_caveman_output(&mut pending_output_text, out)?;
-                    } else if let Some(rendered) = markdown_stream.flush(&renderer) {
-                        write!(out, "{rendered}")
-                            .and_then(|()| out.flush())
-                            .map_err(|error| RuntimeError::new(error.to_string()))?;
-                    }
-                    events.push(AssistantEvent::MessageStop);
-                }
-            }
-        }
-
-        if caveman_output {
-            flush_caveman_output(&mut pending_output_text, out)?;
-        }
-        push_prompt_cache_record(&self.client, &mut events);
-
-        if !saw_stop
-            && events.iter().any(|event| {
-                matches!(event, AssistantEvent::TextDelta(text) if !text.is_empty())
-                    || matches!(event, AssistantEvent::ToolUse { .. })
-            })
-        {
-            events.push(AssistantEvent::MessageStop);
-        }
-
-        if events
-            .iter()
-            .any(|event| matches!(event, AssistantEvent::MessageStop))
-        {
-            return Ok(events);
-        }
-
-        let response = self
-            .client
-            .send_message(&MessageRequest {
-                stream: false,
-                ..message_request.clone()
-            })
-            .await
-            .map_err(|error| {
-                RuntimeError::new(format_user_visible_api_error(&self.session_id, &error))
-            })?;
-        let mut events = response_to_events(response, out, caveman_output)?;
-        if let Some(live_usage_reporter) = &self.live_usage_reporter {
-            for event in &events {
-                if let AssistantEvent::Usage(usage) = event {
-                    live_usage_reporter.record_usage(*usage);
-                }
-            }
-        }
-        push_prompt_cache_record(&self.client, &mut events);
-        Ok(events)
-    }
-}
 
 /// Returns `true` when the conversation ends with a tool-result message,
 /// meaning the model is expected to continue after tool execution.
@@ -15884,283 +15272,199 @@ fn truncate_output_for_display(content: &str, max_lines: usize, max_chars: usize
     preview
 }
 
-fn render_thinking_block_summary(
-    out: &mut (impl Write + ?Sized),
-    char_count: Option<usize>,
-    redacted: bool,
-) -> Result<(), RuntimeError> {
-    let summary = if redacted {
-        "\n▶ Thinking block hidden by provider\n".to_string()
-    } else if let Some(char_count) = char_count {
-        format!("\n▶ Thinking ({char_count} chars hidden)\n")
-    } else {
-        "\n▶ Thinking hidden\n".to_string()
-    };
-    write!(out, "{summary}")
-        .and_then(|()| out.flush())
-        .map_err(|error| RuntimeError::new(error.to_string()))
-}
-
-fn push_output_block(
-    block: OutputContentBlock,
-    out: &mut (impl Write + ?Sized),
-    events: &mut Vec<AssistantEvent>,
-    pending_tool: &mut Option<(String, String, String)>,
-    streaming_tool_input: bool,
-    block_has_thinking_summary: &mut bool,
-    caveman_output: bool,
-    pending_output_text: &mut String,
-) -> Result<(), RuntimeError> {
-    match block {
-        OutputContentBlock::Text { text } => {
-            if !text.is_empty() {
-                if caveman_output {
-                    pending_output_text.push_str(&text);
-                } else {
-                    let rendered = TerminalRenderer::new().markdown_to_ansi(&text);
-                    write!(out, "{rendered}")
-                        .and_then(|()| out.flush())
-                        .map_err(|error| RuntimeError::new(error.to_string()))?;
-                }
-                events.push(AssistantEvent::TextDelta(text));
-            }
-        }
-        OutputContentBlock::ToolUse { id, name, input } => {
-            // During streaming, the initial content_block_start has an empty input ({}).
-            // The real input arrives via input_json_delta events. In
-            // non-streaming responses, preserve a legitimate empty object.
-            let initial_input = if streaming_tool_input
-                && input.is_object()
-                && input.as_object().is_some_and(serde_json::Map::is_empty)
-            {
-                String::new()
-            } else {
-                input.to_string()
-            };
-            *pending_tool = Some((id, name, initial_input));
-        }
-        OutputContentBlock::Thinking {
-            thinking,
-            signature,
-        } => {
-            render_thinking_block_summary(out, Some(thinking.chars().count()), false)?;
-            events.push(AssistantEvent::Thinking {
-                thinking,
-                signature,
-            });
-            *block_has_thinking_summary = true;
-        }
-        OutputContentBlock::RedactedThinking { .. } => {
-            render_thinking_block_summary(out, None, true)?;
-            *block_has_thinking_summary = true;
-        }
-    }
-    Ok(())
-}
-
-fn flush_caveman_output(
-    pending_output_text: &mut String,
-    out: &mut (impl Write + ?Sized),
-) -> Result<(), RuntimeError> {
-    if pending_output_text.is_empty() {
-        return Ok(());
-    }
-    let compressed = runtime::compress_caveman(pending_output_text);
-    pending_output_text.clear();
-    if compressed.is_empty() {
-        return Ok(());
-    }
-    let rendered = TerminalRenderer::new().markdown_to_ansi(&compressed);
-    write!(out, "{rendered}")
-        .and_then(|()| out.flush())
-        .map_err(|error| RuntimeError::new(error.to_string()))
-}
-
-fn response_to_events(
-    response: MessageResponse,
-    out: &mut (impl Write + ?Sized),
-    caveman_output: bool,
-) -> Result<Vec<AssistantEvent>, RuntimeError> {
-    let mut events = Vec::new();
-    let mut pending_tool = None;
-    let mut pending_output_text = String::new();
-
-    for block in response.content {
-        let mut block_has_thinking_summary = false;
-        push_output_block(
-            block,
-            out,
-            &mut events,
-            &mut pending_tool,
-            false,
-            &mut block_has_thinking_summary,
-            caveman_output,
-            &mut pending_output_text,
-        )?;
-        flush_caveman_output(&mut pending_output_text, out)?;
-        if let Some((id, name, input)) = pending_tool.take() {
-            events.push(AssistantEvent::ToolUse { id, name, input });
-        }
-    }
-
-    events.push(AssistantEvent::Usage(response.usage.token_usage()));
-    events.push(AssistantEvent::MessageStop);
-    Ok(events)
-}
-
-fn push_prompt_cache_record(client: &ApiProviderClient, events: &mut Vec<AssistantEvent>) {
-    // `ApiProviderClient::take_last_prompt_cache_record` is a pass-through
-    // to the Anthropic variant and returns `None` for OpenAI-compat /
-    // xAI variants, which do not have a prompt cache. So this helper
-    // remains a no-op on non-Anthropic providers without any extra
-    // branching here.
-    if let Some(record) = client.take_last_prompt_cache_record() {
-        if let Some(event) = prompt_cache_record_to_runtime_event(record) {
-            events.push(AssistantEvent::PromptCache(event));
-        }
-    }
-}
-
-fn prompt_cache_record_to_runtime_event(
-    record: api::PromptCacheRecord,
-) -> Option<PromptCacheEvent> {
-    let cache_break = record.cache_break?;
-    Some(PromptCacheEvent {
-        unexpected: cache_break.unexpected,
-        reason: cache_break.reason,
-        previous_cache_read_input_tokens: cache_break.previous_cache_read_input_tokens,
-        current_cache_read_input_tokens: cache_break.current_cache_read_input_tokens,
-        token_drop: cache_break.token_drop,
-    })
-}
-
-struct CliToolExecutor {
+/// Renders a turn to stdout for the line REPL.
+///
+/// Holds every piece of presentation state the engine deliberately does not:
+/// the markdown stream buffer, Caveman batching, and the
+/// one-thinking-summary-per-block rule. The engine emits semantic events; this
+/// decides what the terminal sees.
+///
+/// `live_usage` is shared rather than owned because the REPL installs the
+/// reporter *after* the runtime is built, by which point this sink has already
+/// been moved into the client.
+struct CliSink {
     renderer: TerminalRenderer,
-    emit_output: bool,
-    allowed_tools: Option<AllowedToolSet>,
-    tool_registry: GlobalToolRegistry,
-    mcp_state: Option<Arc<Mutex<RuntimeMcpState>>>,
+    markdown_stream: MarkdownStreamState,
+    /// Caveman batches a whole block before compressing, so text is withheld
+    /// until `block_stop` instead of streaming through the markdown renderer.
+    caveman_output: bool,
+    pending_output_text: String,
+    block_has_thinking_summary: bool,
+    progress_reporter: Option<InternalPromptProgressReporter>,
+    live_usage: LiveUsageHandle,
 }
 
-impl CliToolExecutor {
-    fn new(
-        allowed_tools: Option<AllowedToolSet>,
-        emit_output: bool,
-        tool_registry: GlobalToolRegistry,
-        mcp_state: Option<Arc<Mutex<RuntimeMcpState>>>,
-    ) -> Self {
-        Self {
+/// Lets the REPL install a usage reporter after the sink is inside the client.
+type LiveUsageHandle = Arc<Mutex<Option<LiveUsageReporter>>>;
+
+impl CliSink {
+    fn new(progress_reporter: Option<InternalPromptProgressReporter>) -> (Self, LiveUsageHandle) {
+        let live_usage: LiveUsageHandle = Arc::new(Mutex::new(None));
+        let sink = Self {
             renderer: TerminalRenderer::new(),
-            emit_output,
-            allowed_tools,
-            tool_registry,
-            mcp_state,
-        }
-    }
-
-    fn execute_search_tool(&self, value: serde_json::Value) -> Result<String, ToolError> {
-        let input: ToolSearchRequest = serde_json::from_value(value)
-            .map_err(|error| ToolError::new(format!("invalid tool input JSON: {error}")))?;
-        let (pending_mcp_servers, mcp_degraded) =
-            self.mcp_state.as_ref().map_or((None, None), |state| {
-                let state = state
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                (state.pending_servers(), state.degraded_report())
-            });
-        serde_json::to_string_pretty(&self.tool_registry.search(
-            &input.query,
-            input.max_results.unwrap_or(5),
-            pending_mcp_servers,
-            mcp_degraded,
-        ))
-        .map_err(|error| ToolError::new(error.to_string()))
-    }
-
-    fn execute_runtime_tool(
-        &self,
-        tool_name: &str,
-        value: serde_json::Value,
-    ) -> Result<String, ToolError> {
-        let Some(mcp_state) = &self.mcp_state else {
-            return Err(ToolError::new(format!(
-                "runtime tool `{tool_name}` is unavailable without configured MCP servers"
-            )));
+            markdown_stream: MarkdownStreamState::default(),
+            caveman_output: runtime::caveman_enabled(),
+            pending_output_text: String::new(),
+            block_has_thinking_summary: false,
+            progress_reporter,
+            live_usage: Arc::clone(&live_usage),
         };
-        let mut mcp_state = mcp_state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        (sink, live_usage)
+    }
 
-        match tool_name {
-            "MCPTool" => {
-                let input: McpToolRequest = serde_json::from_value(value)
-                    .map_err(|error| ToolError::new(format!("invalid tool input JSON: {error}")))?;
-                let qualified_name = input
-                    .qualified_name
-                    .or(input.tool)
-                    .ok_or_else(|| ToolError::new("missing required field `qualifiedName`"))?;
-                mcp_state.call_tool(&qualified_name, input.arguments)
-            }
-            "ListMcpResourcesTool" => {
-                let input: ListMcpResourcesRequest = serde_json::from_value(value)
-                    .map_err(|error| ToolError::new(format!("invalid tool input JSON: {error}")))?;
-                match input.server {
-                    Some(server_name) => mcp_state.list_resources_for_server(&server_name),
-                    None => mcp_state.list_resources_for_all_servers(),
-                }
-            }
-            "ReadMcpResourceTool" => {
-                let input: ReadMcpResourceRequest = serde_json::from_value(value)
-                    .map_err(|error| ToolError::new(format!("invalid tool input JSON: {error}")))?;
-                mcp_state.read_resource(&input.server, &input.uri)
-            }
-            _ => mcp_state.call_tool(tool_name, Some(value)),
+    fn with_live_usage<F>(&self, apply: F)
+    where
+        F: FnOnce(&LiveUsageReporter),
+    {
+        if let Some(reporter) = self
+            .live_usage
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+        {
+            apply(reporter);
         }
+    }
+
+    fn write_out(&self, rendered: &str) -> claw_engine::SinkResult {
+        let mut out = io::stdout();
+        write!(out, "{rendered}")
+            .and_then(|()| out.flush())
+            .map_err(|error| error.to_string())
+    }
+
+    /// Compress and emit whatever Caveman batched for this block.
+    fn flush_caveman(&mut self) -> claw_engine::SinkResult {
+        if self.pending_output_text.is_empty() {
+            return Ok(());
+        }
+        let compressed = runtime::compress_caveman(&self.pending_output_text);
+        self.pending_output_text.clear();
+        if compressed.is_empty() {
+            return Ok(());
+        }
+        let rendered = self.renderer.markdown_to_ansi(&compressed);
+        self.write_out(&rendered)
+    }
+
+    fn thinking_summary(
+        &mut self,
+        char_count: Option<usize>,
+        redacted: bool,
+    ) -> claw_engine::SinkResult {
+        let summary = if redacted {
+            "\n▶ Thinking block hidden by provider\n".to_string()
+        } else if let Some(char_count) = char_count {
+            format!("\n▶ Thinking ({char_count} chars hidden)\n")
+        } else {
+            "\n▶ Thinking hidden\n".to_string()
+        };
+        self.block_has_thinking_summary = true;
+        self.write_out(&summary)
     }
 }
 
-impl ToolExecutor for CliToolExecutor {
-    fn execute(&mut self, tool_name: &str, input: &str) -> Result<String, ToolError> {
-        if self
-            .allowed_tools
-            .as_ref()
-            .is_some_and(|allowed| !allowed.contains(&canonical_allowed_tool_name(tool_name)))
-        {
-            return Err(ToolError::new(format!(
-                "tool `{tool_name}` is not enabled by the current --allowedTools setting"
-            )));
+impl claw_engine::TurnSink for CliSink {
+    fn request_start(&mut self) -> claw_engine::SinkResult {
+        if let Some(reporter) = &self.progress_reporter {
+            reporter.mark_model_phase();
         }
-        let value = serde_json::from_str(input)
-            .map_err(|error| ToolError::new(format!("invalid tool input JSON: {error}")))?;
-        let result = if tool_name == "ToolSearch" {
-            self.execute_search_tool(value)
-        } else if self.tool_registry.has_runtime_tool(tool_name) {
-            self.execute_runtime_tool(tool_name, value)
-        } else {
-            self.tool_registry
-                .execute(tool_name, &value)
-                .map_err(ToolError::new)
-        };
-        match result {
-            Ok(output) => {
-                if self.emit_output {
-                    let markdown = format_tool_result(tool_name, &output, false);
-                    self.renderer
-                        .stream_markdown(&markdown, &mut io::stdout())
-                        .map_err(|error| ToolError::new(error.to_string()))?;
-                }
-                Ok(output)
-            }
-            Err(error) => {
-                if self.emit_output {
-                    let markdown = format_tool_result(tool_name, &error.to_string(), true);
-                    self.renderer
-                        .stream_markdown(&markdown, &mut io::stdout())
-                        .map_err(|stream_error| ToolError::new(stream_error.to_string()))?;
-                }
-                Err(error)
-            }
+        Ok(())
+    }
+
+    fn text_delta(&mut self, text: &str) -> claw_engine::SinkResult {
+        self.with_live_usage(|reporter| reporter.record_output_estimate(text));
+        if let Some(reporter) = &self.progress_reporter {
+            reporter.mark_text_phase(text);
         }
+        if self.caveman_output {
+            self.pending_output_text.push_str(text);
+            return Ok(());
+        }
+        if let Some(rendered) = self.markdown_stream.push(&self.renderer, text) {
+            return self.write_out(&rendered);
+        }
+        Ok(())
+    }
+
+    /// A whole block at once: render it directly rather than through the
+    /// incremental markdown stream.
+    fn text_block(&mut self, text: &str) -> claw_engine::SinkResult {
+        if self.caveman_output {
+            self.pending_output_text.push_str(text);
+            return Ok(());
+        }
+        let rendered = self.renderer.markdown_to_ansi(text);
+        self.write_out(&rendered)
+    }
+
+    fn thinking_delta(&mut self, thinking: &str) -> claw_engine::SinkResult {
+        self.with_live_usage(|reporter| reporter.record_output_estimate(thinking));
+        // Reasoning text itself stays hidden; announce the block once.
+        if !self.block_has_thinking_summary {
+            return self.thinking_summary(None, false);
+        }
+        Ok(())
+    }
+
+    fn thinking_block(
+        &mut self,
+        thinking: &str,
+        _signature: Option<&str>,
+    ) -> claw_engine::SinkResult {
+        self.thinking_summary(Some(thinking.chars().count()), false)
+    }
+
+    fn redacted_thinking(&mut self) -> claw_engine::SinkResult {
+        self.thinking_summary(None, true)
+    }
+
+    fn tool_call(&mut self, name: &str, input: &str) -> claw_engine::SinkResult {
+        if let Some(reporter) = &self.progress_reporter {
+            reporter.mark_tool_phase(name, input);
+        }
+        let rendered = format!("\n{}\n", format_tool_call_start(name, input));
+        self.write_out(&rendered)
+    }
+
+    fn tool_result(&mut self, name: &str, output: &str, is_error: bool) -> claw_engine::SinkResult {
+        let markdown = format_tool_result(name, output, is_error);
+        self.renderer
+            .stream_markdown(&markdown, &mut io::stdout())
+            .map_err(|error| error.to_string())
+    }
+
+    fn block_stop(&mut self) -> claw_engine::SinkResult {
+        self.block_has_thinking_summary = false;
+        if self.caveman_output {
+            return self.flush_caveman();
+        }
+        if let Some(rendered) = self.markdown_stream.flush(&self.renderer) {
+            return self.write_out(&rendered);
+        }
+        Ok(())
+    }
+
+    fn message_stop(&mut self) -> claw_engine::SinkResult {
+        if self.caveman_output {
+            return self.flush_caveman();
+        }
+        if let Some(rendered) = self.markdown_stream.flush(&self.renderer) {
+            return self.write_out(&rendered);
+        }
+        Ok(())
+    }
+
+    fn usage(&mut self, usage: runtime::TokenUsage) -> claw_engine::SinkResult {
+        self.with_live_usage(|reporter| reporter.record_usage(usage));
+        Ok(())
+    }
+
+    fn turn_end(&mut self) -> claw_engine::SinkResult {
+        if self.caveman_output {
+            return self.flush_caveman();
+        }
+        Ok(())
     }
 }
 
@@ -16426,17 +15730,16 @@ mod tests {
         format_user_visible_api_error, gate_audit_lines, merge_prompt_with_stdin,
         normalize_permission_mode, parse_args, parse_export_args, parse_git_status_branch,
         parse_git_status_metadata_for, parse_git_workspace_summary, parse_history_count,
-        permission_policy, persist_provider_setup, print_help_to, push_output_block,
-        render_config_report, render_diff_report, render_diff_report_for, render_help_topic,
-        render_help_topic_json, render_memory_report, render_prompt_history_report,
-        render_repl_help, render_repl_response, render_resume_usage, render_session_list,
-        render_session_markdown, resolve_model_alias, resolve_model_alias_with_config,
-        resolve_repl_model, resolve_session_reference, response_to_events,
+        permission_policy, persist_provider_setup, print_help_to, render_config_report,
+        render_diff_report, render_diff_report_for, render_help_topic, render_help_topic_json,
+        render_memory_report, render_prompt_history_report, render_repl_help, render_repl_response,
+        render_resume_usage, render_session_list, render_session_markdown, resolve_model_alias,
+        resolve_model_alias_with_config, resolve_repl_model, resolve_session_reference,
         resume_supported_slash_commands, run_resume_command, setup_default_model, short_tool_id,
         slash_command_completion_candidates_with_sessions, split_error_hint, status_context,
         status_json_value, summarize_tool_payload_for_markdown, try_resolve_bare_skill_prompt,
         validate_endpoint_url, validate_no_args, write_mcp_server_fixture, CliAction,
-        CliOutputFormat, CliToolExecutor, EndpointProtocol, GitOperation, GitWorkspaceSummary,
+        CliOutputFormat, EndpointProtocol, GitOperation, GitWorkspaceSummary,
         InternalPromptProgressEvent, InternalPromptProgressState, LiveCli, LocalHelpTopic,
         PermissionModeProvenance, PromptHistoryEntry, ProviderSetup, SessionLifecycleKind,
         SessionLifecycleSummary, SlashCommand, StatusUsage, TmuxPaneSnapshot,
@@ -21694,218 +20997,6 @@ UU conflicted.rs",
     }
 
     #[test]
-    fn push_output_block_renders_markdown_text() {
-        let mut out = Vec::new();
-        let mut events = Vec::new();
-        let mut pending_tool = None;
-        let mut block_has_thinking_summary = false;
-
-        push_output_block(
-            OutputContentBlock::Text {
-                text: "# Heading".to_string(),
-            },
-            &mut out,
-            &mut events,
-            &mut pending_tool,
-            false,
-            &mut block_has_thinking_summary,
-            false,
-            &mut String::new(),
-        )
-        .expect("text block should render");
-
-        let rendered = String::from_utf8(out).expect("utf8");
-        assert!(rendered.contains("Heading"));
-        assert!(rendered.contains('\u{1b}'));
-    }
-
-    #[test]
-    fn push_output_block_skips_empty_object_prefix_for_tool_streams() {
-        let mut out = Vec::new();
-        let mut events = Vec::new();
-        let mut pending_tool = None;
-        let mut block_has_thinking_summary = false;
-
-        push_output_block(
-            OutputContentBlock::ToolUse {
-                id: "tool-1".to_string(),
-                name: "read_file".to_string(),
-                input: json!({}),
-            },
-            &mut out,
-            &mut events,
-            &mut pending_tool,
-            true,
-            &mut block_has_thinking_summary,
-            false,
-            &mut String::new(),
-        )
-        .expect("tool block should accumulate");
-
-        assert!(events.is_empty());
-        assert_eq!(
-            pending_tool,
-            Some(("tool-1".to_string(), "read_file".to_string(), String::new(),))
-        );
-    }
-
-    #[test]
-    fn response_to_events_preserves_empty_object_json_input_outside_streaming() {
-        let mut out = Vec::new();
-        let events = response_to_events(
-            MessageResponse {
-                id: "msg-1".to_string(),
-                kind: "message".to_string(),
-                model: "anthropic/claude-opus-4-6".to_string(),
-                role: "assistant".to_string(),
-                content: vec![OutputContentBlock::ToolUse {
-                    id: "tool-1".to_string(),
-                    name: "read_file".to_string(),
-                    input: json!({}),
-                }],
-                stop_reason: Some("tool_use".to_string()),
-                stop_sequence: None,
-                usage: Usage {
-                    input_tokens: 1,
-                    output_tokens: 1,
-                    cache_creation_input_tokens: 0,
-                    cache_read_input_tokens: 0,
-                },
-                request_id: None,
-            },
-            &mut out,
-            false,
-        )
-        .expect("response conversion should succeed");
-
-        assert!(matches!(
-            &events[0],
-            AssistantEvent::ToolUse { name, input, .. }
-                if name == "read_file" && input == "{}"
-        ));
-    }
-
-    #[test]
-    fn response_to_events_preserves_non_empty_json_input_outside_streaming() {
-        let mut out = Vec::new();
-        let events = response_to_events(
-            MessageResponse {
-                id: "msg-2".to_string(),
-                kind: "message".to_string(),
-                model: "anthropic/claude-opus-4-6".to_string(),
-                role: "assistant".to_string(),
-                content: vec![OutputContentBlock::ToolUse {
-                    id: "tool-2".to_string(),
-                    name: "read_file".to_string(),
-                    input: json!({ "path": "rust/Cargo.toml" }),
-                }],
-                stop_reason: Some("tool_use".to_string()),
-                stop_sequence: None,
-                usage: Usage {
-                    input_tokens: 1,
-                    output_tokens: 1,
-                    cache_creation_input_tokens: 0,
-                    cache_read_input_tokens: 0,
-                },
-                request_id: None,
-            },
-            &mut out,
-            false,
-        )
-        .expect("response conversion should succeed");
-
-        assert!(matches!(
-            &events[0],
-            AssistantEvent::ToolUse { name, input, .. }
-                if name == "read_file" && input == "{\"path\":\"rust/Cargo.toml\"}"
-        ));
-    }
-
-    #[test]
-    fn response_to_events_renders_collapsed_thinking_summary() {
-        let mut out = Vec::new();
-        let events = response_to_events(
-            MessageResponse {
-                id: "msg-3".to_string(),
-                kind: "message".to_string(),
-                model: "anthropic/claude-opus-4-6".to_string(),
-                role: "assistant".to_string(),
-                content: vec![
-                    OutputContentBlock::Thinking {
-                        thinking: "step 1".to_string(),
-                        signature: Some("sig_123".to_string()),
-                    },
-                    OutputContentBlock::Text {
-                        text: "Final answer".to_string(),
-                    },
-                ],
-                stop_reason: Some("end_turn".to_string()),
-                stop_sequence: None,
-                usage: Usage {
-                    input_tokens: 1,
-                    output_tokens: 1,
-                    cache_creation_input_tokens: 0,
-                    cache_read_input_tokens: 0,
-                },
-                request_id: None,
-            },
-            &mut out,
-            false,
-        )
-        .expect("response conversion should succeed");
-
-        assert!(matches!(
-            &events[0],
-            AssistantEvent::Thinking {
-                thinking,
-                signature
-            } if thinking == "step 1" && signature.as_deref() == Some("sig_123")
-        ));
-        assert!(matches!(
-            &events[1],
-            AssistantEvent::TextDelta(text) if text == "Final answer"
-        ));
-        let rendered = String::from_utf8(out).expect("utf8");
-        assert!(rendered.contains("▶ Thinking (6 chars hidden)"));
-        assert!(!rendered.contains("step 1"));
-    }
-
-    #[test]
-    fn response_to_events_renders_caveman_output_but_keeps_event_text() {
-        let mut out = Vec::new();
-        let source = "Please review the auth middleware in src/auth/token.rs and do not change the public API.";
-        let events = response_to_events(
-            MessageResponse {
-                id: "msg-4".to_string(),
-                kind: "message".to_string(),
-                model: "anthropic/claude-opus-4-6".to_string(),
-                role: "assistant".to_string(),
-                content: vec![OutputContentBlock::Text {
-                    text: source.to_string(),
-                }],
-                stop_reason: Some("end_turn".to_string()),
-                stop_sequence: None,
-                usage: Usage {
-                    input_tokens: 1,
-                    output_tokens: 1,
-                    cache_creation_input_tokens: 0,
-                    cache_read_input_tokens: 0,
-                },
-                request_id: None,
-            },
-            &mut out,
-            true,
-        )
-        .expect("response conversion should succeed");
-
-        assert!(matches!(&events[0], AssistantEvent::TextDelta(text) if text == source));
-        let rendered = String::from_utf8(out).expect("utf8");
-        assert!(!rendered.contains("Please"));
-        assert!(rendered.contains("src/auth/token.rs"));
-        assert!(rendered.contains("do not change public API"));
-    }
-
-    #[test]
     fn build_runtime_plugin_state_merges_plugin_hooks_into_runtime_features() {
         let config_home = temp_dir();
         let workspace = temp_dir();
@@ -21977,11 +21068,11 @@ UU conflicted.rs",
         assert!(allowed.contains("mcp__alpha__echo"));
         assert!(allowed.contains("mcp_tool"));
 
-        let mut executor = CliToolExecutor::new(
+        let mut executor = claw_engine::EngineToolExecutor::new(
             None,
-            false,
             state.tool_registry.clone(),
             state.mcp_state.clone(),
+            Box::new(claw_engine::NullSink),
         );
 
         let tool_output = executor
@@ -22075,11 +21166,11 @@ UU conflicted.rs",
         let runtime_config = loader.load().expect("runtime config should load");
         let state = build_runtime_plugin_state_with_loader(&workspace, &loader, &runtime_config)
             .expect("runtime plugin state should load");
-        let mut executor = CliToolExecutor::new(
+        let mut executor = claw_engine::EngineToolExecutor::new(
             None,
-            false,
             state.tool_registry.clone(),
             state.mcp_state.clone(),
+            Box::new(claw_engine::NullSink),
         );
 
         let search_output = executor

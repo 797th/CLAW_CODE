@@ -36,7 +36,7 @@ pub const NEEDS_LOGIN_HINT: &str =
 
 /// After tool execution some providers accept the continuation request but
 /// never send a first event. Drop the stalled connection and re-send once.
-const POST_TOOL_STALL_TIMEOUT: Duration = Duration::from_secs(60);
+const POST_TOOL_STALL_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Streams provider responses for one session.
 pub struct EngineClient {
@@ -555,8 +555,231 @@ pub fn filter_tool_specs(
 
 #[cfg(test)]
 mod tests {
-    use super::{convert_messages_with_mode, request_ends_with_tool_result};
-    use runtime::{ApiRequest, ContentBlock, ConversationMessage, MessageRole};
+    use super::{
+        convert_messages_with_mode, push_output_block, request_ends_with_tool_result,
+        response_to_events,
+    };
+    use crate::sink::{SinkResult, TurnSink};
+    use api::{MessageResponse, OutputContentBlock, Usage};
+    use runtime::{ApiRequest, AssistantEvent, ContentBlock, ConversationMessage, MessageRole};
+    use serde_json::json;
+
+    /// Records the semantic events a frontend would draw.
+    #[derive(Default)]
+    struct RecordingSink {
+        calls: Vec<String>,
+    }
+
+    impl TurnSink for RecordingSink {
+        fn text_delta(&mut self, text: &str) -> SinkResult {
+            self.calls.push(format!("text_delta:{text}"));
+            Ok(())
+        }
+        fn text_block(&mut self, text: &str) -> SinkResult {
+            self.calls.push(format!("text_block:{text}"));
+            Ok(())
+        }
+        fn thinking_block(&mut self, thinking: &str, _signature: Option<&str>) -> SinkResult {
+            self.calls.push(format!("thinking_block:{thinking}"));
+            Ok(())
+        }
+        fn tool_call(&mut self, name: &str, input: &str) -> SinkResult {
+            self.calls.push(format!("tool_call:{name}:{input}"));
+            Ok(())
+        }
+        fn block_stop(&mut self) -> SinkResult {
+            self.calls.push("block_stop".to_string());
+            Ok(())
+        }
+    }
+
+    fn response_with(content: Vec<OutputContentBlock>) -> MessageResponse {
+        MessageResponse {
+            id: "msg-1".to_string(),
+            kind: "message".to_string(),
+            model: "anthropic/claude-opus-4-6".to_string(),
+            role: "assistant".to_string(),
+            content,
+            stop_reason: Some("end_turn".to_string()),
+            stop_sequence: None,
+            usage: Usage {
+                input_tokens: 1,
+                output_tokens: 1,
+                cache_creation_input_tokens: 0,
+                cache_read_input_tokens: 0,
+            },
+            request_id: None,
+        }
+    }
+
+    #[test]
+    fn text_blocks_reach_the_sink_and_the_event_log() {
+        let mut sink = RecordingSink::default();
+        let mut events = Vec::new();
+        let mut pending_tool = None;
+
+        push_output_block(
+            OutputContentBlock::Text {
+                text: "# Heading".to_string(),
+            },
+            &mut sink,
+            &mut events,
+            &mut pending_tool,
+            false,
+        )
+        .expect("text block should render");
+
+        assert_eq!(sink.calls, vec!["text_block:# Heading"]);
+        assert!(matches!(&events[0], AssistantEvent::TextDelta(t) if t == "# Heading"));
+    }
+
+    #[test]
+    fn empty_text_blocks_are_not_forwarded() {
+        let mut sink = RecordingSink::default();
+        let mut events = Vec::new();
+        let mut pending_tool = None;
+
+        push_output_block(
+            OutputContentBlock::Text {
+                text: String::new(),
+            },
+            &mut sink,
+            &mut events,
+            &mut pending_tool,
+            false,
+        )
+        .expect("empty text should be skipped");
+
+        assert!(
+            sink.calls.is_empty(),
+            "empty text must not draw: {:?}",
+            sink.calls
+        );
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn streaming_tool_input_drops_the_empty_object_placeholder() {
+        // While streaming, content_block_start carries `{}` and the real input
+        // arrives as deltas; keeping the placeholder would corrupt the JSON.
+        let mut sink = RecordingSink::default();
+        let mut events = Vec::new();
+        let mut pending_tool = None;
+
+        push_output_block(
+            OutputContentBlock::ToolUse {
+                id: "tool-1".to_string(),
+                name: "read_file".to_string(),
+                input: json!({}),
+            },
+            &mut sink,
+            &mut events,
+            &mut pending_tool,
+            true,
+        )
+        .expect("tool block should accumulate");
+
+        assert!(events.is_empty(), "the tool use is emitted at block_stop");
+        assert_eq!(
+            pending_tool,
+            Some(("tool-1".to_string(), "read_file".to_string(), String::new()))
+        );
+    }
+
+    #[test]
+    fn non_streaming_tool_input_keeps_a_legitimate_empty_object() {
+        let mut sink = RecordingSink::default();
+        let mut events = Vec::new();
+        let mut pending_tool = None;
+
+        push_output_block(
+            OutputContentBlock::ToolUse {
+                id: "tool-1".to_string(),
+                name: "read_file".to_string(),
+                input: json!({}),
+            },
+            &mut sink,
+            &mut events,
+            &mut pending_tool,
+            false,
+        )
+        .expect("tool block should accumulate");
+
+        assert_eq!(
+            pending_tool,
+            Some((
+                "tool-1".to_string(),
+                "read_file".to_string(),
+                "{}".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn non_streaming_responses_preserve_tool_input_json() {
+        let mut sink = RecordingSink::default();
+
+        let events = response_to_events(
+            response_with(vec![OutputContentBlock::ToolUse {
+                id: "tool-9".to_string(),
+                name: "read_file".to_string(),
+                input: json!({"path": "src/main.rs"}),
+            }]),
+            &mut sink,
+        )
+        .expect("response conversion should succeed");
+
+        let tool = events
+            .iter()
+            .find_map(|event| match event {
+                AssistantEvent::ToolUse { input, .. } => Some(input.clone()),
+                _ => None,
+            })
+            .expect("a tool use should be emitted");
+        assert!(
+            tool.contains("src/main.rs"),
+            "input JSON must survive: {tool}"
+        );
+    }
+
+    #[test]
+    fn thinking_blocks_are_announced_without_leaking_reasoning_text() {
+        let mut sink = RecordingSink::default();
+
+        let events = response_to_events(
+            response_with(vec![OutputContentBlock::Thinking {
+                thinking: "step 1".to_string(),
+                signature: None,
+            }]),
+            &mut sink,
+        )
+        .expect("response conversion should succeed");
+
+        // The sink is told the block exists and its length; how (or whether) to
+        // show it is the frontend's call.
+        assert_eq!(sink.calls[0], "thinking_block:step 1");
+        assert!(events
+            .iter()
+            .any(|event| matches!(event, AssistantEvent::Thinking { thinking, .. } if thinking == "step 1")));
+    }
+
+    #[test]
+    fn response_events_always_carry_full_text_regardless_of_rendering() {
+        // Caveman compression is a rendering concern owned by the sink; the
+        // session must still record what the model actually said.
+        let mut sink = RecordingSink::default();
+        let source = "Please review the auth middleware in src/auth/token.rs.";
+
+        let events = response_to_events(
+            response_with(vec![OutputContentBlock::Text {
+                text: source.to_string(),
+            }]),
+            &mut sink,
+        )
+        .expect("response conversion should succeed");
+
+        assert!(matches!(&events[0], AssistantEvent::TextDelta(text) if text == source));
+    }
 
     fn text_message(role: MessageRole, text: &str) -> ConversationMessage {
         ConversationMessage {
