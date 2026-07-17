@@ -4,12 +4,43 @@
 
 use std::collections::BTreeMap;
 use std::fs;
-use std::io;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::conversation::{ApiClient, ApiRequest, AssistantEvent};
+use crate::harness_assets::parse_frontmatter_value;
+use crate::session::{ContentBlock, ConversationMessage, MessageRole};
+
 pub const WEAVER_DIR_NAME: &str = ".weaver";
 pub const STATS_FILENAME: &str = "stats.json";
+pub const LAST_WEAVE_FILENAME: &str = ".last-weave";
+pub const WEAVE_LOCK_FILENAME: &str = ".weave-lock";
+pub const LEARNED_DIR_NAME: &str = "learned";
+const MAX_SKILLS_PER_PASS: usize = 3;
+
+// ---------------------------------------------------------------------------
+// System prompt
+// ---------------------------------------------------------------------------
+
+const WEAVER_SYSTEM_PROMPT: &str = r#"You are the Skill Weaver for an agentic coding CLI. You read transcripts of completed agent sessions and distill *reusable, generalizable procedures* into skill files, exactly like the SkillWeaver propose-and-synthesize loop.
+
+Rules:
+- Only weave a skill when the transcript shows a NON-OBVIOUS multi-step procedure that succeeded and would plausibly recur (recurring build/test/debug workflow, project-specific incantation, multi-tool recipe).
+- Never weave: one-liner commands, generic knowledge the model already has, secrets/credentials, user-specific data, or anything from a failed trajectory.
+- Skill names are kebab-case, [a-z0-9-]+ only, 3-40 chars, and must not duplicate an existing skill name from the provided list.
+- Each skill is emitted as a block:
+<skill name="<kebab-name>">
+---
+name: <kebab-name>
+description: <one line: when to use this skill>
+---
+
+# <Title>
+
+<numbered, concrete steps with exact commands where known>
+</skill>
+- Emit zero skills (empty response) when nothing qualifies. Quality over quantity: at most 3 skills per pass."#;
 
 /// `<cwd>/.claw/skills/.weaver`
 pub fn weaver_dir(cwd: &Path) -> PathBuf {
@@ -171,6 +202,211 @@ pub fn collect_episodes(
     Ok(episodes)
 }
 
+// ---------------------------------------------------------------------------
+// Weave pass: synthesize + write learned skills
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WovenSkill {
+    pub name: String,
+    pub markdown: String,
+}
+
+fn valid_skill_name(name: &str) -> bool {
+    (3..=40).contains(&name.len())
+        && name
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+}
+
+fn collect_text_from_events(events: &[AssistantEvent]) -> String {
+    let mut text = String::new();
+    for event in events {
+        if let AssistantEvent::TextDelta(delta) = event {
+            text.push_str(delta);
+        }
+    }
+    text.trim().to_string()
+}
+
+/// Parse `<skill name="...">...</skill>` blocks out of the raw provider text.
+fn parse_weaver_output(raw: &str) -> Result<Vec<WovenSkill>, WeaverError> {
+    let mut skills = Vec::new();
+    let mut rest = raw;
+    while let Some(start) = rest.find("<skill name=\"") {
+        let after = &rest[start + "<skill name=\"".len()..];
+        let Some(name_end) = after.find('"') else {
+            break;
+        };
+        let name = after[..name_end].to_string();
+        let Some(body_start) = after.find('>') else {
+            break;
+        };
+        let body_rest = &after[body_start + 1..];
+        let Some(end) = body_rest.find("</skill>") else {
+            return Err(WeaverError::InvalidOutput(format!(
+                "unterminated skill block '{name}'"
+            )));
+        };
+        let markdown = body_rest[..end].trim().to_string();
+        if !valid_skill_name(&name) {
+            return Err(WeaverError::InvalidOutput(format!(
+                "invalid skill name '{name}'"
+            )));
+        }
+        let frontmatter_name = parse_frontmatter_value(&markdown, "name");
+        if frontmatter_name.as_deref() != Some(name.as_str()) {
+            return Err(WeaverError::InvalidOutput(format!(
+                "skill '{name}': frontmatter name mismatch"
+            )));
+        }
+        if parse_frontmatter_value(&markdown, "description").is_none() {
+            return Err(WeaverError::InvalidOutput(format!(
+                "skill '{name}': missing description"
+            )));
+        }
+        skills.push(WovenSkill { name, markdown });
+        rest = &body_rest[end + "</skill>".len()..];
+    }
+    skills.truncate(MAX_SKILLS_PER_PASS);
+    Ok(skills)
+}
+
+pub fn synthesize_skills(
+    episodes: &[Episode],
+    existing_skill_names: &[String],
+    client: &mut impl ApiClient,
+) -> Result<Vec<WovenSkill>, WeaverError> {
+    if episodes.is_empty() {
+        return Err(WeaverError::NoEpisodes);
+    }
+    let mut user_message = String::from("Existing skill names (do not duplicate):\n");
+    for name in existing_skill_names {
+        user_message.push_str("- ");
+        user_message.push_str(name);
+        user_message.push('\n');
+    }
+    user_message.push_str("\nSession transcripts, newest first:\n\n");
+    for episode in episodes {
+        user_message.push_str(&format!(
+            "=== session {} ===\n{}\n",
+            episode.session_file.display(),
+            episode.content
+        ));
+    }
+
+    let request = ApiRequest {
+        system_prompt: vec![WEAVER_SYSTEM_PROMPT.to_string()],
+        messages: vec![ConversationMessage {
+            role: MessageRole::User,
+            blocks: vec![ContentBlock::Text { text: user_message }],
+            usage: None,
+        }],
+    };
+    let events = client
+        .stream(request)
+        .map_err(|e| WeaverError::Api(e.to_string()))?;
+    let raw = collect_text_from_events(&events);
+    parse_weaver_output(&raw)
+}
+
+pub fn write_learned_skills(
+    skills: &[WovenSkill],
+    skills_root: &Path,
+) -> Result<Vec<PathBuf>, WeaverError> {
+    let mut written = Vec::new();
+    for skill in skills {
+        if !valid_skill_name(&skill.name) {
+            return Err(WeaverError::InvalidOutput(format!(
+                "invalid skill name '{}'",
+                skill.name
+            )));
+        }
+        let dir = skills_root.join(LEARNED_DIR_NAME).join(&skill.name);
+        fs::create_dir_all(&dir)?;
+        let dest = dir.join("SKILL.md");
+        let tmp = dir.join("SKILL.md.tmp");
+        let mut body = skill.markdown.clone();
+        if !body.ends_with('\n') {
+            body.push('\n');
+        }
+        fs::write(&tmp, body)?;
+        fs::rename(&tmp, &dest)?;
+        written.push(dest);
+    }
+    Ok(written)
+}
+
+#[derive(Debug)]
+pub struct WeaveRun {
+    pub files_written: Vec<PathBuf>,
+    pub episode_count: usize,
+}
+
+pub fn run_weave_pass(
+    cwd: &Path,
+    client: &mut impl ApiClient,
+    max_input_bytes: usize,
+) -> Result<WeaveRun, WeaverError> {
+    let weaver = weaver_dir(cwd);
+    fs::create_dir_all(&weaver)?;
+    let _lock = WeaveLock::try_acquire(&weaver)?;
+
+    let since = last_weave_time(&weaver);
+    let episodes = collect_episodes(cwd, since, max_input_bytes)?;
+    if episodes.is_empty() {
+        return Err(WeaverError::NoEpisodes);
+    }
+    let existing: Vec<String> = crate::harness_assets::discover(cwd)
+        .skills
+        .into_iter()
+        .map(|s| s.name)
+        .collect();
+    let skills = synthesize_skills(&episodes, &existing, client)?;
+    let skills_root = cwd.join(".claw").join("skills");
+    let files_written = write_learned_skills(&skills, &skills_root)?;
+    fs::write(weaver.join(LAST_WEAVE_FILENAME), b"")?;
+    Ok(WeaveRun {
+        files_written,
+        episode_count: episodes.len(),
+    })
+}
+
+fn last_weave_time(weaver: &Path) -> Option<SystemTime> {
+    fs::metadata(weaver.join(LAST_WEAVE_FILENAME))
+        .and_then(|m| m.modified())
+        .ok()
+}
+
+struct WeaveLock {
+    path: PathBuf,
+}
+
+impl WeaveLock {
+    fn try_acquire(weaver_dir: &Path) -> Result<Self, WeaverError> {
+        fs::create_dir_all(weaver_dir)?;
+        let path = weaver_dir.join(WEAVE_LOCK_FILENAME);
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(mut file) => {
+                writeln!(file, "pid={}", std::process::id())?;
+                Ok(Self { path })
+            }
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Err(WeaverError::Locked),
+            Err(error) => Err(WeaverError::Io(error)),
+        }
+    }
+}
+
+impl Drop for WeaveLock {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -234,5 +470,93 @@ mod tests {
         let episodes = collect_episodes(dir.path(), Some(cutoff), 1024).unwrap();
         assert_eq!(episodes.len(), 1);
         assert!(episodes[0].content.contains("new"));
+    }
+
+    const VALID_SKILL_BLOCK: &str = r#"<skill name="fix-clippy-warnings">
+---
+name: fix-clippy-warnings
+description: Run clippy with -D warnings and fix each lint mechanically before committing
+---
+
+# Fix clippy warnings
+
+1. Run `cargo clippy --workspace --all-targets -- -D warnings`.
+2. Fix each warning in source order; re-run until clean.
+</skill>"#;
+
+    #[test]
+    fn parse_weaver_output_parses_valid_skill_block() {
+        let skills = parse_weaver_output(VALID_SKILL_BLOCK).unwrap();
+        assert_eq!(skills.len(), 1);
+        assert_eq!(skills[0].name, "fix-clippy-warnings");
+        assert!(skills[0].markdown.starts_with("---"));
+    }
+
+    #[test]
+    fn parse_weaver_output_empty_response_is_empty_skills() {
+        let skills = parse_weaver_output("").unwrap();
+        assert!(skills.is_empty());
+    }
+
+    #[test]
+    fn parse_weaver_output_rejects_path_escaping_name() {
+        let bad = r#"<skill name="../evil">
+---
+name: ../evil
+description: nope
+---
+body
+</skill>"#;
+        let err = parse_weaver_output(bad).unwrap_err();
+        assert!(matches!(err, WeaverError::InvalidOutput(_)));
+    }
+
+    #[test]
+    fn parse_weaver_output_rejects_frontmatter_name_mismatch() {
+        let bad = r#"<skill name="fix-clippy-warnings">
+---
+name: different-name
+description: nope
+---
+body
+</skill>"#;
+        let err = parse_weaver_output(bad).unwrap_err();
+        assert!(matches!(err, WeaverError::InvalidOutput(_)));
+    }
+
+    #[test]
+    fn parse_weaver_output_rejects_missing_description() {
+        let bad = r#"<skill name="fix-clippy-warnings">
+---
+name: fix-clippy-warnings
+---
+body
+</skill>"#;
+        let err = parse_weaver_output(bad).unwrap_err();
+        assert!(matches!(err, WeaverError::InvalidOutput(_)));
+    }
+
+    #[test]
+    fn parse_weaver_output_truncates_to_max_skills_per_pass() {
+        let mut raw = String::new();
+        for i in 0..5 {
+            raw.push_str(&format!(
+                "<skill name=\"skill-number-{i}\">\n---\nname: skill-number-{i}\ndescription: skill {i}\n---\nbody\n</skill>\n"
+            ));
+        }
+        let skills = parse_weaver_output(&raw).unwrap();
+        assert_eq!(skills.len(), MAX_SKILLS_PER_PASS);
+    }
+
+    #[test]
+    fn write_learned_skills_rejects_path_escaping_name_without_writing() {
+        let dir = tempfile::tempdir().unwrap();
+        let skills = vec![WovenSkill {
+            name: "../evil".to_string(),
+            markdown: "---\nname: ../evil\ndescription: nope\n---\nbody\n".to_string(),
+        }];
+        let err = write_learned_skills(&skills, dir.path()).unwrap_err();
+        assert!(matches!(err, WeaverError::InvalidOutput(_)));
+        assert!(!dir.path().join("learned").exists());
     }
 }

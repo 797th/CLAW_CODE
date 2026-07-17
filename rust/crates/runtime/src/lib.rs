@@ -189,8 +189,9 @@ pub use sandbox::{
     SandboxRequest, SandboxStatus,
 };
 pub use session::{
-    CompactionDetails, ContentBlock, ConversationMessage, MessageRole, Session, SessionCompaction,
-    SessionError, SessionFork, SessionHeartbeat, SessionLiveness, SessionPromptEntry,
+    workspace_sessions_dir, CompactionDetails, ContentBlock, ConversationMessage, MessageRole,
+    Session, SessionCompaction, SessionError, SessionFork, SessionHeartbeat, SessionLiveness,
+    SessionPromptEntry,
 };
 pub use sse::{IncrementalSseParser, SseEvent};
 pub use stale_base::{
