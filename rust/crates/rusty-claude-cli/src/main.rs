@@ -1729,8 +1729,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             worker_model,
             output_format,
         } => {
-            let assets =
-                runtime::harness_assets::discover(&env::current_dir().unwrap_or_default());
+            let assets = runtime::harness_assets::discover(&env::current_dir().unwrap_or_default());
             let personas = mao::load_personas(&assets);
             match mao::run_orchestrate(&manager_model, &worker_model, &prompt, personas) {
                 Ok(result) => match output_format {
@@ -2706,6 +2705,10 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                     args,
                     output_format,
                 }),
+                SkillSlashDispatch::Weave => Err(
+                    "interactive_only: `claw skills weave` is a slash command.\nStart `claw` and run `/skills weave` inside the REPL."
+                        .to_string(),
+                ),
             }
         }
         "settings" => {
@@ -3196,7 +3199,7 @@ fn repl_command_model_prompt(command: &SlashCommand) -> Option<String> {
     match command {
         SlashCommand::Skills { args } => match classify_skills_slash_command(args.as_deref()) {
             SkillSlashDispatch::Invoke(prompt) => Some(prompt),
-            SkillSlashDispatch::Local => None,
+            SkillSlashDispatch::Local | SkillSlashDispatch::Weave => None,
         },
         _ => None,
     }
@@ -3267,6 +3270,10 @@ fn parse_direct_slash_cli_action(
                     args,
                     output_format,
                 }),
+                SkillSlashDispatch::Weave => Err(
+                    "interactive_only: `/skills weave` is a slash command.\nStart `claw` and run `/skills weave` inside the REPL."
+                        .to_string(),
+                ),
             }
         }
         Ok(Some(SlashCommand::Unknown(name))) => {
@@ -3832,10 +3839,9 @@ fn apply_headless_model_add(
         return Err("alias cannot be empty.".into());
     }
     if reserved_model_alias(alias) {
-        return Err(format!(
-            "'{alias}' is a reserved model name; choose a different alias."
-        )
-        .into());
+        return Err(
+            format!("'{alias}' is a reserved model name; choose a different alias.").into(),
+        );
     }
     // Validate the target syntax (provider/model or a configured alias).
     if let Err(message) = validate_model_syntax(model) {
@@ -3866,11 +3872,9 @@ fn apply_headless_model_remove(
     alias: Option<&str>,
 ) -> Result<(String, serde_json::Value), Box<dyn std::error::Error>> {
     let Some(alias) = alias else {
-        return Err(
-            "model remove needs an alias in non-interactive mode.\n\
+        return Err("model remove needs an alias in non-interactive mode.\n\
              Usage: /model remove <alias>  (or run /model remove in the REPL)"
-                .into(),
-        );
+            .into());
     };
     let alias = alias.trim();
     if alias.is_empty() {
@@ -7554,8 +7558,7 @@ fn run_resume_command(
             // always discover fresh, there's no dispatch snapshot to stay
             // consistent with here.
             let (custom_commands, _warnings) = commands::resolve_custom_commands(
-                runtime::harness_assets::discover(&env::current_dir().unwrap_or_default())
-                    .commands,
+                runtime::harness_assets::discover(&env::current_dir().unwrap_or_default()).commands,
             );
             let help_text = render_repl_help(&custom_commands);
             Ok(ResumeCommandOutcome {
@@ -7962,20 +7965,22 @@ fn run_resume_command(
             })
         }
         SlashCommand::ModelAdd { alias, model } => {
-            apply_headless_model_add(alias.as_deref(), model.as_deref())
-                .map(|(message, json)| ResumeCommandOutcome {
+            apply_headless_model_add(alias.as_deref(), model.as_deref()).map(|(message, json)| {
+                ResumeCommandOutcome {
                     session: session.clone(),
                     message: Some(message),
                     json: Some(json),
-                })
+                }
+            })
         }
         SlashCommand::ModelRemove { alias } => {
-            apply_headless_model_remove(alias.as_deref())
-                .map(|(message, json)| ResumeCommandOutcome {
+            apply_headless_model_remove(alias.as_deref()).map(|(message, json)| {
+                ResumeCommandOutcome {
                     session: session.clone(),
                     message: Some(message),
                     json: Some(json),
-                })
+                }
+            })
         }
         SlashCommand::Bughunter { .. }
         | SlashCommand::Commit { .. }
@@ -8218,10 +8223,8 @@ fn run_repl(
                 // surfaced here instead of failing dispatch.
                 let custom_commands = if trimmed.starts_with('/') {
                     let (kept, warnings) = commands::resolve_custom_commands(
-                        runtime::harness_assets::discover(
-                            &env::current_dir().unwrap_or_default(),
-                        )
-                        .commands,
+                        runtime::harness_assets::discover(&env::current_dir().unwrap_or_default())
+                            .commands,
                     );
                     for warning in &warnings {
                         eprintln!("{warning}");
@@ -8307,12 +8310,7 @@ fn run_repl(
                 queue_working_input_result(
                     &mut pending_inputs,
                     &mut pending_draft,
-                    run_interactive_turn_after_begin(
-                        &mut cli,
-                        &editor,
-                        &trimmed,
-                        composer_column,
-                    )?,
+                    run_interactive_turn_after_begin(&mut cli, &editor, &trimmed, composer_column)?,
                 );
             }
             input::ReadOutcome::Cancel => {}
@@ -8333,11 +8331,8 @@ fn run_interactive_turn_after_begin(
     composer_column: Option<u16>,
 ) -> Result<input::WorkingInputResult, Box<dyn std::error::Error>> {
     let mut working_input = editor.start_working_input()?;
-    let turn_result = cli.run_turn_with_composer(
-        prompt,
-        composer_column,
-        Some(working_input.store()),
-    );
+    let turn_result =
+        cli.run_turn_with_composer(prompt, composer_column, Some(working_input.store()));
     let queued_inputs = working_input.finish()?;
     turn_result?;
     Ok(queued_inputs)
@@ -9176,6 +9171,72 @@ impl LiveCli {
         Ok(())
     }
 
+    fn run_weave(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        let cwd = env::current_dir()?;
+        let max_input_bytes = ConfigLoader::default_for(&cwd)
+            .load()
+            .map(|config| config.weaver().max_input_bytes())
+            .unwrap_or_else(|_| runtime::WeaverConfig::default().max_input_bytes());
+        // `prepare_dream_runtime` builds a throwaway runtime (no system prompt,
+        // no history injection) purely to get a live `ApiClient` — the same
+        // pattern `run_dream` uses for its provider pass.
+        let mut runtime = self.prepare_dream_runtime()?;
+        let result =
+            runtime::skill_weaver::run_weave_pass(&cwd, runtime.api_client_mut(), max_input_bytes);
+        runtime.shutdown_plugins()?;
+
+        match result {
+            Ok(run) => {
+                let honed = {
+                    let weaver = runtime::skill_weaver::weaver_dir(&cwd);
+                    let ledger = runtime::skill_weaver::SkillLedger::load(&weaver);
+                    match runtime::skill_weaver::hone(&cwd, &ledger) {
+                        Ok(honed) => honed,
+                        Err(error) => {
+                            eprintln!("weave: honing pass failed: {error}");
+                            Vec::new()
+                        }
+                    }
+                };
+                // Mirror run_dream: the in-session system prompt embeds the
+                // skill index, so a successful weave/hone (new skills
+                // written, others just quarantined) must rebuild it —
+                // otherwise new skills stay invisible and quarantined ones
+                // stay advertised until the next process restart.
+                self.system_prompt = build_system_prompt(&self.model)?;
+                println!(
+                    "wove {} skill(s) from {} session(s){}{}",
+                    run.files_written.len(),
+                    run.episode_count,
+                    if honed.is_empty() {
+                        String::new()
+                    } else {
+                        format!("; quarantined: {}", honed.join(", "))
+                    },
+                    if run.skipped_quarantined.is_empty() {
+                        String::new()
+                    } else {
+                        format!(
+                            "; skipped (still quarantined): {}",
+                            run.skipped_quarantined.join(", ")
+                        )
+                    }
+                );
+                for path in run.files_written {
+                    println!("  - {}", path.display());
+                }
+            }
+            Err(runtime::skill_weaver::WeaverError::NoEpisodes) => {
+                println!("nothing to weave: no new session episodes");
+            }
+            Err(runtime::skill_weaver::WeaverError::Locked) => {
+                println!("weave skipped: another weave pass is running");
+            }
+            Err(error) => eprintln!("weave failed: {error}"),
+        }
+        Ok(())
+    }
+
     fn run_dream(&mut self, force: bool) -> Result<(), Box<dyn std::error::Error>> {
         let manager = self.memory_manager()?;
         let memory_dir = manager.memory_dir();
@@ -9258,6 +9319,61 @@ impl LiveCli {
         }
     }
 
+    fn maybe_auto_weave_after_success(&mut self) {
+        let Ok(cwd) = env::current_dir() else {
+            return;
+        };
+        let config = match ConfigLoader::default_for(&cwd).load() {
+            Ok(config) => config,
+            Err(error) => {
+                eprintln!("auto-weave skipped: {error}");
+                return;
+            }
+        };
+        if !config.weaver().auto_weave() {
+            return;
+        }
+        let mut runtime = match self.prepare_dream_runtime() {
+            Ok(runtime) => runtime,
+            Err(error) => {
+                eprintln!("auto-weave skipped: {error}");
+                return;
+            }
+        };
+        let result = runtime::skill_weaver::maybe_run_auto_weave(
+            &cwd,
+            config.weaver(),
+            runtime.api_client_mut(),
+        );
+        let shutdown_result = runtime.shutdown_plugins();
+        match (result, shutdown_result) {
+            (Ok(Some(run)), Ok(())) => {
+                // Mirror maybe_auto_dream_after_success: rebuild the
+                // system prompt so newly woven skills are advertised (and
+                // any hone-quarantined ones drop out) without waiting for
+                // a fresh process.
+                if let Ok(system_prompt) = build_system_prompt(&self.model) {
+                    self.system_prompt = system_prompt;
+                }
+                eprintln!(
+                    "auto-weave complete: wove {} skill(s) from {} session(s)",
+                    run.files_written.len(),
+                    run.episode_count
+                );
+            }
+            (
+                Ok(None)
+                | Err(
+                    runtime::skill_weaver::WeaverError::NoEpisodes
+                    | runtime::skill_weaver::WeaverError::Locked,
+                ),
+                Ok(()),
+            ) => {}
+            (Err(error), Ok(())) => eprintln!("auto-weave skipped: {error}"),
+            (_, Err(error)) => eprintln!("auto-weave cleanup failed: {error}"),
+        }
+    }
+
     fn run_turn(&mut self, input: &str) -> Result<(), Box<dyn std::error::Error>> {
         self.run_turn_internal(input, true, None, None)
     }
@@ -9321,6 +9437,7 @@ impl LiveCli {
                 self.persist_session()?;
                 self.append_turn_log(input, &summary);
                 self.maybe_auto_dream_after_success();
+                self.maybe_auto_weave_after_success();
                 Ok(())
             }
             Err(error) => {
@@ -9768,6 +9885,9 @@ impl LiveCli {
                             eprintln!("{error}");
                         }
                     }
+                    SkillSlashDispatch::Weave => {
+                        self.run_weave()?;
+                    }
                 }
                 false
             }
@@ -10093,10 +10213,7 @@ impl LiveCli {
 
     /// `/model remove [alias]`. Headless when the alias is supplied, otherwise
     /// prompts interactively (REPL only).
-    fn remove_model(
-        &mut self,
-        alias: Option<String>,
-    ) -> Result<bool, Box<dyn std::error::Error>> {
+    fn remove_model(&mut self, alias: Option<String>) -> Result<bool, Box<dyn std::error::Error>> {
         let alias = match alias {
             Some(alias) => alias,
             None => {
@@ -10727,7 +10844,9 @@ impl LiveCli {
                 workflow.start(task_ref);
                 let phase = workflow.phase;
                 self.persist_session()?;
-                println!("Workflow started\n  Task             {task_ref}\n  Phase            {phase:?}");
+                println!(
+                    "Workflow started\n  Task             {task_ref}\n  Phase            {phase:?}"
+                );
                 Ok(false)
             }
             Some("advance") => {
@@ -10784,9 +10903,7 @@ impl LiveCli {
                 Ok(false)
             }
             _ => {
-                println!(
-                    "Usage: /workflow [status|start <task-ref>|advance|gate <kind> <detail>]"
-                );
+                println!("Usage: /workflow [status|start <task-ref>|advance|gate <kind> <detail>]");
                 Ok(false)
             }
         }
@@ -16386,34 +16503,35 @@ mod tests {
     use super::{
         acp_status_json, build_runtime_plugin_state_with_loader, build_runtime_with_plugin_state,
         classify_error_kind, classify_session_lifecycle_from_panes, collect_gate_events,
-        collect_session_prompt_history, gate_audit_lines,
-        create_managed_session_handle, describe_tool_progress, filter_tool_specs,
-        format_bughunter_report, format_commit_preflight_report, format_commit_skipped_report,
-        format_compact_report, format_connected_line, format_cost_report, format_history_timestamp,
-        format_internal_prompt_progress_line, format_issue_report, format_model_report,
-        format_model_switch_report, format_permissions_report, format_permissions_switch_report,
-        format_pr_report, format_repl_footer, format_repl_prompt, format_resume_report,
-        format_status_report, format_tool_call_start, format_tool_result, format_ultraplan_report,
+        collect_session_prompt_history, create_managed_session_handle, describe_tool_progress,
+        filter_tool_specs, format_bughunter_report, format_commit_preflight_report,
+        format_commit_skipped_report, format_compact_report, format_connected_line,
+        format_cost_report, format_history_timestamp, format_internal_prompt_progress_line,
+        format_issue_report, format_model_report, format_model_switch_report,
+        format_permissions_report, format_permissions_switch_report, format_pr_report,
+        format_repl_footer, format_repl_prompt, format_resume_report, format_status_report,
+        format_tool_call_start, format_tool_result, format_ultraplan_report,
         format_unknown_slash_command, format_unknown_slash_command_message,
-        format_user_visible_api_error, merge_prompt_with_stdin, normalize_permission_mode,
-        parse_args, parse_export_args, parse_git_status_branch, parse_git_status_metadata_for,
-        parse_git_workspace_summary, parse_history_count, permission_policy,
-        persist_provider_setup, print_help_to, push_output_block, render_config_report,
-        render_diff_report, render_diff_report_for, render_help_topic, render_help_topic_json,
-        render_memory_report, render_prompt_history_report, render_repl_help, render_repl_response,
-        render_resume_usage, render_session_list, render_session_markdown, resolve_model_alias,
-        resolve_model_alias_with_config, resolve_repl_model, resolve_session_reference,
-        response_to_events, resume_supported_slash_commands, run_resume_command,
-        setup_default_model, short_tool_id, slash_command_completion_candidates_with_sessions,
-        split_error_hint, status_context, status_json_value, summarize_tool_payload_for_markdown,
-        try_resolve_bare_skill_prompt, validate_endpoint_url, validate_no_args,
-        write_mcp_server_fixture, CliAction, CliOutputFormat, CliToolExecutor, EndpointProtocol,
-        GitOperation, GitWorkspaceSummary, InternalPromptProgressEvent,
-        InternalPromptProgressState, LiveCli, LocalHelpTopic, PermissionModeProvenance,
-        PromptHistoryEntry, ProviderSetup, SessionLifecycleKind, SessionLifecycleSummary,
-        SlashCommand, StatusUsage, TmuxPaneSnapshot, DEFAULT_ANTHROPIC_COMPAT_BASE_URL,
-        DEFAULT_ANTHROPIC_COMPAT_MODEL, DEFAULT_MODEL, DEFAULT_OPENAI_COMPAT_BASE_URL,
-        DEFAULT_OPENAI_COMPAT_MODEL, LATEST_SESSION_REFERENCE, STUB_COMMANDS,
+        format_user_visible_api_error, gate_audit_lines, merge_prompt_with_stdin,
+        normalize_permission_mode, parse_args, parse_export_args, parse_git_status_branch,
+        parse_git_status_metadata_for, parse_git_workspace_summary, parse_history_count,
+        permission_policy, persist_provider_setup, print_help_to, push_output_block,
+        render_config_report, render_diff_report, render_diff_report_for, render_help_topic,
+        render_help_topic_json, render_memory_report, render_prompt_history_report,
+        render_repl_help, render_repl_response, render_resume_usage, render_session_list,
+        render_session_markdown, resolve_model_alias, resolve_model_alias_with_config,
+        resolve_repl_model, resolve_session_reference, response_to_events,
+        resume_supported_slash_commands, run_resume_command, setup_default_model, short_tool_id,
+        slash_command_completion_candidates_with_sessions, split_error_hint, status_context,
+        status_json_value, summarize_tool_payload_for_markdown, try_resolve_bare_skill_prompt,
+        validate_endpoint_url, validate_no_args, write_mcp_server_fixture, CliAction,
+        CliOutputFormat, CliToolExecutor, EndpointProtocol, GitOperation, GitWorkspaceSummary,
+        InternalPromptProgressEvent, InternalPromptProgressState, LiveCli, LocalHelpTopic,
+        PermissionModeProvenance, PromptHistoryEntry, ProviderSetup, SessionLifecycleKind,
+        SessionLifecycleSummary, SlashCommand, StatusUsage, TmuxPaneSnapshot,
+        DEFAULT_ANTHROPIC_COMPAT_BASE_URL, DEFAULT_ANTHROPIC_COMPAT_MODEL, DEFAULT_MODEL,
+        DEFAULT_OPENAI_COMPAT_BASE_URL, DEFAULT_OPENAI_COMPAT_MODEL, LATEST_SESSION_REFERENCE,
+        STUB_COMMANDS,
     };
     use api::{ApiError, MessageResponse, OutputContentBlock, Usage};
     use plugins::{
@@ -16489,7 +16607,10 @@ mod tests {
 
         // Text sink: only the BLOCKED decision produces an audit line.
         let lines = gate_audit_lines(&summary);
-        assert_eq!(lines, vec!["gate_check: stop-the-line-spec block (spec)".to_string()]);
+        assert_eq!(
+            lines,
+            vec!["gate_check: stop-the-line-spec block (spec)".to_string()]
+        );
     }
 
     fn registry_with_plugin_tool() -> GlobalToolRegistry {

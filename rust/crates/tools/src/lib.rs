@@ -4142,6 +4142,8 @@ fn execute_skill(input: SkillInput) -> Result<SkillOutput, String> {
     let prompt = std::fs::read_to_string(&skill_path).map_err(|error| error.to_string())?;
     let description = parse_skill_description(&prompt);
 
+    record_skill_invocation(&input.skill);
+
     Ok(SkillOutput {
         skill: input.skill,
         path: skill_path.display().to_string(),
@@ -4149,6 +4151,22 @@ fn execute_skill(input: SkillInput) -> Result<SkillOutput, String> {
         description,
         prompt,
     })
+}
+
+/// Fire-and-forget telemetry: ledger failures must never fail the Skill
+/// tool. Uses the same cwd source as `resolve_skill_path`.
+fn record_skill_invocation(skill: &str) {
+    let Ok(cwd) = std::env::current_dir() else {
+        return;
+    };
+    // Normalize the same way `resolve_skill_path` does (commands::resolve_skill_path)
+    // so invocations like "$plan" or "/handoff" are recorded under the
+    // canonical name and don't fragment ledger entries.
+    let canonical = skill.trim().trim_start_matches('/').trim_start_matches('$');
+    let weaver = runtime::skill_weaver::weaver_dir(&cwd);
+    let mut ledger = runtime::skill_weaver::SkillLedger::load(&weaver);
+    ledger.record(canonical, runtime::skill_weaver::SkillOutcome::Invoked);
+    let _ = ledger.save(&weaver);
 }
 
 fn validate_todos(todos: &[TodoItem]) -> Result<(), String> {
@@ -4216,7 +4234,16 @@ fn skill_lookup_roots() -> Vec<SkillLookupRoot> {
     }
 
     if let Ok(claw_config_home) = std::env::var("CLAW_CONFIG_HOME") {
-        push_prefixed_skill_lookup_roots(&mut roots, std::path::Path::new(&claw_config_home));
+        let claw_config_home = std::path::Path::new(&claw_config_home);
+        push_prefixed_skill_lookup_roots(&mut roots, claw_config_home);
+        // Skill Weaver writes synthesized skills under `skills/learned/<name>/SKILL.md`;
+        // register that nested directory as its own lookup root (same pattern as
+        // `omc-learned` below) so weaved skills resolve by name.
+        push_skill_lookup_root(
+            &mut roots,
+            claw_config_home.join("skills").join("learned"),
+            SkillLookupOrigin::SkillsDir,
+        );
     }
     if let Ok(codex_home) = std::env::var("CODEX_HOME") {
         push_prefixed_skill_lookup_roots(&mut roots, std::path::Path::new(&codex_home));
@@ -4261,6 +4288,16 @@ fn push_project_skill_lookup_roots(roots: &mut Vec<SkillLookupRoot>, cwd: &std::
         push_prefixed_skill_lookup_roots(roots, &ancestor.join(".omc"));
         push_prefixed_skill_lookup_roots(roots, &ancestor.join(".agents"));
         push_prefixed_skill_lookup_roots(roots, &ancestor.join(".claw"));
+        // Skill Weaver writes synthesized skills under
+        // `.claw/skills/learned/<name>/SKILL.md`. Register that nested directory
+        // as its own root, pushed right after the top-level `.claw/skills` root
+        // (via `push_prefixed_skill_lookup_roots` above) so a top-level skill of
+        // the same name always shadows a learned one.
+        push_skill_lookup_root(
+            roots,
+            ancestor.join(".claw").join("skills").join("learned"),
+            SkillLookupOrigin::SkillsDir,
+        );
         push_prefixed_skill_lookup_roots(roots, &ancestor.join(".codex"));
         push_prefixed_skill_lookup_roots(roots, &ancestor.join(".claude"));
     }
@@ -4269,6 +4306,11 @@ fn push_project_skill_lookup_roots(roots: &mut Vec<SkillLookupRoot>, cwd: &std::
 fn push_home_skill_lookup_roots(roots: &mut Vec<SkillLookupRoot>, home: &std::path::Path) {
     push_prefixed_skill_lookup_roots(roots, &home.join(".omc"));
     push_prefixed_skill_lookup_roots(roots, &home.join(".claw"));
+    push_skill_lookup_root(
+        roots,
+        home.join(".claw").join("skills").join("learned"),
+        SkillLookupOrigin::SkillsDir,
+    );
     push_prefixed_skill_lookup_roots(roots, &home.join(".codex"));
     push_prefixed_skill_lookup_roots(roots, &home.join(".claude"));
     push_skill_lookup_root(
@@ -7485,12 +7527,12 @@ mod tests {
     use super::{
         agent_permission_policy, allowed_tools_for_subagent, append_agent_output,
         build_agent_system_prompt, classify_lane_failure, derive_agent_state,
-        execute_agent_with_spawn, execute_send_message_with_spawn, execute_tool,
+        execute_agent_with_spawn, execute_send_message_with_spawn, execute_skill, execute_tool,
         extract_recovery_outcome, final_assistant_text, global_agent_registry,
         global_cron_registry, maybe_commit_provenance, mvp_tool_specs, permission_mode_from_plugin,
         persist_agent_terminal_state, push_output_block, run_task_output, run_task_packet,
         run_task_stop, AgentInput, AgentJob, GlobalToolRegistry, LaneEventName, LaneFailureClass,
-        ProviderRuntimeClient, SendMessageInput, SubagentToolExecutor, TaskIdInput,
+        ProviderRuntimeClient, SendMessageInput, SkillInput, SubagentToolExecutor, TaskIdInput,
     };
     use api::OutputContentBlock;
     use runtime::ProviderFallbackConfig;
@@ -8984,6 +9026,116 @@ mod tests {
             .as_str()
             .expect("path")
             .ends_with(".claw/commands/handoff.md"));
+
+        std::env::set_current_dir(&original_dir).expect("restore cwd");
+        fs::remove_dir_all(root).expect("temp project should clean up");
+    }
+
+    #[test]
+    fn skill_invocation_is_recorded_in_weaver_ledger() {
+        let _guard = env_guard();
+        let root = temp_path("skill-weaver-ledger");
+        // Skills written by the weave pass live under
+        // `.claw/skills/learned/<name>/SKILL.md` (see
+        // `runtime::skill_weaver::LEARNED_DIR_NAME`); resolution of that nested
+        // layout is covered separately by
+        // `skill_resolves_learned_skill_nested_under_dot_claw_skills` below.
+        // This test uses a directly-discoverable skill dir so it exercises
+        // just the ledger-recording behavior.
+        let skill_dir = root.join(".claw").join("skills").join("demo-skill");
+        fs::create_dir_all(&skill_dir).expect("skill dir should exist");
+        fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: demo-skill\ndescription: demo\n---\nbody\n",
+        )
+        .expect("skill file should exist");
+
+        let original_dir = std::env::current_dir().expect("cwd");
+        std::env::set_current_dir(&root).expect("set cwd");
+
+        let output = execute_skill(SkillInput {
+            skill: "demo-skill".to_string(),
+            args: None,
+        })
+        .expect("execute_skill should succeed");
+        assert_eq!(output.skill, "demo-skill");
+
+        let ledger =
+            runtime::skill_weaver::SkillLedger::load(&runtime::skill_weaver::weaver_dir(&root));
+        assert_eq!(
+            ledger
+                .entry("demo-skill")
+                .expect("ledger entry should exist")
+                .invocations,
+            1
+        );
+
+        // Real invocations arrive with `$`/`/` prefixes (see
+        // `skill_resolves_project_local_skills_and_legacy_commands` above).
+        // `resolve_skill_path` normalizes those away before matching, so
+        // the ledger must record under the same stripped, canonical name —
+        // otherwise "$demo-skill" and "demo-skill" fragment into separate
+        // ledger entries and break weave/quarantine/`/skills stats`, which
+        // key on canonical names.
+        let output = execute_skill(SkillInput {
+            skill: "$demo-skill".to_string(),
+            args: None,
+        })
+        .expect("execute_skill should succeed for $-prefixed invocation");
+        assert_eq!(output.skill, "$demo-skill");
+
+        let ledger =
+            runtime::skill_weaver::SkillLedger::load(&runtime::skill_weaver::weaver_dir(&root));
+        assert_eq!(
+            ledger
+                .entry("demo-skill")
+                .expect("ledger entry should exist under the canonical name")
+                .invocations,
+            2,
+            "$-prefixed invocation must accumulate under the same canonical ledger entry"
+        );
+        assert!(
+            ledger.entry("$demo-skill").is_none(),
+            "ledger must not fragment entries by raw, unnormalized skill name"
+        );
+
+        std::env::set_current_dir(&original_dir).expect("restore cwd");
+        fs::remove_dir_all(root).expect("temp project should clean up");
+    }
+
+    // Part B (task 6 review gap): the Skill tool must be able to invoke a
+    // skill that the weaver wrote to `.claw/skills/learned/<name>/SKILL.md`
+    // even though nothing exists directly under `.claw/skills/<name>/`.
+    #[test]
+    fn skill_resolves_learned_skill_nested_under_dot_claw_skills() {
+        let _guard = env_guard();
+        let root = temp_path("skill-learned-resolution");
+        let skill_dir = root
+            .join(".claw")
+            .join("skills")
+            .join("learned")
+            .join("woven-skill");
+        fs::create_dir_all(&skill_dir).expect("learned skill dir should exist");
+        fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: woven-skill\ndescription: Synthesized by the weaver\n---\nbody\n",
+        )
+        .expect("skill file should exist");
+
+        let original_dir = std::env::current_dir().expect("cwd");
+        std::env::set_current_dir(&root).expect("set cwd");
+
+        let output = execute_skill(SkillInput {
+            skill: "woven-skill".to_string(),
+            args: None,
+        })
+        .expect("execute_skill should resolve a skill nested under learned/");
+        assert_eq!(output.skill, "woven-skill");
+        assert!(output.path.ends_with("skills/learned/woven-skill/SKILL.md"));
+        assert_eq!(
+            output.description,
+            Some("Synthesized by the weaver".to_string())
+        );
 
         std::env::set_current_dir(&original_dir).expect("restore cwd");
         fs::remove_dir_all(root).expect("temp project should clean up");

@@ -14,6 +14,7 @@ mod config;
 pub mod config_validate;
 mod conversation;
 pub mod dreamer;
+pub mod skill_weaver;
 mod file_ops;
 pub mod g004_conformance;
 mod git_context;
@@ -75,7 +76,7 @@ pub use config::{
     ConfigSource, McpConfigCollection, McpInvalidServerConfig,
     McpManagedProxyServerConfig, McpOAuthConfig, McpRemoteServerConfig, McpSdkServerConfig,
     McpServerConfig, McpStdioServerConfig, McpTransport, McpWebSocketServerConfig, MemoryConfig,
-    OAuthConfig, ProviderFallbackConfig, ResolvedPermissionMode, RuntimeConfig,
+    OAuthConfig, ProviderFallbackConfig, ResolvedPermissionMode, RuntimeConfig, WeaverConfig,
     RuntimeFeatureConfig, RuntimeHookConfig, RuntimeInvalidHookConfig, RuntimePermissionRuleConfig,
     RuntimePluginConfig, RuntimeProviderConfig, ScopedMcpServerConfig, WorkflowGateMode,
     load_user_model_aliases, load_user_model_aliases_in_home, remove_user_model_alias,
@@ -188,8 +189,9 @@ pub use sandbox::{
     SandboxRequest, SandboxStatus,
 };
 pub use session::{
-    CompactionDetails, ContentBlock, ConversationMessage, MessageRole, Session, SessionCompaction,
-    SessionError, SessionFork, SessionHeartbeat, SessionLiveness, SessionPromptEntry,
+    workspace_sessions_dir, CompactionDetails, ContentBlock, ConversationMessage, MessageRole,
+    Session, SessionCompaction, SessionError, SessionFork, SessionHeartbeat, SessionLiveness,
+    SessionPromptEntry,
 };
 pub use sse::{IncrementalSseParser, SseEvent};
 pub use stale_base::{

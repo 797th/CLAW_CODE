@@ -588,6 +588,55 @@ Use `/skills list` in the interactive REPL or `claw skills --output-format json`
 
 If install succeeds but invocation fails with a provider HTTP error, treat provider setup separately: run `claw doctor` and a one-shot prompt smoke test before reinstalling the skill. See [`docs/local-openai-compatible-providers.md`](./docs/local-openai-compatible-providers.md#local-skills-install-from-disk) for the full checklist.
 
+## Learned skills (Skill Weaver)
+
+Claw Code can distill its own session transcripts into new local skills — a
+SkillWeaver-style propose/synthesize/hone loop modeled on the existing
+memory-consolidation ("dreamer") pass. A **weave** pass reads recent session
+transcripts under `.claw/sessions/`, asks the configured provider to
+identify non-obvious multi-step procedures that succeeded and would
+plausibly recur, and writes each one as a skill under
+`.claw/skills/learned/<name>/SKILL.md`. Every time the `Skill` tool invokes a
+skill, that invocation is recorded in a small outcome ledger
+(`.claw/skills/.weaver/stats.json`); `/skills mark <name> success|failure`
+lets you record an explicit verdict for the last use of a skill. A **hone**
+pass (run automatically after every weave) reads that ledger and quarantines
+learned skills with too many recorded invocations and too low a success
+rate — quarantined skills are parked as `SKILL.md.quarantined` and no longer
+discovered, without touching hand-written skills outside `learned/`.
+
+The five `/skills` verbs that drive the loop:
+
+```text
+/skills weave                  # synthesize new learned skills from recent sessions
+/skills stats                  # show the outcome ledger: invocations, successes, failures, quarantine state
+/skills quarantine <name>      # manually park a learned skill so it's no longer discovered
+/skills restore <name>         # un-park a previously quarantined learned skill
+/skills mark <name> success|failure   # record an explicit outcome for a learned skill
+```
+
+Weaving only ever touches `.claw/skills/learned/` — skills you author by
+hand elsewhere under `.claw/skills/` are never rewritten or quarantined by
+this loop. A weave pass is also gated: it will not run again within 24
+hours of the last pass, and it needs at least 3 sessions touched since then
+before it fires, so a single verbose session doesn't trigger a pass on its
+own.
+
+Weaving is manual (`/skills weave`) by default. To let it run automatically
+after successful turns, set `weaver.autoWeave` to `true` in settings (it
+defaults to `false`); `weaver.maxInputBytes` controls how much recent
+session transcript (in bytes) is fed into a single weave pass, defaulting to
+64 KiB.
+
+```jsonc
+{
+  "weaver": {
+    "autoWeave": true,
+    "maxInputBytes": 65536
+  }
+}
+```
+
 ## Common operational commands
 
 ```bash
