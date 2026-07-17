@@ -4142,6 +4142,8 @@ fn execute_skill(input: SkillInput) -> Result<SkillOutput, String> {
     let prompt = std::fs::read_to_string(&skill_path).map_err(|error| error.to_string())?;
     let description = parse_skill_description(&prompt);
 
+    record_skill_invocation(&input.skill);
+
     Ok(SkillOutput {
         skill: input.skill,
         path: skill_path.display().to_string(),
@@ -4149,6 +4151,18 @@ fn execute_skill(input: SkillInput) -> Result<SkillOutput, String> {
         description,
         prompt,
     })
+}
+
+/// Fire-and-forget telemetry: ledger failures must never fail the Skill
+/// tool. Uses the same cwd source as `resolve_skill_path`.
+fn record_skill_invocation(skill: &str) {
+    let Ok(cwd) = std::env::current_dir() else {
+        return;
+    };
+    let weaver = runtime::skill_weaver::weaver_dir(&cwd);
+    let mut ledger = runtime::skill_weaver::SkillLedger::load(&weaver);
+    ledger.record(skill, runtime::skill_weaver::SkillOutcome::Invoked);
+    let _ = ledger.save(&weaver);
 }
 
 fn validate_todos(todos: &[TodoItem]) -> Result<(), String> {
@@ -7485,12 +7499,12 @@ mod tests {
     use super::{
         agent_permission_policy, allowed_tools_for_subagent, append_agent_output,
         build_agent_system_prompt, classify_lane_failure, derive_agent_state,
-        execute_agent_with_spawn, execute_send_message_with_spawn, execute_tool,
+        execute_agent_with_spawn, execute_send_message_with_spawn, execute_skill, execute_tool,
         extract_recovery_outcome, final_assistant_text, global_agent_registry,
         global_cron_registry, maybe_commit_provenance, mvp_tool_specs, permission_mode_from_plugin,
         persist_agent_terminal_state, push_output_block, run_task_output, run_task_packet,
         run_task_stop, AgentInput, AgentJob, GlobalToolRegistry, LaneEventName, LaneFailureClass,
-        ProviderRuntimeClient, SendMessageInput, SubagentToolExecutor, TaskIdInput,
+        ProviderRuntimeClient, SendMessageInput, SkillInput, SubagentToolExecutor, TaskIdInput,
     };
     use api::OutputContentBlock;
     use runtime::ProviderFallbackConfig;
@@ -8984,6 +8998,51 @@ mod tests {
             .as_str()
             .expect("path")
             .ends_with(".claw/commands/handoff.md"));
+
+        std::env::set_current_dir(&original_dir).expect("restore cwd");
+        fs::remove_dir_all(root).expect("temp project should clean up");
+    }
+
+    #[test]
+    fn skill_invocation_is_recorded_in_weaver_ledger() {
+        let _guard = env_guard();
+        let root = temp_path("skill-weaver-ledger");
+        // NOTE: skills written by the weave pass live under
+        // `.claw/skills/learned/<name>/SKILL.md` (see
+        // `runtime::skill_weaver::LEARNED_DIR_NAME`), but
+        // `commands::discover_skill_roots` only scans `.claw/skills`
+        // one level deep, so a skill nested under `learned/` is not yet
+        // resolvable by name (pre-existing gap, out of scope for this
+        // task — it only touches `execute_skill`'s ledger recording).
+        // Use a directly-discoverable skill dir so this test exercises
+        // the ledger-recording behavior without depending on that gap.
+        let skill_dir = root.join(".claw").join("skills").join("demo-skill");
+        fs::create_dir_all(&skill_dir).expect("skill dir should exist");
+        fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: demo-skill\ndescription: demo\n---\nbody\n",
+        )
+        .expect("skill file should exist");
+
+        let original_dir = std::env::current_dir().expect("cwd");
+        std::env::set_current_dir(&root).expect("set cwd");
+
+        let output = execute_skill(SkillInput {
+            skill: "demo-skill".to_string(),
+            args: None,
+        })
+        .expect("execute_skill should succeed");
+        assert_eq!(output.skill, "demo-skill");
+
+        let ledger =
+            runtime::skill_weaver::SkillLedger::load(&runtime::skill_weaver::weaver_dir(&root));
+        assert_eq!(
+            ledger
+                .entry("demo-skill")
+                .expect("ledger entry should exist")
+                .invocations,
+            1
+        );
 
         std::env::set_current_dir(&original_dir).expect("restore cwd");
         fs::remove_dir_all(root).expect("temp project should clean up");

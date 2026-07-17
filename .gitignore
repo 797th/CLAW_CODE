@@ -21,6 +21,9 @@ archive/
 **/.claw/memory/logs/
 **/.claw/memory/.last-dream
 **/.claw/memory/dream.lock
+# SkillWeaver ledger written by the Skill tool's fire-and-forget invocation
+# recording; tests that don't isolate cwd may create this under a crate dir.
+**/.claw/skills/.weaver/
 rust/.claw/
 .clawhip/
 status-help.txt
