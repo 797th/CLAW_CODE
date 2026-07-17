@@ -10,8 +10,11 @@ path = "src/lib.rs"
 
 [dependencies]
 api = { path = "../api" }
+claw-engine = { path = "../claw-engine" }
 crossterm.workspace = true
 pulldown-cmark.workspace = true
 ratatui.workspace = true
+runtime = { path = "../runtime" }
 serde_json.workspace = true
+tools = { path = "../tools" }
 unicode-width.workspace = true

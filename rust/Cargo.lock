@@ -535,10 +535,13 @@ name = "claw-tui"
 version = "0.1.3"
 dependencies = [
  "api",
+ "claw-engine",
  "crossterm",
  "pulldown-cmark",
  "ratatui",
+ "runtime",
  "serde_json",
+ "tools",
  "unicode-width 0.2.0",
 ]
 

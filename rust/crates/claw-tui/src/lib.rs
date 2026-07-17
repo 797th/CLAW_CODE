@@ -4,6 +4,7 @@ mod markdown;
 mod slash;
 mod terminal;
 mod theme;
+mod turn;
 
 use std::io;
 

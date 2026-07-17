@@ -84,7 +84,7 @@ struct Todo {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum StreamEvent {
+pub(crate) enum StreamEvent {
     ThinkingStart,
     ThinkingDelta(String),
     ThinkingEnd,
@@ -105,6 +105,7 @@ enum StreamEvent {
         output_tokens: u32,
         cost_cents: u32,
     },
+    Failed(String),
 }
 
 #[derive(Debug, Clone)]
@@ -329,6 +330,11 @@ pub struct App {
     status: Status,
     model_list_rx: Option<Receiver<Result<Vec<String>, String>>>,
     model_list_state: ModelListState,
+    /// Conversation history, parked here between turns and lent to the worker
+    /// while one runs.
+    session: Option<runtime::Session>,
+    session_rx_tx: Sender<Option<runtime::Session>>,
+    session_rx: Receiver<Option<runtime::Session>>,
 }
 
 pub fn run() -> io::Result<()> {
@@ -342,6 +348,7 @@ pub fn run() -> io::Result<()> {
 fn run_loop(terminal: &mut crate::terminal::TuiTerminal, app: &mut App) -> io::Result<()> {
     loop {
         app.poll_stream();
+        app.poll_session();
         app.poll_model_list();
         terminal.hide_cursor()?;
         terminal.draw(|frame| app.draw(frame))?;
@@ -357,6 +364,7 @@ fn run_loop(terminal: &mut crate::terminal::TuiTerminal, app: &mut App) -> io::R
 
 impl App {
     fn empty() -> Self {
+        let (session_rx_tx, session_rx) = mpsc::channel();
         Self {
             theme: Theme::default(),
             messages: Vec::new(),
@@ -377,6 +385,9 @@ impl App {
             status: Status::default(),
             model_list_rx: None,
             model_list_state: ModelListState::Idle,
+            session: Some(runtime::Session::new()),
+            session_rx_tx,
+            session_rx,
         }
     }
 
@@ -395,7 +406,62 @@ impl App {
         self.status.output_tokens = 0;
         self.status.cost_cents = 0;
         self.follow_output = true;
-        spawn_mock_stream(prompt.to_string(), tx);
+        self.spawn_turn(prompt.to_string(), tx);
+    }
+
+    /// Run one real turn on a worker thread.
+    ///
+    /// `run_turn` blocks and executes tools, so it cannot share the draw
+    /// thread. The session travels to the worker and back so conversation
+    /// history survives across turns.
+    fn spawn_turn(&mut self, prompt: String, tx: Sender<StreamEvent>) {
+        let request = crate::turn::TurnRequest {
+            prompt,
+            model: self.status.model.clone(),
+            permission_mode: self.permission_mode(),
+            session: self.session.take().unwrap_or_default(),
+            cwd: std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
+        };
+        let session_tx = self.session_rx_tx.clone();
+        thread::spawn(move || {
+            let outcome = crate::turn::run_turn(request, &tx);
+            // Return the session before the terminal event so the draw loop has
+            // history back by the time it stops streaming.
+            let _ = session_tx.send(outcome.session);
+            let event = outcome.error.map_or(
+                StreamEvent::Done {
+                    input_tokens: 0,
+                    output_tokens: 0,
+                    cost_cents: 0,
+                },
+                StreamEvent::Failed,
+            );
+            let _ = tx.send(event);
+        });
+    }
+
+    /// Map the status bar's mode label onto the runtime's permission model.
+    fn permission_mode(&self) -> runtime::PermissionMode {
+        match self.status.mode() {
+            "plan" | "ask" => runtime::PermissionMode::Prompt,
+            "workspace" => runtime::PermissionMode::WorkspaceWrite,
+            "bypass" => runtime::PermissionMode::DangerFullAccess,
+            _ => runtime::PermissionMode::Prompt,
+        }
+    }
+
+    /// Take back conversation history from a finished turn. Without this the
+    /// next turn would start from an empty session.
+    fn poll_session(&mut self) {
+        while let Ok(session) = self.session_rx.try_recv() {
+            if let Some(session) = session {
+                self.session = Some(session);
+            }
+        }
+        // A worker that died without answering must not strand the session.
+        if self.session.is_none() && !self.status.streaming {
+            self.session = Some(runtime::Session::new());
+        }
     }
 
     fn poll_stream(&mut self) {
@@ -464,6 +530,14 @@ impl App {
                 output_tokens,
                 cost_cents,
             } => self.update_usage(input_tokens, output_tokens, cost_cents),
+            StreamEvent::Failed(error) => {
+                self.status.streaming = false;
+                self.active_thinking = None;
+                self.active_assistant = None;
+                self.active_tool = None;
+                self.messages
+                    .push(Message::new(MessageKind::Assistant, "Turn failed", error));
+            }
             StreamEvent::Done {
                 input_tokens,
                 output_tokens,
@@ -1951,80 +2025,14 @@ fn truncate_model(model: &str, limit: usize) -> String {
     chars.into_iter().take(keep).chain(['…']).collect()
 }
 
-fn spawn_mock_stream(prompt: String, tx: Sender<StreamEvent>) {
-    thread::spawn(move || {
-        for (index, event) in mock_events(&prompt).into_iter().enumerate() {
-            let delay = match event {
-                StreamEvent::TextDelta(_) => Duration::from_millis(115),
-                StreamEvent::ThinkingDelta(_) => Duration::from_millis(160),
-                StreamEvent::ToolOutput(_) => Duration::from_millis(260),
-                _ => Duration::from_millis(if index == 0 { 220 } else { 100 }),
-            };
-            thread::sleep(delay);
-            if tx.send(event).is_err() {
-                break;
-            }
-        }
-    });
-}
-
-fn mock_events(prompt: &str) -> Vec<StreamEvent> {
-    vec![
-        StreamEvent::ThinkingStart,
-        StreamEvent::Usage {
-            input_tokens: 512,
-            output_tokens: 0,
-            cost_cents: 1,
-        },
-        StreamEvent::ThinkingDelta(format!(
-            "Trace `{prompt}`. Preserve constraints and exact technical values."
-        )),
-        StreamEvent::ThinkingEnd,
-        StreamEvent::ToolStart {
-            name: "read_file".to_string(),
-            detail: "src/auth/token.rs".to_string(),
-        },
-        StreamEvent::ToolOutput("✓ 48 lines · auth middleware loaded".to_string()),
-        StreamEvent::Usage {
-            input_tokens: 1_284,
-            output_tokens: 12,
-            cost_cents: 1,
-        },
-        StreamEvent::AssistantStart,
-        StreamEvent::TextDelta("**Auth middleware inspected.** ".to_string()),
-        StreamEvent::Usage {
-            input_tokens: 1_284,
-            output_tokens: 32,
-            cost_cents: 2,
-        },
-        StreamEvent::TextDelta(
-            "Expired bearer tokens are rejected before handler dispatch. ".to_string(),
-        ),
-        StreamEvent::Usage {
-            input_tokens: 1_284,
-            output_tokens: 64,
-            cost_cents: 3,
-        },
-        StreamEvent::TextDelta(
-            "Public API unchanged. Next: add regression coverage for exact `401` behavior."
-                .to_string(),
-        ),
-        StreamEvent::Done {
-            input_tokens: 1_284,
-            output_tokens: 96,
-            cost_cents: 4,
-        },
-    ]
-}
-
 #[cfg(test)]
 mod tests {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use ratatui::{backend::TestBackend, Terminal};
 
     use super::{
-        mock_events, model_label, resolve_model_alias_with_config, App, LoginMode, Message,
-        MessageKind, ModelChoiceAction, ModelListState, Overlay, StreamEvent,
+        model_label, resolve_model_alias_with_config, App, LoginMode, Message, MessageKind,
+        ModelChoiceAction, ModelListState, Overlay, StreamEvent,
     };
 
     #[test]
@@ -2076,22 +2084,6 @@ mod tests {
             title.contains("endpoint list failed") && title.contains("connection refused"),
             "a failed lookup must say so rather than look like an empty endpoint: {title}"
         );
-    }
-
-    #[test]
-    fn mock_stream_contains_thinking_tool_and_answer_phases() {
-        let events = mock_events("test request");
-        assert!(matches!(events[0], StreamEvent::ThinkingStart));
-        assert!(events
-            .iter()
-            .any(|event| matches!(event, StreamEvent::ToolStart { .. })));
-        assert!(events
-            .iter()
-            .any(|event| matches!(event, StreamEvent::TextDelta(_))));
-        assert!(events
-            .iter()
-            .any(|event| matches!(event, StreamEvent::Usage { .. })));
-        assert!(matches!(events.last(), Some(StreamEvent::Done { .. })));
     }
 
     #[test]
