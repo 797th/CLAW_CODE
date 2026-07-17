@@ -14377,13 +14377,6 @@ impl runtime::PermissionPrompter for CliPermissionPrompter {
     }
 }
 
-// NOTE: Despite the historical name `AnthropicRuntimeClient`, this struct
-// now holds an `ApiProviderClient` which dispatches to Anthropic, xAI,
-// OpenAI, or DashScope at construction time based on
-// `detect_provider_kind(&model)`. The struct name is kept to avoid
-// churning `BuiltRuntime` and every Deref/DerefMut site that references
-// it. See ROADMAP #29 for the provider-dispatch routing fix.
-
 fn resolve_cli_auth_source() -> Result<AuthSource, Box<dyn std::error::Error>> {
     Ok(resolve_cli_auth_source_for_cwd()?)
 }

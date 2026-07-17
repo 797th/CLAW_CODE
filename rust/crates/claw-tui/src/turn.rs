@@ -244,7 +244,7 @@ pub fn run_turn(request: TurnRequest, tx: &Sender<StreamEvent>) -> TurnOutcome {
 
     let system_prompt = match runtime::load_system_prompt(
         cwd,
-        current_date(),
+        BUILD_DATE,
         std::env::consts::OS,
         "",
         api::model_family_identity_for(&model),
@@ -266,8 +266,15 @@ pub fn run_turn(request: TurnRequest, tx: &Sender<StreamEvent>) -> TurnOutcome {
         Ok(client) => client,
         Err(error) => return TurnOutcome::failed(session, error.to_string()),
     };
-    let executor =
-        EngineToolExecutor::new(None, tool_registry, None, Box::new(claw_engine::NullSink));
+    let executor = EngineToolExecutor::new(
+        None,
+        tool_registry,
+        None,
+        // Must be a ChannelSink, not NullSink: tool results are drawn from
+        // TurnSink::tool_result, so a null sink silently swallows every tool's
+        // output and the transcript stalls after "running".
+        Box::new(ChannelSink::new(tx.clone())),
+    );
 
     let mut runtime = ConversationRuntime::new(session, client, executor, policy, system_prompt);
     let mut prompter = ChannelPrompter { asks };
@@ -290,11 +297,12 @@ impl TurnOutcome {
     }
 }
 
-fn current_date() -> String {
-    // The prompt only needs a stable date string; the frontend has no clock
-    // dependency worth pulling in for this.
-    "unknown".to_string()
-}
+/// Build-stamped date for the system prompt, matching the CLI's DEFAULT_DATE.
+/// Both fall back to "unknown" when BUILD_DATE is not set at compile time.
+const BUILD_DATE: &str = match option_env!("BUILD_DATE") {
+    Some(date) => date,
+    None => "unknown",
+};
 
 #[cfg(test)]
 mod tests {
@@ -365,7 +373,8 @@ mod tests {
 
         let outcome = super::run_turn(
             super::TurnRequest {
-                prompt: "reply with exactly: TUILIVE".to_string(),
+                prompt: std::env::var("CLAW_TUI_LIVE_PROMPT")
+                    .unwrap_or_else(|_| "reply with exactly: TUILIVE".to_string()),
                 model,
                 permission_mode: runtime::PermissionMode::Prompt,
                 session: runtime::Session::new(),
@@ -384,8 +393,10 @@ mod tests {
                 _ => None,
             })
             .collect();
+        let expected =
+            std::env::var("CLAW_TUI_LIVE_EXPECT").unwrap_or_else(|_| "TUILIVE".to_string());
         assert!(
-            text.contains("TUILIVE"),
+            text.contains(&expected),
             "expected streamed assistant text, got {text:?}"
         );
         assert!(
@@ -474,6 +485,39 @@ mod tests {
             decision,
             runtime::PermissionPromptDecision::Deny { .. }
         ));
+    }
+
+    #[test]
+    fn tool_results_reach_the_transcript() {
+        // Regression: the executor was built with NullSink, so tools showed as
+        // "running" and their output never arrived.
+        let (tx, rx) = mpsc::channel();
+        let mut sink = ChannelSink::new(tx);
+
+        sink.tool_call("read_file", r#"{"path":"src/lib.rs"}"#)
+            .expect("send");
+        sink.tool_result("read_file", "48 lines read\nmore detail", false)
+            .expect("send");
+        sink.tool_result("write_file", "permission denied", true)
+            .expect("send");
+        drop(sink);
+
+        let events: Vec<StreamEvent> = rx.iter().collect();
+        let outputs: Vec<&str> = events
+            .iter()
+            .filter_map(|event| match event {
+                StreamEvent::ToolOutput(text) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            outputs,
+            vec!["✓ 48 lines read", "✗ permission denied"],
+            "tool output must be forwarded, collapsed to one line, error-marked"
+        );
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, StreamEvent::ToolStart { name, .. } if name == "read_file")));
     }
 
     #[test]
