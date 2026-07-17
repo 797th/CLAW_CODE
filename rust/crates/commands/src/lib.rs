@@ -57,6 +57,7 @@ pub struct SlashCommandSpec {
 pub enum SkillSlashDispatch {
     Local,
     Invoke(String),
+    Weave,
 }
 
 const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
@@ -257,7 +258,7 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
         name: "skills",
         aliases: &["skill"],
         summary: "List, install, uninstall, or invoke available skills",
-        argument_hint: Some("[list|show <name>|install <path>|uninstall <name>|help|<skill> [args]]"),
+        argument_hint: Some("[list|show <name>|install <path>|uninstall <name>|weave|stats|quarantine <name>|restore <name>|mark <name> success|failure|help|<skill> [args]]"),
         resume_supported: true,
     },
     SlashCommandSpec {
@@ -3074,6 +3075,77 @@ pub fn handle_skills_slash_command(args: Option<&str>, cwd: &Path) -> std::io::R
                 )),
             }
         }
+        Some("stats") => render_skills_stats(cwd).map_err(std::io::Error::other),
+        Some("weave") => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "interactive_only: skills weave requires a live provider session.\nStart `clawcli` and run `/skills weave` inside the REPL.",
+        )),
+        Some("quarantine") => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "missing_argument: skills quarantine requires a skill name.\nUsage: claw skills quarantine <name>",
+        )),
+        Some(args) if args.starts_with("quarantine ") => {
+            let name = args["quarantine ".len()..].trim();
+            if name.is_empty() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "missing_argument: skills quarantine requires a skill name.\nUsage: claw skills quarantine <name>",
+                ));
+            }
+            runtime::skill_weaver::quarantine_skill(cwd, name)
+                .map(|path| {
+                    format!(
+                        "Skills\n  Result           quarantined '{name}'\n  Path             {}",
+                        path.display()
+                    )
+                })
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e.to_string()))
+        }
+        Some("restore") => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "missing_argument: skills restore requires a skill name.\nUsage: claw skills restore <name>",
+        )),
+        Some(args) if args.starts_with("restore ") => {
+            let name = args["restore ".len()..].trim();
+            if name.is_empty() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "missing_argument: skills restore requires a skill name.\nUsage: claw skills restore <name>",
+                ));
+            }
+            runtime::skill_weaver::restore_skill(cwd, name)
+                .map(|path| {
+                    format!(
+                        "Skills\n  Result           restored '{name}'\n  Path             {}",
+                        path.display()
+                    )
+                })
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e.to_string()))
+        }
+        Some("mark") => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "missing_argument: skills mark requires a skill name and verdict.\nUsage: claw skills mark <name> success|failure",
+        )),
+        Some(args) if args.starts_with("mark ") => {
+            let rest = args["mark ".len()..].trim();
+            let mut parts = rest.split_whitespace();
+            let name = parts.next().unwrap_or_default();
+            let verdict = parts.next();
+            if name.is_empty() || verdict.is_none() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "missing_argument: skills mark requires a skill name and verdict.\nUsage: claw skills mark <name> success|failure",
+                ));
+            }
+            if parts.next().is_some() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("unexpected extra arguments after verdict\nUsage: claw skills mark <name> success|failure\nUnexpected extra: '{rest}'"),
+                ));
+            }
+            run_skills_mark(cwd, name, verdict.unwrap_or_default())
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))
+        }
         Some(args) if is_help_arg(args) => Ok(render_skills_usage(None)),
         Some(args) => Ok(render_skills_usage(Some(args))),
     }
@@ -3253,6 +3325,139 @@ pub fn handle_skills_slash_command_json(args: Option<&str>, cwd: &Path) -> std::
                 )),
             }
         }
+        Some("stats") => match render_skills_stats(cwd) {
+            Ok(report) => Ok(json!({
+                "kind": "skills",
+                "action": "stats",
+                "status": "ok",
+                "report": report,
+            })),
+            Err(error) => Ok(json!({
+                "kind": "skills",
+                "action": "stats",
+                "status": "error",
+                "error_kind": "stats_failed",
+                "message": error,
+            })),
+        },
+        Some("weave") => Ok(json!({
+            "kind": "skills",
+            "action": "weave",
+            "status": "error",
+            "error_kind": "interactive_only",
+            "message": "skills weave requires a live provider session",
+            "hint": "Start `clawcli` and run `/skills weave` inside the REPL.",
+        })),
+        Some("quarantine") => Ok(render_skills_missing_argument_json(
+            "quarantine",
+            "skill_name",
+            "Usage: claw skills quarantine <name>",
+        )),
+        Some(args) if args.starts_with("quarantine ") => {
+            let name = args["quarantine ".len()..].trim();
+            if name.is_empty() {
+                return Ok(render_skills_missing_argument_json(
+                    "quarantine",
+                    "skill_name",
+                    "Usage: claw skills quarantine <name>",
+                ));
+            }
+            match runtime::skill_weaver::quarantine_skill(cwd, name) {
+                Ok(path) => Ok(json!({
+                    "kind": "skills",
+                    "action": "quarantine",
+                    "status": "ok",
+                    "skill": name,
+                    "path": path.display().to_string(),
+                })),
+                Err(error) => Ok(json!({
+                    "kind": "skills",
+                    "action": "quarantine",
+                    "status": "error",
+                    "error_kind": "quarantine_failed",
+                    "skill": name,
+                    "message": error.to_string(),
+                })),
+            }
+        }
+        Some("restore") => Ok(render_skills_missing_argument_json(
+            "restore",
+            "skill_name",
+            "Usage: claw skills restore <name>",
+        )),
+        Some(args) if args.starts_with("restore ") => {
+            let name = args["restore ".len()..].trim();
+            if name.is_empty() {
+                return Ok(render_skills_missing_argument_json(
+                    "restore",
+                    "skill_name",
+                    "Usage: claw skills restore <name>",
+                ));
+            }
+            match runtime::skill_weaver::restore_skill(cwd, name) {
+                Ok(path) => Ok(json!({
+                    "kind": "skills",
+                    "action": "restore",
+                    "status": "ok",
+                    "skill": name,
+                    "path": path.display().to_string(),
+                })),
+                Err(error) => Ok(json!({
+                    "kind": "skills",
+                    "action": "restore",
+                    "status": "error",
+                    "error_kind": "restore_failed",
+                    "skill": name,
+                    "message": error.to_string(),
+                })),
+            }
+        }
+        Some("mark") => Ok(render_skills_missing_argument_json(
+            "mark",
+            "skill_name_and_verdict",
+            "Usage: claw skills mark <name> success|failure",
+        )),
+        Some(args) if args.starts_with("mark ") => {
+            let rest = args["mark ".len()..].trim();
+            let mut parts = rest.split_whitespace();
+            let name = parts.next().unwrap_or_default();
+            let verdict = parts.next();
+            if name.is_empty() || verdict.is_none() {
+                return Ok(render_skills_missing_argument_json(
+                    "mark",
+                    "skill_name_and_verdict",
+                    "Usage: claw skills mark <name> success|failure",
+                ));
+            }
+            if parts.next().is_some() {
+                return Ok(json!({
+                    "kind": "skills",
+                    "action": "mark",
+                    "status": "error",
+                    "error_kind": "unexpected_extra_args",
+                    "unexpected": rest,
+                    "hint": "Usage: claw skills mark <name> success|failure",
+                }));
+            }
+            match run_skills_mark(cwd, name, verdict.unwrap_or_default()) {
+                Ok(message) => Ok(json!({
+                    "kind": "skills",
+                    "action": "mark",
+                    "status": "ok",
+                    "skill": name,
+                    "verdict": verdict,
+                    "message": message,
+                })),
+                Err(error) => Ok(json!({
+                    "kind": "skills",
+                    "action": "mark",
+                    "status": "error",
+                    "error_kind": "invalid_argument",
+                    "skill": name,
+                    "message": error,
+                })),
+            }
+        }
         Some(args) if is_help_arg(args) => Ok(render_skills_usage_json(None)),
         Some(args) => Ok(render_skills_usage_json(Some(args))),
     }
@@ -3264,8 +3469,9 @@ pub fn classify_skills_slash_command(args: Option<&str>) -> SkillSlashDispatch {
         None
         | Some(
             "list" | "help" | "-h" | "--help" | "show" | "info" | "describe" | "install"
-            | "uninstall" | "remove" | "delete",
+            | "uninstall" | "remove" | "delete" | "stats" | "quarantine" | "restore" | "mark",
         ) => SkillSlashDispatch::Local,
+        Some("weave") => SkillSlashDispatch::Weave,
         Some(args)
             if args
                 .split_whitespace()
@@ -3277,7 +3483,10 @@ pub fn classify_skills_slash_command(args: Option<&str>) -> SkillSlashDispatch {
             if args.starts_with("install ")
                 || args.starts_with("uninstall ")
                 || args.starts_with("remove ")
-                || args.starts_with("delete ") =>
+                || args.starts_with("delete ")
+                || args.starts_with("quarantine ")
+                || args.starts_with("restore ")
+                || args.starts_with("mark ") =>
         {
             SkillSlashDispatch::Local
         }
@@ -3425,10 +3634,7 @@ fn render_mcp_report_for(
             // as #143 for `status`). Text mode prepends a "Config load error"
             // block before the MCP list; the list falls back to empty.
             match loader.load() {
-                Ok(runtime_config) => Ok(render_mcp_summary_report(
-                    cwd,
-                    runtime_config.mcp(),
-                )),
+                Ok(runtime_config) => Ok(render_mcp_summary_report(cwd, runtime_config.mcp())),
                 Err(err) => {
                     let empty = McpConfigCollection::default();
                     Ok(format!(
@@ -3437,7 +3643,7 @@ fn render_mcp_report_for(
                     ))
                 }
             }
-        },
+        }
         Some(args) if is_help_arg(args) => Ok(render_mcp_usage(None)),
         Some("show") => Ok(render_mcp_missing_argument_text("show")),
         Some(args) if args.split_whitespace().next() == Some("show") => {
@@ -3790,6 +3996,17 @@ fn discover_skill_roots(cwd: &Path) -> Vec<SkillRoot> {
             ancestor.join(".claw").join("skills"),
             SkillOrigin::SkillsDir,
         );
+        // Skill Weaver writes synthesized skills under `.claw/skills/learned/<name>/SKILL.md`.
+        // Register that nested directory as its own root (same pattern as
+        // `~/.claude/skills/omc-learned` below) so weaved skills resolve and list
+        // by name. Pushed immediately after the top-level `.claw/skills` root so
+        // a top-level skill with the same name always shadows a learned one.
+        push_unique_skill_root(
+            &mut roots,
+            DefinitionSource::ProjectClaw,
+            ancestor.join(".claw").join("skills").join("learned"),
+            SkillOrigin::SkillsDir,
+        );
         push_unique_skill_root(
             &mut roots,
             DefinitionSource::ProjectClaw,
@@ -3845,6 +4062,12 @@ fn discover_skill_roots(cwd: &Path) -> Vec<SkillRoot> {
         push_unique_skill_root(
             &mut roots,
             DefinitionSource::UserClawConfigHome,
+            claw_config_home.join("skills").join("learned"),
+            SkillOrigin::SkillsDir,
+        );
+        push_unique_skill_root(
+            &mut roots,
+            DefinitionSource::UserClawConfigHome,
             claw_config_home.join("commands"),
             SkillOrigin::LegacyCommandsDir,
         );
@@ -3872,6 +4095,12 @@ fn discover_skill_roots(cwd: &Path) -> Vec<SkillRoot> {
             &mut roots,
             DefinitionSource::UserClaw,
             home.join(".claw").join("skills"),
+            SkillOrigin::SkillsDir,
+        );
+        push_unique_skill_root(
+            &mut roots,
+            DefinitionSource::UserClaw,
+            home.join(".claw").join("skills").join("learned"),
             SkillOrigin::SkillsDir,
         );
         push_unique_skill_root(
@@ -5172,13 +5401,67 @@ fn render_agents_usage_json(unexpected: Option<&str>) -> Value {
     })
 }
 
+/// Render the skill outcome ledger as a table: name, invocations, successes,
+/// failures, success rate, and whether the skill is currently quarantined.
+pub fn render_skills_stats(cwd: &Path) -> Result<String, String> {
+    let weaver = runtime::skill_weaver::weaver_dir(cwd);
+    let ledger = runtime::skill_weaver::SkillLedger::load(&weaver);
+    if ledger.is_empty() {
+        return Ok("No skill usage recorded yet.".to_string());
+    }
+    let mut out = String::from("Skill                          Inv  Ok  Fail  Rate  Quarantined\n");
+    for (name, record) in ledger.iter() {
+        let judged = record.successes + record.failures;
+        let rate = if judged == 0 {
+            "-".to_string()
+        } else {
+            format!("{:.0}%", 100.0 * record.successes as f64 / judged as f64)
+        };
+        let quarantined = cwd
+            .join(".claw")
+            .join("skills")
+            .join(runtime::skill_weaver::LEARNED_DIR_NAME)
+            .join(name)
+            .join("SKILL.md.quarantined")
+            .is_file();
+        out.push_str(&format!(
+            "{name:<30} {inv:>4} {ok:>3} {fail:>5} {rate:>5}  {quarantined}\n",
+            inv = record.invocations,
+            ok = record.successes,
+            fail = record.failures,
+            quarantined = if quarantined { "yes" } else { "no" },
+        ));
+    }
+    Ok(out)
+}
+
+/// Record an explicit success/failure outcome for `skill` in the ledger.
+/// This is the manual honing signal until automatic attribution exists.
+pub fn run_skills_mark(cwd: &Path, skill: &str, verdict: &str) -> Result<String, String> {
+    let outcome = match verdict {
+        "success" => runtime::skill_weaver::SkillOutcome::Success,
+        "failure" => runtime::skill_weaver::SkillOutcome::Failure,
+        other => {
+            return Err(format!(
+                "invalid_argument: expected success|failure, got '{other}'"
+            ))
+        }
+    };
+    let weaver = runtime::skill_weaver::weaver_dir(cwd);
+    let mut ledger = runtime::skill_weaver::SkillLedger::load(&weaver);
+    ledger.record(skill, outcome);
+    ledger.save(&weaver).map_err(|e| e.to_string())?;
+    Ok(format!("recorded {verdict} for '{skill}'"))
+}
+
 fn render_skills_usage(unexpected: Option<&str>) -> String {
     let mut lines = vec![
         "Skills".to_string(),
-        "  Usage            /skills [list|show <name>|install [--project] <path>|uninstall <name>|help|<skill> [args]]".to_string(),
+        "  Usage            /skills [list|show <name>|install [--project] <path>|uninstall <name>|weave|stats|quarantine <name>|restore <name>|mark <name> success|failure|help|<skill> [args]]".to_string(),
         "  Alias            /skill".to_string(),
         "  Direct CLI       clawcli skills [list|install <path>|help|<skill> [args]]".to_string(),
         "  Lifecycle        install <path>, uninstall <name>".to_string(),
+        "  Weaver           weave (synthesize learned skills), stats (ledger), quarantine <name>, restore <name>, mark <name> success|failure".to_string(),
         "  Invoke           /skills help overview -> $help overview".to_string(),
         "  Install root     $CLAW_CONFIG_HOME/skills or ~/.claw/skills (use --project for .claw/skills)".to_string(),
         "  Sources          .claw/skills, .omc/skills, .agents/skills, .codex/skills, .claude/skills, ~/.claw/skills, ~/.omc/skills, ~/.claude/skills/omc-learned, ~/.codex/skills, ~/.claude/skills, legacy /commands".to_string(),
@@ -5196,10 +5479,11 @@ fn render_skills_usage_json(unexpected: Option<&str>) -> Value {
         "ok": unexpected.is_none(),
         "status": if unexpected.is_some() { "error" } else { "ok" },
         "usage": {
-            "slash_command": "/skills [list|show <name>|install <path>|uninstall <name>|help|<skill> [args]]",
+            "slash_command": "/skills [list|show <name>|install <path>|uninstall <name>|weave|stats|quarantine <name>|restore <name>|mark <name> success|failure|help|<skill> [args]]",
             "aliases": ["/skill"],
             "direct_cli": "clawcli skills [list|install <path>|help|<skill> [args]]",
             "lifecycle": ["install <path>", "uninstall <name>"],
+            "weaver": ["weave", "stats", "quarantine <name>", "restore <name>", "mark <name> success|failure"],
             "invoke": "/skills help overview -> $help overview",
             "install_root": "$CLAW_CONFIG_HOME/skills or ~/.claw/skills",
             "sources": [
@@ -5659,13 +5943,15 @@ pub fn handle_slash_command(
 mod tests {
     use super::{
         classify_skills_slash_command, handle_agents_slash_command_json,
-        handle_plugins_slash_command, handle_skills_slash_command_json, handle_slash_command,
-        load_agents_from_roots, load_skills_from_roots, render_agents_report,
-        render_agents_report_json, render_mcp_report_json_for, render_plugins_report,
-        render_plugins_report_with_failures, render_skills_report, render_slash_command_help,
+        handle_plugins_slash_command, handle_skills_slash_command,
+        handle_skills_slash_command_json, handle_slash_command, load_agents_from_roots,
+        load_skills_from_roots, render_agents_report, render_agents_report_json,
+        render_mcp_report_json_for, render_plugins_report, render_plugins_report_with_failures,
+        render_skills_report, render_skills_stats, render_slash_command_help,
         render_slash_command_help_detail, resolve_skill_path, resume_supported_slash_commands,
-        slash_command_specs, suggest_slash_commands, validate_slash_command_input, AgentCollection,
-        DefinitionSource, SkillOrigin, SkillRoot, SkillSlashDispatch, SlashCommand,
+        run_skills_mark, slash_command_specs, suggest_slash_commands, validate_slash_command_input,
+        AgentCollection, DefinitionSource, SkillOrigin, SkillRoot, SkillSlashDispatch,
+        SlashCommand,
     };
     use plugins::{
         PluginError, PluginKind, PluginLifecycle, PluginLoadFailure, PluginManager,
@@ -6092,10 +6378,8 @@ mod tests {
 
     #[test]
     fn rejects_model_remove_with_too_many_arguments() {
-        assert!(
-            parse_error_message("/model remove mini extra")
-                .contains("Usage: /model remove <alias>")
-        );
+        assert!(parse_error_message("/model remove mini extra")
+            .contains("Usage: /model remove <alias>"));
     }
 
     #[test]
@@ -6329,7 +6613,7 @@ mod tests {
         assert!(help.contains("aliases: /plugins, /marketplace"));
         assert!(help.contains("/agents [list|show <name>|create <name>|help]"));
         assert!(help.contains(
-            "/skills [list|show <name>|install <path>|uninstall <name>|help|<skill> [args]]"
+            "/skills [list|show <name>|install <path>|uninstall <name>|weave|stats|quarantine <name>|restore <name>|mark <name> success|failure|help|<skill> [args]]"
         ));
         assert!(help.contains("aliases: /skill"));
         assert!(help.contains("/login"));
@@ -6929,6 +7213,158 @@ mod tests {
         );
     }
 
+    // Part B (task 6 review gap): skills written to `.claw/skills/learned/<name>/SKILL.md`
+    // by the weaver must be resolvable by name even though nothing lives directly
+    // under `.claw/skills/<name>/SKILL.md`.
+    #[test]
+    fn resolve_skill_path_finds_skill_that_exists_only_under_learned() {
+        let workspace = temp_dir("resolve-learned-only-skill");
+        let learned_root = workspace.join(".claw").join("skills").join("learned");
+        write_skill(
+            &learned_root,
+            "woven-skill",
+            "A skill synthesized by the weaver",
+        );
+
+        let resolved = resolve_skill_path(&workspace, "woven-skill")
+            .expect("learned-only skill should resolve by name");
+        assert_eq!(resolved, learned_root.join("woven-skill").join("SKILL.md"));
+
+        let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn resolve_skill_path_prefers_top_level_over_learned_on_name_collision() {
+        let workspace = temp_dir("resolve-learned-shadowed");
+        let project_skills = workspace.join(".claw").join("skills");
+        let learned_root = project_skills.join("learned");
+        write_skill(&project_skills, "dup-skill", "Top-level version");
+        write_skill(&learned_root, "dup-skill", "Learned version");
+
+        let resolved = resolve_skill_path(&workspace, "dup-skill")
+            .expect("top-level skill should win over learned/ on collision");
+        assert_eq!(resolved, project_skills.join("dup-skill").join("SKILL.md"));
+
+        let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn skills_stats_renders_ledger_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let weaver = runtime::skill_weaver::weaver_dir(dir.path());
+        let mut ledger = runtime::skill_weaver::SkillLedger::load(&weaver);
+        ledger.record("learned-a", runtime::skill_weaver::SkillOutcome::Invoked);
+        ledger.record("learned-a", runtime::skill_weaver::SkillOutcome::Success);
+        ledger.save(&weaver).unwrap();
+
+        let report = render_skills_stats(dir.path()).unwrap();
+        assert!(report.contains("learned-a"));
+        assert!(report.contains('1')); // invocations
+    }
+
+    #[test]
+    fn skills_stats_marks_quarantined_skill() {
+        let dir = tempfile::tempdir().unwrap();
+        let skill_dir = dir
+            .path()
+            .join(".claw")
+            .join("skills")
+            .join("learned")
+            .join("flaky");
+        fs::create_dir_all(&skill_dir).unwrap();
+        fs::write(
+            skill_dir.join("SKILL.md.quarantined"),
+            "---\nname: flaky\ndescription: test\n---\nbody\n",
+        )
+        .unwrap();
+
+        let weaver = runtime::skill_weaver::weaver_dir(dir.path());
+        let mut ledger = runtime::skill_weaver::SkillLedger::load(&weaver);
+        ledger.record("flaky", runtime::skill_weaver::SkillOutcome::Invoked);
+        ledger.save(&weaver).unwrap();
+
+        let report = render_skills_stats(dir.path()).unwrap();
+        assert!(report.contains("flaky"));
+        assert!(report.contains("yes"));
+    }
+
+    #[test]
+    fn skills_mark_records_outcome() {
+        let dir = tempfile::tempdir().unwrap();
+        run_skills_mark(dir.path(), "some-skill", "failure").unwrap();
+        let ledger = runtime::skill_weaver::SkillLedger::load(&runtime::skill_weaver::weaver_dir(
+            dir.path(),
+        ));
+        assert_eq!(ledger.entry("some-skill").unwrap().failures, 1);
+    }
+
+    #[test]
+    fn skills_mark_rejects_invalid_verdict() {
+        let dir = tempfile::tempdir().unwrap();
+        let error = run_skills_mark(dir.path(), "some-skill", "maybe").unwrap_err();
+        assert!(error.starts_with("invalid_argument:"));
+    }
+
+    #[test]
+    fn skills_weave_parses_to_dispatch() {
+        assert_eq!(
+            classify_skills_slash_command(Some("weave")),
+            SkillSlashDispatch::Weave
+        );
+    }
+
+    #[test]
+    fn skills_stats_quarantine_restore_mark_classify_as_local() {
+        for args in [
+            "stats",
+            "quarantine some-skill",
+            "restore some-skill",
+            "mark some-skill success",
+        ] {
+            assert_eq!(
+                classify_skills_slash_command(Some(args)),
+                SkillSlashDispatch::Local,
+                "expected {args:?} to classify as Local"
+            );
+        }
+    }
+
+    #[test]
+    fn handle_skills_quarantine_and_restore_round_trip() {
+        let workspace = temp_dir("skills-quarantine-restore");
+        let learned_root = workspace.join(".claw").join("skills").join("learned");
+        write_skill(&learned_root, "flaky-skill", "flaky");
+
+        let quarantine_report =
+            handle_skills_slash_command(Some("quarantine flaky-skill"), &workspace)
+                .expect("quarantine should succeed");
+        assert!(quarantine_report.contains("quarantined 'flaky-skill'"));
+        assert!(resolve_skill_path(&workspace, "flaky-skill").is_err());
+
+        let restore_report = handle_skills_slash_command(Some("restore flaky-skill"), &workspace)
+            .expect("restore should succeed");
+        assert!(restore_report.contains("restored 'flaky-skill'"));
+        assert!(resolve_skill_path(&workspace, "flaky-skill").is_ok());
+
+        let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn handle_skills_mark_missing_argument_reports_usage() {
+        let workspace = temp_dir("skills-mark-missing-arg");
+        let error = handle_skills_slash_command(Some("mark"), &workspace).unwrap_err();
+        assert!(error.to_string().starts_with("missing_argument:"));
+        let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn handle_skills_weave_reports_interactive_only() {
+        let workspace = temp_dir("skills-weave-interactive-only");
+        let error = handle_skills_slash_command(Some("weave"), &workspace).unwrap_err();
+        assert!(error.to_string().starts_with("interactive_only:"));
+        let _ = fs::remove_dir_all(workspace);
+    }
+
     #[test]
     fn renders_skills_reports_as_json() {
         let workspace = temp_dir("skills-json-workspace");
@@ -7035,7 +7471,7 @@ mod tests {
         let skills_help =
             super::handle_skills_slash_command(Some("--help"), &cwd).expect("skills help");
         assert!(skills_help.contains(
-            "Usage            /skills [list|show <name>|install [--project] <path>|uninstall <name>|help|<skill> [args]]"
+            "Usage            /skills [list|show <name>|install [--project] <path>|uninstall <name>|weave|stats|quarantine <name>|restore <name>|mark <name> success|failure|help|<skill> [args]]"
         ));
         assert!(skills_help.contains("Alias            /skill"));
         assert!(skills_help.contains("Lifecycle        install <path>, uninstall <name>"));
@@ -7054,7 +7490,7 @@ mod tests {
         let skills_install_help = super::handle_skills_slash_command(Some("install --help"), &cwd)
             .expect("nested skills help");
         assert!(skills_install_help.contains(
-            "Usage            /skills [list|show <name>|install [--project] <path>|uninstall <name>|help|<skill> [args]]"
+            "Usage            /skills [list|show <name>|install [--project] <path>|uninstall <name>|weave|stats|quarantine <name>|restore <name>|mark <name> success|failure|help|<skill> [args]]"
         ));
         assert!(skills_install_help.contains("Alias            /skill"));
         assert!(skills_install_help.contains("Unexpected       install"));
@@ -7062,7 +7498,7 @@ mod tests {
         let skills_unknown_help =
             super::handle_skills_slash_command(Some("show --help"), &cwd).expect("skills help");
         assert!(skills_unknown_help.contains(
-            "Usage            /skills [list|show <name>|install [--project] <path>|uninstall <name>|help|<skill> [args]]"
+            "Usage            /skills [list|show <name>|install [--project] <path>|uninstall <name>|weave|stats|quarantine <name>|restore <name>|mark <name> success|failure|help|<skill> [args]]"
         ));
         assert!(skills_unknown_help.contains("Unexpected       show"));
 
