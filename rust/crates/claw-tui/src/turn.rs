@@ -76,9 +76,16 @@ impl TurnSink for ChannelSink {
     }
 
     fn thinking_block(&mut self, thinking: &str, _signature: Option<&str>) -> SinkResult {
+        // Streaming providers announce the block with an empty complete
+        // block before sending its deltas. Do not render that placeholder;
+        // the first real delta opens the single visible reasoning row.
+        if thinking.is_empty() {
+            return Ok(());
+        }
+        self.close_thinking();
+        self.thinking_open = true;
         self.send(StreamEvent::ThinkingStart);
         self.send(StreamEvent::ThinkingDelta(thinking.to_string()));
-        self.send(StreamEvent::ThinkingEnd);
         Ok(())
     }
 
@@ -358,6 +365,73 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn empty_thinking_block_does_not_duplicate_the_following_reasoning_delta() {
+        let (tx, rx) = mpsc::channel();
+        let mut sink = ChannelSink::new(tx);
+
+        sink.thinking_block("", None).expect("send");
+        sink.thinking_delta("actual reasoning").expect("send");
+        sink.text_delta("answer").expect("send");
+        drop(sink);
+
+        let events: Vec<StreamEvent> = rx.iter().collect();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, StreamEvent::ThinkingStart))
+                .count(),
+            1,
+            "an empty stream-start block must not create a duplicate reasoning row"
+        );
+        assert!(matches!(
+            events.as_slice(),
+            [
+                StreamEvent::ThinkingStart,
+                StreamEvent::ThinkingDelta(text),
+                StreamEvent::ThinkingEnd,
+                StreamEvent::AssistantStart,
+                StreamEvent::TextDelta(_),
+            ] if text == "actual reasoning"
+        ));
+    }
+
+    #[test]
+    fn complete_thinking_block_and_deltas_share_one_reasoning_entry() {
+        let (tx, rx) = mpsc::channel();
+        let mut sink = ChannelSink::new(tx);
+
+        sink.thinking_block("initial reasoning", None)
+            .expect("send");
+        sink.thinking_delta(" and more").expect("send");
+        sink.block_stop().expect("send");
+        drop(sink);
+
+        let events: Vec<StreamEvent> = rx.iter().collect();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, StreamEvent::ThinkingStart))
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, StreamEvent::ThinkingEnd))
+                .count(),
+            1
+        );
+        let deltas: Vec<&str> = events
+            .iter()
+            .filter_map(|event| match event {
+                StreamEvent::ThinkingDelta(text) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(deltas, vec!["initial reasoning", " and more"]);
     }
 
     /// Drives a real turn against the configured provider. Opt-in because it

@@ -574,10 +574,15 @@ impl App {
     fn apply_stream_event(&mut self, event: StreamEvent) {
         match event {
             StreamEvent::ThinkingStart => {
-                let index = self.messages.len();
-                self.messages
-                    .push(Message::new(MessageKind::Thinking, "Reasoning", ""));
-                self.active_thinking = Some(index);
+                // Some providers announce an empty reasoning block before
+                // sending its first delta. Reusing the active row keeps that
+                // announcement from becoming a duplicate reasoning entry.
+                if self.active_thinking.is_none() {
+                    let index = self.messages.len();
+                    self.messages
+                        .push(Message::new(MessageKind::Thinking, "Reasoning", ""));
+                    self.active_thinking = Some(index);
+                }
             }
             StreamEvent::ThinkingDelta(delta) => {
                 self.append_to(self.active_thinking, &delta);
@@ -1613,6 +1618,11 @@ impl App {
     fn transcript_lines(&self) -> Vec<Line<'static>> {
         let mut lines = Vec::new();
         for (index, message) in self.messages.iter().enumerate() {
+            // Keep the intentional breathing room between transcript
+            // entries, without leaving an unnecessary blank row at the end.
+            if index > 0 {
+                lines.push(Line::default());
+            }
             let thinking_is_live =
                 message.kind == MessageKind::Thinking && self.active_thinking == Some(index);
             let (icon, color) = match message.kind {
@@ -2349,6 +2359,46 @@ mod tests {
         assert_eq!(app.messages[0].body, "hello world");
         assert!(!app.status.streaming);
         assert_eq!(app.status.output_tokens, 2);
+    }
+
+    #[test]
+    fn transcript_keeps_message_spacing_without_a_trailing_blank_row() {
+        let mut app = App::empty();
+        app.messages
+            .push(Message::new(MessageKind::User, "You", "first"));
+        app.messages
+            .push(Message::new(MessageKind::Assistant, "Claw", "second"));
+
+        let lines = app.transcript_lines();
+
+        assert_eq!(
+            lines.iter().filter(|line| line.spans.is_empty()).count(),
+            1,
+            "there should be one separator between messages"
+        );
+        assert!(
+            lines.last().is_some_and(|line| !line.spans.is_empty()),
+            "the transcript must not end with an extra blank row"
+        );
+    }
+
+    #[test]
+    fn repeated_thinking_start_reuses_one_reasoning_entry() {
+        let mut app = App::empty();
+        app.apply_stream_event(StreamEvent::ThinkingStart);
+        app.apply_stream_event(StreamEvent::ThinkingDelta("first".to_string()));
+        app.apply_stream_event(StreamEvent::ThinkingStart);
+        app.apply_stream_event(StreamEvent::ThinkingDelta(" second".to_string()));
+
+        assert_eq!(
+            app.messages
+                .iter()
+                .filter(|message| message.kind == MessageKind::Thinking)
+                .count(),
+            1,
+            "one live reasoning block must render as one transcript entry"
+        );
+        assert_eq!(app.messages[0].body, "first second");
     }
 
     #[test]
