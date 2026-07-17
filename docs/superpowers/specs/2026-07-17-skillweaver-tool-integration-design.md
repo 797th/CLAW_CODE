@@ -78,8 +78,9 @@ wasteful (payloads eat `max_input_bytes`) and noisy.
   parsing surface.
 - The condensed form is what `synthesize_skills` sends. More sessions fit
   the byte budget and woven skills come out as concrete tool recipes.
-- Unparseable lines degrade to being skipped (never fail the episode); a
-  fully unparseable file falls back to raw content, truncated to budget.
+- A file that fails session parsing falls back to its raw content, subject
+  to the existing budget rule (oversize files are skipped, preserving the
+  I2 regression semantics in `collect_episodes`).
 
 ### Explicitly out of scope
 
