@@ -311,9 +311,8 @@ enum LoginMode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LoginField {
     Provider,
-    ApiKey,
     BaseUrl,
-    Model,
+    ApiKey,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1332,9 +1331,9 @@ impl App {
             action: ModelChoiceAction::Custom,
         });
         items.push(ModelChoice {
-            label: "add alias…".to_string(),
+            label: "add model…".to_string(),
             value: String::new(),
-            detail: "persist a named model".to_string(),
+            detail: "connect an OpenAI/Anthropic endpoint (URL + API key)".to_string(),
             action: ModelChoiceAction::AddAlias,
         });
         items
@@ -1446,9 +1445,16 @@ impl App {
                     action: InputAction::SwitchModel,
                 }));
             }
-            ModelChoiceAction::AddAlias => self.open_model_add_dialog(None),
+            ModelChoiceAction::AddAlias => self.open_model_connection_dialog(),
             ModelChoiceAction::RemoveAlias => self.remove_model_alias(&choice.label),
         }
+    }
+
+    /// Add a model by describing where it lives: an OpenAI- or
+    /// Anthropic-compatible endpoint plus its key. The models themselves are
+    /// then listed from that endpoint, so there is nothing to type by hand.
+    fn open_model_connection_dialog(&mut self) {
+        self.overlay = Some(Overlay::Login(login_dialog(LoginMode::Endpoint)));
     }
 
     fn open_model_add_dialog(&mut self, alias: Option<&str>) {
@@ -1589,15 +1595,12 @@ impl App {
                     return true;
                 };
                 dialog.provider = provider.to_string();
-                dialog.field = LoginField::ApiKey;
-                dialog.value.clear();
-                dialog.cursor = 0;
-            }
-            LoginField::ApiKey => {
-                if !dialog.value.trim().is_empty() {
-                    dialog.api_key = dialog.value.trim().to_string();
-                }
+                // URL before key: the endpoint decides which key is even valid,
+                // so asking for the key first is asking out of order.
                 dialog.field = LoginField::BaseUrl;
+                if dialog.base_url.trim().is_empty() {
+                    dialog.base_url = provider_base_url(&dialog.provider).to_string();
+                }
                 dialog.value.clone_from(&dialog.base_url);
                 dialog.cursor = dialog.value.chars().count();
             }
@@ -1607,19 +1610,17 @@ impl App {
                 } else {
                     dialog.base_url = dialog.value.trim().to_string();
                 }
-                dialog.field = LoginField::Model;
-                dialog.value.clone_from(&dialog.model);
-                dialog.cursor = dialog.value.chars().count();
+                dialog.field = LoginField::ApiKey;
+                dialog.value.clear();
+                dialog.cursor = 0;
             }
-            LoginField::Model => {
-                if dialog.value.trim().is_empty() {
-                    self.show_notice(
-                        "Login",
-                        "Model is required. Enter the provider model name before saving.",
-                    );
-                    return true;
+            LoginField::ApiKey => {
+                if !dialog.value.trim().is_empty() {
+                    dialog.api_key = dialog.value.trim().to_string();
                 }
-                dialog.model = dialog.value.trim().to_string();
+                // The model is not asked for here: /model lists what the
+                // endpoint actually serves once the connection exists. Whatever
+                // model was already configured carries through untouched.
                 let result = match dialog.mode {
                     LoginMode::Endpoint => crate::config::save_login(
                         &dialog.provider,
@@ -2454,6 +2455,11 @@ impl App {
                         dialog.value.clone(),
                         "1 anthropic · 2 xai · 3 openai · 4 dashscope · 5 custom",
                     ),
+                    LoginField::BaseUrl => (
+                        "Base URL",
+                        dialog.value.clone(),
+                        "Enter accepts the URL; edit it for an OpenAI-compatible endpoint",
+                    ),
                     LoginField::ApiKey => (
                         "API key",
                         if dialog.value.is_empty() {
@@ -2465,17 +2471,7 @@ impl App {
                         } else {
                             "•".repeat(dialog.value.chars().count())
                         },
-                        "Enter keeps the saved key when the field is empty",
-                    ),
-                    LoginField::BaseUrl => (
-                        "Base URL",
-                        dialog.value.clone(),
-                        "Enter accepts the URL; edit it for an OpenAI-compatible endpoint",
-                    ),
-                    LoginField::Model => (
-                        "Model",
-                        dialog.value.clone(),
-                        "Enter saves provider settings; a model name is required",
+                        "Enter saves; an empty field keeps the saved key",
                     ),
                 };
                 let value_before = raw_value.chars().take(dialog.cursor).collect::<String>();
@@ -2489,9 +2485,8 @@ impl App {
                                     "connection"
                                 }
                                 LoginField::Provider => "provider",
-                                LoginField::ApiKey => "API key",
                                 LoginField::BaseUrl => "base URL",
-                                LoginField::Model => "model",
+                                LoginField::ApiKey => "API key",
                             }
                         ),
                         self.theme.muted(),
@@ -2859,6 +2854,71 @@ mod tests {
             "truncation should be marked: {padded:?}"
         );
         assert_eq!(UnicodeWidthStr::width(padded.as_str()), width + 2);
+    }
+
+    #[test]
+    fn login_asks_for_the_url_before_the_key_and_never_for_a_model() {
+        let mut app = App::empty();
+        let mut dialog = super::login_dialog(LoginMode::Endpoint);
+        assert_eq!(dialog.field, super::LoginField::Provider);
+
+        // Connection kind -> base URL (not the key).
+        dialog.value = "1".to_string();
+        app.submit_login_field(&mut dialog);
+        assert_eq!(
+            dialog.field,
+            super::LoginField::BaseUrl,
+            "the endpoint must be chosen before the key that authenticates to it"
+        );
+        assert!(
+            !dialog.value.is_empty(),
+            "the URL field should arrive prefilled with a sensible default"
+        );
+
+        // Base URL -> API key, and that is the last step.
+        dialog.value = "https://example.test/v1".to_string();
+        app.submit_login_field(&mut dialog);
+        assert_eq!(dialog.field, super::LoginField::ApiKey);
+        assert_eq!(dialog.base_url, "https://example.test/v1");
+    }
+
+    #[test]
+    fn the_login_flow_has_no_model_step() {
+        // The endpoint lists its own models via /model, so asking the user to
+        // type one during login was a step with nothing behind it.
+        let fields = [
+            super::LoginField::Provider,
+            super::LoginField::BaseUrl,
+            super::LoginField::ApiKey,
+        ];
+        assert_eq!(fields.len(), 3, "provider, URL, key — and nothing else");
+    }
+
+    #[test]
+    fn adding_a_model_asks_for_the_connection_that_serves_it() {
+        let mut app = App::empty();
+        app.status.model = "gpt-4.1".to_string();
+        app.model_list_state = ModelListState::Loaded(vec!["gpt-4.1".to_string()]);
+        app.open_model_picker();
+
+        let Some(Overlay::ModelPicker { items, .. }) = &app.overlay else {
+            panic!("picker should be open");
+        };
+        let add = items
+            .iter()
+            .find(|item| item.action == ModelChoiceAction::AddAlias)
+            .expect("the picker should offer a way to add a model");
+        assert!(
+            add.detail.contains("URL") && add.detail.contains("API key"),
+            "adding a model should advertise the connection it needs: {:?}",
+            add.detail
+        );
+
+        app.open_model_connection_dialog();
+        assert!(
+            matches!(&app.overlay, Some(Overlay::Login(dialog)) if dialog.mode == LoginMode::Endpoint),
+            "adding a model should collect an OpenAI/Anthropic endpoint"
+        );
     }
 
     #[test]
