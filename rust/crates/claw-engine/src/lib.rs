@@ -10,6 +10,7 @@
 pub mod client;
 pub mod error;
 pub mod mcp;
+pub mod setup;
 pub mod sink;
 pub mod tool_executor;
 
@@ -21,6 +22,9 @@ pub use error::format_user_visible_api_error;
 pub use mcp::{
     ListMcpResourcesRequest, McpToolRequest, ReadMcpResourceRequest, RuntimeMcpState,
     ToolSearchRequest,
+};
+pub use setup::{
+    build_runtime_mcp_state, build_runtime_plugin_state, permission_policy, RuntimePluginState,
 };
 pub use sink::{NullSink, SinkResult, TurnSink};
 pub use tool_executor::EngineToolExecutor;

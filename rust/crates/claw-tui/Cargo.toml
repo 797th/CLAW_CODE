@@ -12,6 +12,7 @@ path = "src/lib.rs"
 api = { path = "../api" }
 claw-engine = { path = "../claw-engine" }
 crossterm.workspace = true
+plugins = { path = "../plugins" }
 pulldown-cmark.workspace = true
 ratatui.workspace = true
 runtime = { path = "../runtime" }

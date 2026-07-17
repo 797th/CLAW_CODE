@@ -505,6 +505,7 @@ name = "claw-engine"
 version = "0.1.3"
 dependencies = [
  "api",
+ "plugins",
  "runtime",
  "serde",
  "serde_json",
@@ -537,6 +538,7 @@ dependencies = [
  "api",
  "claw-engine",
  "crossterm",
+ "plugins",
  "pulldown-cmark",
  "ratatui",
  "runtime",
