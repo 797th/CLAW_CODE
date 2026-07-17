@@ -22,14 +22,14 @@ pub struct TerminalGuard {
     restored: bool,
 }
 
-/// Mouse capture routes drags to the app, which stops the terminal's own
-/// click-drag selection — so text in the transcript cannot be highlighted or
-/// copied. Selection is worth more than wheel scrolling (keys cover that), so
-/// capture is opt-in via `CLAW_MOUSE_CAPTURE=1`.
+/// Mouse capture is enabled by default so wheel scrolling reaches the
+/// transcript. Set `CLAW_MOUSE_CAPTURE=0` when terminal-native text selection
+/// is more important than mouse scrolling; PageUp/PageDown and the empty-input
+/// arrow keys still scroll without capture.
 pub fn mouse_capture_requested() -> bool {
     std::env::var("CLAW_MOUSE_CAPTURE")
-        .map(|value| matches!(value.trim(), "1" | "true" | "yes"))
-        .unwrap_or(false)
+        .map(|value| !matches!(value.trim(), "" | "0" | "false" | "no" | "off"))
+        .unwrap_or(true)
 }
 
 impl TerminalGuard {
@@ -127,16 +127,16 @@ mod tests {
     }
 
     #[test]
-    fn mouse_capture_stays_off_unless_explicitly_requested() {
+    fn mouse_capture_is_on_for_scroll_unless_explicitly_disabled() {
         let _guard = env_lock();
 
         std::env::remove_var("CLAW_MOUSE_CAPTURE");
         assert!(
-            !mouse_capture_requested(),
-            "default must leave selection/copy working"
+            mouse_capture_requested(),
+            "scrolling should work by default"
         );
 
-        for value in ["0", "false", "", "no"] {
+        for value in ["0", "false", "", "no", "off"] {
             std::env::set_var("CLAW_MOUSE_CAPTURE", value);
             assert!(
                 !mouse_capture_requested(),
@@ -144,7 +144,7 @@ mod tests {
             );
         }
 
-        for value in ["1", "true", "yes", " 1 "] {
+        for value in ["1", "true", "yes", " 1 ", "anything"] {
             std::env::set_var("CLAW_MOUSE_CAPTURE", value);
             assert!(mouse_capture_requested(), "{value:?} should enable capture");
         }

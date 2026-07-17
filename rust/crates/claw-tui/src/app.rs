@@ -58,7 +58,7 @@ fn resolve_model_alias_with_config(model: &str) -> String {
 /// the beginning, and it never returns more than one line.
 fn reasoning_tail(body: &str) -> Option<String> {
     const TICKER_WIDTH: usize = 72;
-    let flat = body.split_whitespace().collect::<Vec<_>>().join(" ");
+    let flat = one_line(body);
     if flat.is_empty() {
         return None;
     }
@@ -69,6 +69,27 @@ fn reasoning_tail(body: &str) -> Option<String> {
     // Keep the end, marking that earlier reasoning is elided.
     let tail: String = chars[chars.len() - TICKER_WIDTH..].iter().collect();
     Some(format!("…{tail}"))
+}
+
+fn one_line(value: &str) -> String {
+    value.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn truncate_display(value: &str, limit: usize) -> String {
+    let flat = one_line(value);
+    if flat.chars().count() <= limit {
+        return flat;
+    }
+    if limit <= 1 {
+        return "…".chars().take(limit).collect();
+    }
+    let mut result: String = flat.chars().take(limit - 1).collect();
+    result.push('…');
+    result
+}
+
+const fn is_activity(kind: MessageKind) -> bool {
+    matches!(kind, MessageKind::Thinking | MessageKind::Tool)
 }
 
 fn model_label(model: &str) -> String {
@@ -88,11 +109,19 @@ enum MessageKind {
     Command,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ToolState {
+    Running,
+    Succeeded,
+    Failed,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Message {
     kind: MessageKind,
     title: String,
     body: String,
+    tool_state: Option<ToolState>,
 }
 
 impl Message {
@@ -101,6 +130,7 @@ impl Message {
             kind,
             title: title.into(),
             body: body.into(),
+            tool_state: None,
         }
     }
 }
@@ -592,15 +622,14 @@ impl App {
             }
             StreamEvent::ToolStart { name, detail } => {
                 let index = self.messages.len();
-                self.messages.push(Message::new(
-                    MessageKind::Tool,
-                    format!("{name}  ·  running"),
-                    detail,
-                ));
+                let mut message = Message::new(MessageKind::Tool, name, detail);
+                message.tool_state = Some(ToolState::Running);
+                self.messages.push(message);
                 self.active_tool = Some(index);
+                self.active_assistant = None;
             }
             StreamEvent::ToolOutput(output) => {
-                self.append_to(self.active_tool, &format!("\n{output}"));
+                self.append_tool_output(&output);
             }
             StreamEvent::AssistantStart => {
                 let index = self.messages.len();
@@ -659,6 +688,34 @@ impl App {
                 message.body.push_str(text);
             }
         }
+    }
+
+    fn append_tool_output(&mut self, output: &str) {
+        let Some(index) = self.active_tool else {
+            return;
+        };
+        let Some(message) = self.messages.get_mut(index) else {
+            return;
+        };
+
+        let trimmed = output.trim();
+        let (state, result) = if let Some(result) = trimmed.strip_prefix("✗ ") {
+            (ToolState::Failed, result)
+        } else if let Some(result) = trimmed.strip_prefix("✓ ") {
+            (ToolState::Succeeded, result)
+        } else {
+            (ToolState::Succeeded, trimmed)
+        };
+        message.tool_state = Some(state);
+
+        let detail = one_line(&message.body);
+        let result = one_line(result);
+        message.body = match (detail.is_empty(), result.is_empty()) {
+            (true, false) => result,
+            (false, true) => detail,
+            (false, false) => format!("{detail} · {result}"),
+            (true, true) => String::new(),
+        };
     }
 
     fn handle_event(&mut self, event: CrosstermEvent) {
@@ -726,6 +783,10 @@ impl App {
             KeyCode::Right => self.cursor = (self.cursor + 1).min(self.input.chars().count()),
             KeyCode::Home => self.cursor = 0,
             KeyCode::End => self.cursor = self.input.chars().count(),
+            KeyCode::Up if key.modifiers.contains(KeyModifiers::CONTROL) => self.scroll_up(3),
+            KeyCode::Down if key.modifiers.contains(KeyModifiers::CONTROL) => self.scroll_down(3),
+            KeyCode::Up if self.input.is_empty() => self.scroll_up(3),
+            KeyCode::Down if self.input.is_empty() => self.scroll_down(3),
             KeyCode::Up => self.history_previous(),
             KeyCode::Down => self.history_next(),
             KeyCode::PageUp => self.scroll_up(8),
@@ -1577,24 +1638,31 @@ impl App {
     }
 
     fn draw_transcript(&mut self, frame: &mut Frame<'_>, area: Rect) {
-        let lines = self.transcript_lines();
         let block = Block::default()
             .title(Line::from(vec![
                 Span::styled(" CLAW_CODE ", self.theme.title()),
                 Span::styled("/", self.theme.muted()),
                 Span::styled(" transcript ", self.theme.muted()),
+                Span::styled(
+                    if self.follow_output {
+                        "· live "
+                    } else {
+                        "· paused · PgUp/PgDn "
+                    },
+                    self.theme.muted(),
+                ),
             ]))
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
             .border_style(self.theme.border())
             .style(self.theme.base());
         let inner = block.inner(area);
+        let lines = self.transcript_lines_for_width(inner.width);
         let mut paragraph = Paragraph::new(Text::from(lines))
             .block(block)
             .wrap(Wrap { trim: false });
         let max_scroll = paragraph
             .line_count(inner.width)
-            .saturating_sub(2)
             .saturating_sub(inner.height as usize)
             .min(u16::MAX as usize) as u16;
         if self.follow_output {
@@ -1615,71 +1683,144 @@ impl App {
         SPINNER_FRAMES[step % SPINNER_FRAMES.len()]
     }
 
-    fn transcript_lines(&self) -> Vec<Line<'static>> {
+    fn transcript_lines_for_width(&self, width: u16) -> Vec<Line<'static>> {
         let mut lines = Vec::new();
-        for (index, message) in self.messages.iter().enumerate() {
-            // Keep the intentional breathing room between transcript
-            // entries, without leaving an unnecessary blank row at the end.
-            if index > 0 {
-                lines.push(Line::default());
-            }
-            let thinking_is_live =
-                message.kind == MessageKind::Thinking && self.active_thinking == Some(index);
-            let (icon, color) = match message.kind {
-                MessageKind::User => ('›', self.theme.accent),
-                MessageKind::Assistant => ('◆', self.theme.heading),
-                // Spin only while this block is still receiving reasoning.
-                MessageKind::Thinking if thinking_is_live => (self.spinner(), self.theme.emphasis),
-                MessageKind::Thinking => ('◌', self.theme.emphasis),
-                MessageKind::Tool => ('⚙', self.theme.strong),
-                MessageKind::Command => ('⌘', self.theme.link),
-            };
-
-            // Reasoning stays hidden: show the title plus a single trailing
-            // line so there is visible movement without dumping the model's
-            // internal monologue into the transcript.
-            if message.kind == MessageKind::Thinking {
-                let mut spans = vec![
-                    Span::styled(format!(" {icon} "), Style::default().fg(color)),
-                    Span::styled(
-                        message.title.clone(),
-                        Style::default().fg(color).add_modifier(Modifier::BOLD),
-                    ),
-                ];
-                if let Some(tail) = reasoning_tail(&message.body) {
-                    spans.push(Span::styled(
-                        format!("  {tail}"),
-                        self.theme.muted().add_modifier(Modifier::ITALIC),
-                    ));
+        let mut index = 0;
+        while index < self.messages.len() {
+            if is_activity(self.messages[index].kind) {
+                let end = self.messages[index..]
+                    .iter()
+                    .position(|message| !is_activity(message.kind))
+                    .map_or(self.messages.len(), |offset| index + offset);
+                if !lines.is_empty() {
+                    lines.push(Line::default());
                 }
-                lines.push(Line::from(spans));
+                self.push_activity_lines(&mut lines, &self.messages[index..end], width);
+                index = end;
                 continue;
             }
 
+            if !lines.is_empty() {
+                lines.push(Line::default());
+            }
+            self.push_message_lines(&mut lines, &self.messages[index], width);
+            index += 1;
+        }
+
+        if self.status.streaming
+            && !self
+                .messages
+                .iter()
+                .any(|message| is_activity(message.kind))
+        {
+            if !lines.is_empty() {
+                lines.push(Line::default());
+            }
             lines.push(Line::from(vec![
-                Span::styled(format!(" {icon} "), Style::default().fg(color)),
                 Span::styled(
-                    message.title.clone(),
-                    Style::default().fg(color).add_modifier(Modifier::BOLD),
+                    format!(" {} ", self.spinner()),
+                    Style::default().fg(self.theme.accent),
                 ),
+                Span::styled(
+                    "Working",
+                    Style::default()
+                        .fg(self.theme.accent)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled("  waiting for model output…", self.theme.muted()),
             ]));
-            for line in render_markdown(&message.body, self.theme) {
+        }
+        lines
+    }
+
+    fn push_message_lines(&self, lines: &mut Vec<Line<'static>>, message: &Message, _width: u16) {
+        let (icon, color) = match message.kind {
+            MessageKind::User => ('›', self.theme.accent),
+            MessageKind::Assistant => ('◆', self.theme.heading),
+            MessageKind::Command => ('⌘', self.theme.link),
+            MessageKind::Thinking | MessageKind::Tool => return,
+        };
+        lines.push(Line::from(vec![
+            Span::styled(format!(" {icon} "), Style::default().fg(color)),
+            Span::styled(
+                message.title.clone(),
+                Style::default().fg(color).add_modifier(Modifier::BOLD),
+            ),
+        ]));
+        for line in render_markdown(&message.body, self.theme) {
+            if line.spans.is_empty() {
+                lines.push(Line::default());
+            } else {
                 let mut spans = vec![Span::raw("   ")];
                 spans.extend(line.spans);
                 lines.push(Line::from(spans));
             }
         }
-        if self.status.streaming {
-            lines.push(Line::from(Span::styled(
-                format!(
-                    " {} thinking  {}s",
-                    self.spinner(),
-                    self.status.started_at.elapsed().as_secs()
+    }
+
+    fn push_activity_lines(
+        &self,
+        lines: &mut Vec<Line<'static>>,
+        messages: &[Message],
+        width: u16,
+    ) {
+        let live = self.status.streaming;
+        let icon = if live { self.spinner() } else { '✓' };
+        let label = if live { "Working" } else { "Completed work" };
+        lines.push(Line::from(vec![
+            Span::styled(format!(" {icon} "), Style::default().fg(self.theme.accent)),
+            Span::styled(
+                label,
+                Style::default()
+                    .fg(self.theme.accent)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!("  {}s", self.status.started_at.elapsed().as_secs()),
+                self.theme.muted(),
+            ),
+        ]));
+
+        if let Some(reasoning) = messages
+            .iter()
+            .rev()
+            .find(|message| message.kind == MessageKind::Thinking)
+            .and_then(|message| reasoning_tail(&message.body))
+        {
+            lines.push(Line::from(vec![
+                Span::styled("   ↳ ", self.theme.muted()),
+                Span::styled(
+                    truncate_display(&reasoning, width.saturating_sub(8) as usize),
+                    self.theme.muted().add_modifier(Modifier::ITALIC),
                 ),
-                Style::default().fg(self.theme.accent),
-            )));
+            ]));
         }
-        lines
+
+        let tool_width = width.saturating_sub(8) as usize;
+        for message in messages
+            .iter()
+            .filter(|message| message.kind == MessageKind::Tool)
+        {
+            let (icon, color) = match message.tool_state.unwrap_or(ToolState::Running) {
+                ToolState::Running => ('⚙', self.theme.accent),
+                ToolState::Succeeded => ('✓', self.theme.success),
+                ToolState::Failed => ('✗', self.theme.error),
+            };
+            let title = truncate_display(&one_line(&message.title), 24);
+            let detail = truncate_display(&one_line(&message.body), tool_width.saturating_sub(28));
+            let mut spans = vec![
+                Span::styled("   └─ ", self.theme.muted()),
+                Span::styled(format!("{icon} "), Style::default().fg(color)),
+                Span::styled(
+                    title,
+                    Style::default().fg(color).add_modifier(Modifier::BOLD),
+                ),
+            ];
+            if !detail.is_empty() {
+                spans.push(Span::styled(format!("  {detail}"), self.theme.muted()));
+            }
+            lines.push(Line::from(spans));
+        }
     }
 
     fn draw_input(&self, frame: &mut Frame<'_>, area: Rect) {
@@ -1809,18 +1950,18 @@ impl App {
         let model_limit = if narrow { 24 } else { 32 };
         let model = truncate_model(&model_label(&self.status.model), model_limit);
         let mode = if narrow {
-            format!("  {}", self.status.mode())
+            self.status.mode().to_string()
         } else {
-            format!("  mode:{}", self.status.mode())
+            format!("mode:{}", self.status.mode())
         };
         let branch = if narrow {
-            format!("  {}", self.status.branch)
+            self.status.branch.to_string()
         } else {
-            format!("  branch:{}", self.status.branch)
+            format!("branch:{}", self.status.branch)
         };
         let usage = if narrow {
             format!(
-                "  {}i/{}o ${}.{:02}",
+                "{}i/{}o ${}.{:02}",
                 self.status.input_tokens,
                 self.status.output_tokens,
                 self.status.cost_cents / 100,
@@ -1828,7 +1969,7 @@ impl App {
             )
         } else {
             format!(
-                "  in:{} out:{}  ${}.{:02}",
+                "in:{} out:{}  ${}.{:02}",
                 self.status.input_tokens,
                 self.status.output_tokens,
                 self.status.cost_cents / 100,
@@ -1836,11 +1977,14 @@ impl App {
             )
         };
         let line = Line::from(vec![
-            Span::styled("  ", self.theme.muted()),
             state,
-            Span::styled(format!("  {model}"), Style::default().fg(self.theme.text)),
+            Span::styled("  ·  ", self.theme.muted()),
+            Span::styled(model, Style::default().fg(self.theme.text)),
+            Span::styled("  ·  ", self.theme.muted()),
             Span::styled(mode, self.status.mode_style(self.theme)),
+            Span::styled("  ·  ", self.theme.muted()),
             Span::styled(branch, self.theme.muted()),
+            Span::styled("  ·  ", self.theme.muted()),
             Span::styled(usage, self.theme.muted()),
         ]);
         let mut line = line;
@@ -2080,10 +2224,39 @@ impl App {
     }
 
     fn draw_sidebar(&self, frame: &mut Frame<'_>, area: Rect) {
-        let todos = self
-            .todos
-            .iter()
-            .map(|todo| {
+        let mut rows = vec![
+            ListItem::new(Line::from(Span::styled(" Session", self.theme.title()))),
+            ListItem::new(Line::from(vec![
+                Span::styled(" Model  ", self.theme.muted()),
+                Span::styled(
+                    truncate_model(&model_label(&self.status.model), 24),
+                    self.theme.text,
+                ),
+            ])),
+            ListItem::new(Line::from(vec![
+                Span::styled(" Mode   ", self.theme.muted()),
+                Span::styled(self.status.mode(), self.status.mode_style(self.theme)),
+            ])),
+            ListItem::new(Line::from(vec![
+                Span::styled(" Usage  ", self.theme.muted()),
+                Span::styled(
+                    format!(
+                        "{}i / {}o",
+                        self.status.input_tokens, self.status.output_tokens
+                    ),
+                    self.theme.text,
+                ),
+            ])),
+            ListItem::new(Line::default()),
+            ListItem::new(Line::from(Span::styled(" Tasks", self.theme.title()))),
+        ];
+        if self.todos.is_empty() {
+            rows.push(ListItem::new(Line::from(Span::styled(
+                " No active tasks",
+                self.theme.muted(),
+            ))));
+        } else {
+            rows.extend(self.todos.iter().map(|todo| {
                 let marker = if todo.done { "✓" } else { "·" };
                 let color = if todo.done {
                     self.theme.success
@@ -2094,15 +2267,15 @@ impl App {
                     Span::styled(format!(" {marker} "), Style::default().fg(color)),
                     Span::styled(todo.label.clone(), Style::default().fg(color)),
                 ]))
-            })
-            .collect::<Vec<_>>();
+            }));
+        }
         let block = Block::default()
             .title(Span::styled(" Context ", self.theme.title()))
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
             .border_style(self.theme.border())
             .style(self.theme.base());
-        let list = List::new(todos).block(block).style(self.theme.base());
+        let list = List::new(rows).block(block).style(self.theme.base());
         frame.render_widget(list, area);
     }
 }
@@ -2197,7 +2370,7 @@ mod tests {
 
     use super::{
         model_label, reasoning_tail, resolve_model_alias_with_config, App, LoginMode, Message,
-        MessageKind, ModelChoiceAction, ModelListState, Overlay, StreamEvent,
+        MessageKind, ModelChoiceAction, ModelListState, Overlay, StreamEvent, ToolState,
     };
 
     #[test]
@@ -2246,7 +2419,7 @@ mod tests {
         app.apply_stream_event(StreamEvent::TextDelta("visible answer".to_string()));
 
         let rendered: String = app
-            .transcript_lines()
+            .transcript_lines_for_width(80)
             .iter()
             .flat_map(|line| line.spans.iter().map(|span| span.content.to_string()))
             .collect();
@@ -2369,7 +2542,7 @@ mod tests {
         app.messages
             .push(Message::new(MessageKind::Assistant, "Claw", "second"));
 
-        let lines = app.transcript_lines();
+        let lines = app.transcript_lines_for_width(80);
 
         assert_eq!(
             lines.iter().filter(|line| line.spans.is_empty()).count(),
@@ -2399,6 +2572,80 @@ mod tests {
             "one live reasoning block must render as one transcript entry"
         );
         assert_eq!(app.messages[0].body, "first second");
+    }
+
+    #[test]
+    fn reasoning_and_tools_render_as_one_compact_working_group() {
+        let mut app = App::empty();
+        app.status.streaming = true;
+        app.apply_stream_event(StreamEvent::ThinkingStart);
+        app.apply_stream_event(StreamEvent::ThinkingDelta(
+            "deciding what to inspect".to_string(),
+        ));
+        app.apply_stream_event(StreamEvent::ToolStart {
+            name: "read_file".to_string(),
+            detail: "src/main.rs".to_string(),
+        });
+        app.apply_stream_event(StreamEvent::ToolOutput(
+            "✓ 48 lines read\nsecond noisy line".to_string(),
+        ));
+        app.apply_stream_event(StreamEvent::ThinkingStart);
+        app.apply_stream_event(StreamEvent::ThinkingDelta(
+            "checking the result".to_string(),
+        ));
+
+        let lines = app.transcript_lines_for_width(80);
+        let rendered = lines.iter().map(ToString::to_string).collect::<Vec<_>>();
+
+        assert_eq!(
+            rendered
+                .iter()
+                .filter(|line| line.contains("Working"))
+                .count(),
+            1
+        );
+        assert_eq!(
+            rendered
+                .iter()
+                .filter(|line| line.contains("read_file"))
+                .count(),
+            1,
+            "the tool should occupy one compact row: {rendered:?}"
+        );
+        assert!(rendered
+            .iter()
+            .any(|line| line.contains("checking the result")));
+        assert!(rendered.iter().any(|line| line.contains("48 lines read")));
+    }
+
+    #[test]
+    fn tool_output_is_kept_on_one_normalized_line() {
+        let mut app = App::empty();
+        app.apply_stream_event(StreamEvent::ToolStart {
+            name: "shell".to_string(),
+            detail: "cargo test".to_string(),
+        });
+        app.apply_stream_event(StreamEvent::ToolOutput(
+            "✓ first line\nsecond line\nthird line".to_string(),
+        ));
+
+        assert_eq!(
+            app.messages[0].body,
+            "cargo test · first line second line third line"
+        );
+        assert_eq!(app.messages[0].tool_state, Some(ToolState::Succeeded));
+    }
+
+    #[test]
+    fn empty_input_arrows_scroll_transcript_instead_of_history() {
+        let mut app = App::empty();
+        app.scroll = 5;
+        app.history.push("previous prompt".to_string());
+
+        app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+
+        assert_eq!(app.scroll, 2);
+        assert_eq!(app.history_index, None);
     }
 
     #[test]
