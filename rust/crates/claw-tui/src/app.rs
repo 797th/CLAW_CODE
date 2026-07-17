@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::io;
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::thread;
@@ -124,6 +125,12 @@ struct Message {
     tool_state: Option<ToolState>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct QueuedPrompt {
+    prompt: String,
+    message_index: usize,
+}
+
 impl Message {
     fn new(kind: MessageKind, title: impl Into<String>, body: impl Into<String>) -> Self {
         Self {
@@ -197,6 +204,10 @@ impl Default for Status {
 }
 
 impl Status {
+    fn total_tokens(&self) -> u32 {
+        self.input_tokens.saturating_add(self.output_tokens)
+    }
+
     fn mode(&self) -> &'static str {
         PERMISSION_MODES[self.mode_index % PERMISSION_MODES.len()]
     }
@@ -406,6 +417,7 @@ pub struct App {
     permission_rx: Receiver<crate::turn::PermissionAsk>,
     /// The approval on screen; holds the channel the worker is blocked on.
     pending_permission: Option<crate::turn::PermissionAsk>,
+    queued_prompts: VecDeque<QueuedPrompt>,
 }
 
 impl Drop for App {
@@ -475,6 +487,7 @@ impl App {
             permission_tx,
             permission_rx,
             pending_permission: None,
+            queued_prompts: VecDeque::new(),
         }
     }
 
@@ -514,10 +527,42 @@ impl App {
         self.active_tool = None;
         self.status.streaming = true;
         self.status.started_at = Instant::now();
-        self.status.input_tokens = 0;
-        self.status.output_tokens = 0;
-        self.status.cost_cents = 0;
         self.follow_output = true;
+    }
+
+    /// Start the next prompt after the worker reports that the current turn is
+    /// complete. Keeping this transition here prevents a second turn from
+    /// resetting the first turn's live activity or usage counters.
+    fn start_next_queued_prompt(&mut self) {
+        if !self.model_available() {
+            return;
+        }
+        let Some(queued) = self.queued_prompts.pop_front() else {
+            return;
+        };
+        if let Some(message) = self.messages.get_mut(queued.message_index) {
+            message.title = "You".to_string();
+        }
+        self.start_stream(&queued.prompt);
+    }
+
+    fn queue_prompt(&mut self, prompt: String, message_index: usize) {
+        if let Some(message) = self.messages.get_mut(message_index) {
+            message.title = "You  [Queued]".to_string();
+        }
+        self.queued_prompts.push_back(QueuedPrompt {
+            prompt,
+            message_index,
+        });
+        self.follow_output = true;
+    }
+
+    fn start_or_queue_prompt(&mut self, prompt: String, message_index: usize) {
+        if self.status.streaming {
+            self.queue_prompt(prompt, message_index);
+        } else {
+            self.start_stream(&prompt);
+        }
     }
 
     /// Map the status bar's mode label onto the runtime's permission model.
@@ -610,6 +655,8 @@ impl App {
                 // sending its first delta. Reusing the active row keeps that
                 // announcement from becoming a duplicate reasoning entry.
                 if self.active_thinking.is_none() {
+                    self.active_tool = None;
+                    self.active_assistant = None;
                     let index = self.messages.len();
                     self.messages
                         .push(Message::new(MessageKind::Thinking, "Reasoning", ""));
@@ -638,6 +685,11 @@ impl App {
                 self.messages
                     .push(Message::new(MessageKind::Assistant, "Claw", ""));
                 self.active_assistant = Some(index);
+                // The tool/reasoning group is finished once the visible answer
+                // begins. Clearing this pointer is what lets the old group
+                // settle while the answer continues streaming.
+                self.active_thinking = None;
+                self.active_tool = None;
             }
             StreamEvent::TextDelta(delta) => {
                 if self.active_assistant.is_none() {
@@ -645,6 +697,8 @@ impl App {
                     self.messages
                         .push(Message::new(MessageKind::Assistant, "Claw", ""));
                     self.active_assistant = Some(index);
+                    self.active_thinking = None;
+                    self.active_tool = None;
                 }
                 self.append_to(self.active_assistant, &delta);
             }
@@ -652,7 +706,7 @@ impl App {
                 input_tokens,
                 output_tokens,
                 cost_cents,
-            } => self.update_usage(input_tokens, output_tokens, cost_cents),
+            } => self.add_usage(input_tokens, output_tokens, cost_cents),
             StreamEvent::Failed(error) => {
                 self.status.streaming = false;
                 self.active_thinking = None;
@@ -660,6 +714,7 @@ impl App {
                 self.active_tool = None;
                 self.messages
                     .push(Message::new(MessageKind::Assistant, "Turn failed", error));
+                self.start_next_queued_prompt();
             }
             StreamEvent::Notice(text) => {
                 self.messages
@@ -671,21 +726,35 @@ impl App {
                 cost_cents,
             } => {
                 self.status.streaming = false;
-                self.update_usage(input_tokens, output_tokens, cost_cents);
+                self.finalize_usage(input_tokens, output_tokens, cost_cents);
                 self.active_thinking = None;
                 self.active_assistant = None;
                 self.active_tool = None;
                 for todo in self.todos.iter_mut().take(2) {
                     todo.done = true;
                 }
+                self.start_next_queued_prompt();
             }
         }
     }
 
-    fn update_usage(&mut self, input_tokens: u32, output_tokens: u32, cost_cents: u32) {
-        self.status.input_tokens = input_tokens;
-        self.status.output_tokens = output_tokens;
-        self.status.cost_cents = cost_cents;
+    /// Provider usage events are deltas from each model request in a tool
+    /// chain. Add them so the footer reflects the whole session while the
+    /// turn is still running.
+    fn add_usage(&mut self, input_tokens: u32, output_tokens: u32, cost_cents: u32) {
+        self.status.input_tokens = self.status.input_tokens.saturating_add(input_tokens);
+        self.status.output_tokens = self.status.output_tokens.saturating_add(output_tokens);
+        self.status.cost_cents = self.status.cost_cents.saturating_add(cost_cents);
+    }
+
+    /// The worker's final event carries the runtime's cumulative total. Never
+    /// let an empty final event erase live usage, and never make the displayed
+    /// total go backwards if provider and worker events arrive in different
+    /// orders.
+    fn finalize_usage(&mut self, input_tokens: u32, output_tokens: u32, cost_cents: u32) {
+        self.status.input_tokens = self.status.input_tokens.max(input_tokens);
+        self.status.output_tokens = self.status.output_tokens.max(output_tokens);
+        self.status.cost_cents = self.status.cost_cents.max(cost_cents);
     }
 
     fn append_to(&mut self, index: Option<usize>, text: &str) {
@@ -935,7 +1004,7 @@ impl App {
 
     fn submit_input(&mut self) {
         let prompt = self.input.trim().to_string();
-        if prompt.is_empty() || self.status.streaming {
+        if prompt.is_empty() {
             return;
         }
         let parsed = crate::slash::parse(&prompt);
@@ -958,6 +1027,7 @@ impl App {
         self.command_menu_selected = 0;
         self.input.clear();
         self.cursor = 0;
+        let message_index = self.messages.len();
         self.messages
             .push(Message::new(MessageKind::User, "You", prompt.clone()));
         if let Some(parsed) = parsed {
@@ -967,7 +1037,7 @@ impl App {
             }
             return;
         }
-        self.start_stream(&prompt);
+        self.start_or_queue_prompt(prompt, message_index);
     }
 
     fn handle_slash_command(&mut self, command: crate::slash::SlashCommand) {
@@ -987,8 +1057,16 @@ impl App {
             "logout" => self.logout(),
             "permissions" => self.handle_permissions_command(&args),
             "clear" => {
-                self.messages.clear();
-                self.add_command_message("/clear", "Session transcript cleared.");
+                if self.status.streaming {
+                    self.add_command_message(
+                        "/clear",
+                        "The current turn is still working. Clear becomes available when it finishes.",
+                    );
+                } else {
+                    self.messages.clear();
+                    self.queued_prompts.clear();
+                    self.add_command_message("/clear", "Session transcript cleared.");
+                }
             }
             "exit" | "quit" => self.should_quit = true,
             _ if crate::slash::is_model_turn(&name)
@@ -999,7 +1077,8 @@ impl App {
                 } else {
                     format!("/{name} {args}")
                 };
-                self.start_stream(&prompt);
+                let message_index = self.messages.len().saturating_sub(1);
+                self.start_or_queue_prompt(prompt, message_index);
             }
             _ => self.add_command_message(
                 format!("/{name}"),
@@ -1037,13 +1116,12 @@ impl App {
         self.add_command_message(
             "/status",
             format!(
-                "Model: {}\nMode: {}\nBranch: {}\nConnection: {}\nTokens: {} in / {} out\nCost: \x24{}.{:02}",
+                "Model: {}\nMode: {}\nBranch: {}\nConnection: {}\nTotal tokens: {}\nCost: \x24{}.{:02}",
                 model_label(&self.status.model),
                 self.status.mode(),
                 self.status.branch,
                 connection,
-                self.status.input_tokens,
-                self.status.output_tokens,
+                self.status.total_tokens(),
                 self.status.cost_cents / 100,
                 self.status.cost_cents % 100,
             ),
@@ -1054,9 +1132,8 @@ impl App {
         self.add_command_message(
             "/cost",
             format!(
-                "Input tokens: {}\nOutput tokens: {}\nEstimated cost: \x24{}.{:02}",
-                self.status.input_tokens,
-                self.status.output_tokens,
+                "Total tokens: {}\nEstimated cost: \x24{}.{:02}",
+                self.status.total_tokens(),
                 self.status.cost_cents / 100,
                 self.status.cost_cents % 100,
             ),
@@ -1502,6 +1579,9 @@ impl App {
                                 dialog.provider, self.status.model, path.display()
                             ),
                         );
+                        if !self.status.streaming {
+                            self.start_next_queued_prompt();
+                        }
                     }
                     Err(error) => self.show_notice("Login", error.to_string()),
                 }
@@ -1622,6 +1702,7 @@ impl App {
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Min(5),
+                Constraint::Length(1),
                 Constraint::Length(input_height),
                 Constraint::Length(1),
             ])
@@ -1637,10 +1718,52 @@ impl App {
         } else {
             self.draw_transcript(frame, vertical[0]);
         }
-        self.draw_input(frame, vertical[1]);
-        self.draw_command_menu(frame, vertical[1]);
-        self.draw_status(frame, vertical[2]);
+        self.draw_work_status(frame, vertical[1]);
+        self.draw_input(frame, vertical[2]);
+        self.draw_command_menu(frame, vertical[2]);
+        self.draw_status(frame, vertical[3]);
         self.draw_overlay(frame);
+    }
+
+    fn draw_work_status(&self, frame: &mut Frame<'_>, area: Rect) {
+        let (text, color) = if self.status.streaming {
+            let queued = if self.queued_prompts.is_empty() {
+                String::new()
+            } else {
+                format!("  ·  [Queued] {}", self.queued_prompts.len())
+            };
+            (
+                format!(
+                    " {} Working  ·  {}  ·  {}s{}",
+                    self.spinner(),
+                    self.current_work_phase(),
+                    self.status.started_at.elapsed().as_secs(),
+                    queued
+                ),
+                self.theme.accent,
+            )
+        } else if !self.queued_prompts.is_empty() {
+            (
+                format!(" [Queued] {} waiting", self.queued_prompts.len()),
+                self.theme.warning,
+            )
+        } else if self.status.model.trim().is_empty() {
+            (
+                " No model configured  ·  use /login to connect".to_string(),
+                self.theme.muted,
+            )
+        } else {
+            (
+                " ✓ Ready  ·  Enter sends a prompt".to_string(),
+                self.theme.success,
+            )
+        };
+        let text = truncate_display(&text, area.width as usize);
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(text, Style::default().fg(color))))
+                .style(self.theme.base()),
+            area,
+        );
     }
 
     fn draw_transcript(&mut self, frame: &mut Frame<'_>, area: Rect) {
@@ -1701,7 +1824,7 @@ impl App {
                 if !lines.is_empty() {
                     lines.push(Line::default());
                 }
-                self.push_activity_lines(&mut lines, &self.messages[index..end], width);
+                self.push_activity_lines(&mut lines, &self.messages[index..end], index, end, width);
                 index = end;
                 continue;
             }
@@ -1713,12 +1836,12 @@ impl App {
             index += 1;
         }
 
-        if self.status.streaming
-            && !self
-                .messages
-                .iter()
-                .any(|message| is_activity(message.kind))
-        {
+        let has_live_activity = self
+            .messages
+            .iter()
+            .enumerate()
+            .any(|(index, message)| is_activity(message.kind) && self.activity_is_live(index));
+        if self.status.streaming && !has_live_activity {
             if !lines.is_empty() {
                 lines.push(Line::default());
             }
@@ -1733,7 +1856,10 @@ impl App {
                         .fg(self.theme.accent)
                         .add_modifier(Modifier::BOLD),
                 ),
-                Span::styled("  waiting for model output…", self.theme.muted()),
+                Span::styled(
+                    format!("  {}…", self.current_work_phase()),
+                    self.theme.muted(),
+                ),
             ]));
         }
         lines
@@ -1768,38 +1894,59 @@ impl App {
         &self,
         lines: &mut Vec<Line<'static>>,
         messages: &[Message],
+        start: usize,
+        end: usize,
         width: u16,
     ) {
-        let live = self.status.streaming;
-        let icon = if live { self.spinner() } else { '✓' };
-        let label = if live { "Working" } else { "Completed work" };
-        lines.push(Line::from(vec![
-            Span::styled(format!(" {icon} "), Style::default().fg(self.theme.accent)),
-            Span::styled(
-                label,
-                Style::default()
-                    .fg(self.theme.accent)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                format!("  {}s", self.status.started_at.elapsed().as_secs()),
-                self.theme.muted(),
-            ),
-        ]));
-
-        if let Some(reasoning) = messages
-            .iter()
-            .rev()
-            .find(|message| message.kind == MessageKind::Thinking)
-            .and_then(|message| reasoning_tail(&message.body))
-        {
+        let live = self.activity_group_is_live(start, end);
+        if live {
             lines.push(Line::from(vec![
-                Span::styled("   ↳ ", self.theme.muted()),
                 Span::styled(
-                    truncate_display(&reasoning, width.saturating_sub(8) as usize),
-                    self.theme.muted().add_modifier(Modifier::ITALIC),
+                    format!(" {} ", self.spinner()),
+                    Style::default().fg(self.theme.accent),
+                ),
+                Span::styled(
+                    "Working",
+                    Style::default()
+                        .fg(self.theme.accent)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!(
+                        "  ·  {}  ·  {}s",
+                        self.current_work_phase(),
+                        self.status.started_at.elapsed().as_secs()
+                    ),
+                    self.theme.muted(),
                 ),
             ]));
+        } else {
+            lines.push(Line::from(vec![
+                Span::styled(" ✓ ", Style::default().fg(self.theme.success)),
+                Span::styled(
+                    "Completed work",
+                    Style::default()
+                        .fg(self.theme.success)
+                        .add_modifier(Modifier::BOLD),
+                ),
+            ]));
+        }
+
+        if live {
+            if let Some(reasoning) = messages
+                .iter()
+                .rev()
+                .find(|message| message.kind == MessageKind::Thinking)
+                .and_then(|message| reasoning_tail(&message.body))
+            {
+                lines.push(Line::from(vec![
+                    Span::styled("   ↳ ", self.theme.muted()),
+                    Span::styled(
+                        truncate_display(&reasoning, width.saturating_sub(8) as usize),
+                        self.theme.muted().add_modifier(Modifier::ITALIC),
+                    ),
+                ]));
+            }
         }
 
         let tool_width = width.saturating_sub(8) as usize;
@@ -1829,9 +1976,43 @@ impl App {
         }
     }
 
+    fn activity_is_live(&self, index: usize) -> bool {
+        self.status.streaming
+            && (self.active_thinking == Some(index) || self.active_tool == Some(index))
+    }
+
+    fn activity_group_is_live(&self, start: usize, end: usize) -> bool {
+        self.status.streaming
+            && (self
+                .active_thinking
+                .is_some_and(|index| index >= start && index < end)
+                || self
+                    .active_tool
+                    .is_some_and(|index| index >= start && index < end))
+    }
+
+    fn current_work_phase(&self) -> &'static str {
+        if self.pending_permission.is_some() {
+            "waiting for approval"
+        } else if self.active_tool.is_some() {
+            "running tool"
+        } else if self.active_thinking.is_some() {
+            "reasoning"
+        } else if self.active_assistant.is_some() {
+            "writing answer"
+        } else {
+            "waiting for model"
+        }
+    }
+
     fn draw_input(&self, frame: &mut Frame<'_>, area: Rect) {
+        let title = if self.status.streaming {
+            " Prompt · Enter queues next turn "
+        } else {
+            " Prompt "
+        };
         let block = Block::default()
-            .title(Span::styled(" Prompt ", self.theme.title()))
+            .title(Span::styled(title, self.theme.title()))
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
             .border_style(if self.status.streaming {
@@ -1847,7 +2028,13 @@ impl App {
                 Span::styled("  ", self.theme.base()),
                 Span::styled(CARET_GLYPH, self.theme.caret()),
                 Span::styled(
-                    "Ask Claw anything…",
+                    if self.status.streaming {
+                        "Ask a follow-up… Enter queues it"
+                    } else if self.status.model.trim().is_empty() {
+                        "/login to connect a model"
+                    } else {
+                        "Ask Claw anything…"
+                    },
                     self.theme.muted().add_modifier(Modifier::ITALIC),
                 ),
             ]));
@@ -1948,7 +2135,7 @@ impl App {
 
     fn draw_status(&self, frame: &mut Frame<'_>, area: Rect) {
         let state = if self.status.streaming {
-            Span::styled("◐ streaming", Style::default().fg(self.theme.accent))
+            Span::styled("◐ working", Style::default().fg(self.theme.accent))
         } else {
             Span::styled("● ready", Style::default().fg(self.theme.success))
         };
@@ -1967,17 +2154,15 @@ impl App {
         };
         let usage = if narrow {
             format!(
-                "{}i/{}o ${}.{:02}",
-                self.status.input_tokens,
-                self.status.output_tokens,
+                "{} tok ${}.{:02}",
+                self.status.total_tokens(),
                 self.status.cost_cents / 100,
                 self.status.cost_cents % 100
             )
         } else {
             format!(
-                "in:{} out:{}  ${}.{:02}",
-                self.status.input_tokens,
-                self.status.output_tokens,
+                "tokens:{}  ${}.{:02}",
+                self.status.total_tokens(),
                 self.status.cost_cents / 100,
                 self.status.cost_cents % 100
             )
@@ -1995,8 +2180,13 @@ impl App {
         ]);
         let mut line = line;
         if area.width >= 108 {
+            let send_hint = if self.status.streaming {
+                "Enter queue"
+            } else {
+                "Enter send"
+            };
             line.spans.push(Span::styled(
-                "   Enter send · ⇧Tab mode · Esc quit",
+                format!("   {send_hint} · ⇧Tab mode · Esc quit"),
                 self.theme.muted(),
             ));
         } else {
@@ -2246,10 +2436,7 @@ impl App {
             ListItem::new(Line::from(vec![
                 Span::styled(" Usage  ", self.theme.muted()),
                 Span::styled(
-                    format!(
-                        "{}i / {}o",
-                        self.status.input_tokens, self.status.output_tokens
-                    ),
+                    format!("{} tokens", self.status.total_tokens()),
                     self.theme.text,
                 ),
             ])),
@@ -2625,6 +2812,45 @@ mod tests {
     }
 
     #[test]
+    fn only_the_current_activity_group_spins() {
+        let mut app = App::empty();
+        app.status.streaming = true;
+        app.apply_stream_event(StreamEvent::ThinkingStart);
+        app.apply_stream_event(StreamEvent::ThinkingDelta("finished reasoning".to_string()));
+        app.apply_stream_event(StreamEvent::ThinkingEnd);
+        app.messages
+            .push(Message::new(MessageKind::User, "You", "next prompt"));
+        app.apply_stream_event(StreamEvent::ThinkingStart);
+        app.apply_stream_event(StreamEvent::ThinkingDelta("current reasoning".to_string()));
+
+        let rendered = app
+            .transcript_lines_for_width(80)
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            rendered
+                .iter()
+                .filter(|line| line.contains("Working"))
+                .count(),
+            1,
+            "only the active group may say Working: {rendered:?}"
+        );
+        assert_eq!(
+            rendered
+                .iter()
+                .filter(|line| line.contains("Completed work"))
+                .count(),
+            1,
+            "the older group must settle: {rendered:?}"
+        );
+        assert!(rendered
+            .iter()
+            .any(|line| line.contains("current reasoning")));
+    }
+
+    #[test]
     fn tool_output_is_kept_on_one_normalized_line() {
         let mut app = App::empty();
         app.apply_stream_event(StreamEvent::ToolStart {
@@ -2667,6 +2893,45 @@ mod tests {
         assert_eq!(app.status.input_tokens, 128);
         assert_eq!(app.status.output_tokens, 17);
         assert_eq!(app.status.cost_cents, 2);
+    }
+
+    #[test]
+    fn usage_accumulates_and_an_empty_done_event_cannot_erase_it() {
+        let mut app = App::empty();
+        app.status.streaming = true;
+        app.apply_stream_event(StreamEvent::Usage {
+            input_tokens: 128,
+            output_tokens: 17,
+            cost_cents: 2,
+        });
+        app.apply_stream_event(StreamEvent::Usage {
+            input_tokens: 10,
+            output_tokens: 3,
+            cost_cents: 1,
+        });
+        app.apply_stream_event(StreamEvent::Done {
+            input_tokens: 0,
+            output_tokens: 0,
+            cost_cents: 0,
+        });
+
+        assert_eq!(app.status.total_tokens(), 158);
+        assert_eq!(app.status.cost_cents, 3);
+        assert!(!app.status.streaming);
+    }
+
+    #[test]
+    fn queued_prompt_is_marked_until_its_turn_starts() {
+        let mut app = App::empty();
+        app.status.streaming = true;
+        app.messages
+            .push(Message::new(MessageKind::User, "You", "follow-up"));
+
+        app.queue_prompt("follow-up".to_string(), 0);
+
+        assert_eq!(app.messages[0].title, "You  [Queued]");
+        assert_eq!(app.queued_prompts.len(), 1);
+        assert_eq!(app.queued_prompts[0].prompt, "follow-up");
     }
 
     #[test]
@@ -2842,7 +3107,7 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect::<String>();
-        assert!(visible.contains("1284i/96o $0.04"));
+        assert!(visible.contains("1380 tok $0.04"));
         assert!(visible.contains("provider/a-model"));
     }
 }
