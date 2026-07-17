@@ -6,8 +6,9 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use crate::config::WeaverConfig;
 use crate::conversation::{ApiClient, ApiRequest, AssistantEvent};
 use crate::harness_assets::parse_frontmatter_value;
 use crate::session::{ContentBlock, ConversationMessage, MessageRole};
@@ -219,6 +220,15 @@ fn valid_skill_name(name: &str) -> bool {
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
 }
 
+/// Public validity check for skill names, using the same convention
+/// `quarantine_skill`/`restore_skill` enforce. Callers outside this module
+/// (e.g. `commands::run_skills_mark`) should validate through this rather
+/// than reimplementing the kebab-case/length rule.
+#[must_use]
+pub fn is_valid_skill_name(name: &str) -> bool {
+    valid_skill_name(name)
+}
+
 fn collect_text_from_events(events: &[AssistantEvent]) -> String {
     let mut text = String::new();
     for event in events {
@@ -407,6 +417,104 @@ fn last_weave_time(weaver: &Path) -> Option<SystemTime> {
         .ok()
 }
 
+// ---------------------------------------------------------------------------
+// Auto-weave gate
+// ---------------------------------------------------------------------------
+
+/// Minimum time between automatic weave passes for a given workspace.
+pub const AUTO_WEAVE_MIN_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
+/// Minimum number of sessions touched since the last weave before an
+/// automatic pass is allowed to run.
+pub const AUTO_WEAVE_MIN_TOUCHED_SESSIONS: usize = 3;
+
+/// Auto-weave gate decision. Mirrors `dreamer::DreamGate` in shape.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WeaveGate {
+    Disabled,
+    Locked,
+    TooSoon { remaining: Duration },
+    TooFewSessions { touched: usize, required: usize },
+    Ready,
+}
+
+/// Count `*.jsonl` session files in `workspace_sessions_dir(cwd)` modified
+/// after `since` (or all of them, when `since` is `None`). Local counterpart
+/// to `dreamer::touched_sessions_since`, which is private to that module.
+fn sessions_touched_since(cwd: &Path, since: Option<SystemTime>) -> Result<usize, WeaverError> {
+    let sessions_dir = crate::session::workspace_sessions_dir(cwd)
+        .map_err(|e| WeaverError::Io(io::Error::other(e.to_string())))?;
+    let entries = match fs::read_dir(&sessions_dir) {
+        Ok(entries) => entries,
+        Err(_) => return Ok(0),
+    };
+    let mut touched = 0usize;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().is_none_or(|e| e != "jsonl") {
+            continue;
+        }
+        let modified = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .unwrap_or(UNIX_EPOCH);
+        if since.is_none_or(|cutoff| modified > cutoff) {
+            touched += 1;
+        }
+    }
+    Ok(touched)
+}
+
+/// Check auto-weave gates for the current workspace.
+pub fn auto_weave_gate(
+    weaver: &Path,
+    cwd: &Path,
+    enabled: bool,
+    force: bool,
+) -> Result<WeaveGate, WeaverError> {
+    if !enabled && !force {
+        return Ok(WeaveGate::Disabled);
+    }
+    if weaver.join(WEAVE_LOCK_FILENAME).exists() {
+        return Ok(WeaveGate::Locked);
+    }
+    if force {
+        return Ok(WeaveGate::Ready);
+    }
+    if let Some(last) = last_weave_time(weaver) {
+        let elapsed = SystemTime::now()
+            .duration_since(last)
+            .unwrap_or(Duration::ZERO);
+        if elapsed < AUTO_WEAVE_MIN_INTERVAL {
+            return Ok(WeaveGate::TooSoon {
+                remaining: AUTO_WEAVE_MIN_INTERVAL
+                    .checked_sub(elapsed)
+                    .unwrap_or(Duration::ZERO),
+            });
+        }
+    }
+    let touched = sessions_touched_since(cwd, last_weave_time(weaver))?;
+    if touched < AUTO_WEAVE_MIN_TOUCHED_SESSIONS {
+        return Ok(WeaveGate::TooFewSessions {
+            touched,
+            required: AUTO_WEAVE_MIN_TOUCHED_SESSIONS,
+        });
+    }
+    Ok(WeaveGate::Ready)
+}
+
+/// Run an auto-weave pass only when gates allow it.
+pub fn maybe_run_auto_weave(
+    cwd: &Path,
+    config: &WeaverConfig,
+    client: &mut impl ApiClient,
+) -> Result<Option<WeaveRun>, WeaverError> {
+    let weaver = weaver_dir(cwd);
+    if auto_weave_gate(&weaver, cwd, config.auto_weave(), false)? != WeaveGate::Ready {
+        return Ok(None);
+    }
+    run_weave_pass(cwd, client, config.max_input_bytes()).map(Some)
+}
+
 struct WeaveLock {
     path: PathBuf,
 }
@@ -481,6 +589,19 @@ pub fn restore_skill(cwd: &Path, name: &str) -> Result<PathBuf, WeaverError> {
     }
     fs::rename(&parked, &live)?;
     Ok(live)
+}
+
+/// Whether `name` currently has a quarantined (parked) learned-skill file,
+/// i.e. `learned/<name>/SKILL.md.quarantined` exists. Promoted out of
+/// `commands` so the `learned/<name>/...quarantined` path convention lives
+/// in one place instead of being duplicated at call sites.
+#[must_use]
+pub fn is_quarantined(cwd: &Path, name: &str) -> bool {
+    let Some(live) = learned_skill_file(cwd, name) else {
+        return false;
+    };
+    live.with_extension(format!("md.{QUARANTINE_SUFFIX}"))
+        .is_file()
 }
 
 /// Quarantine learned skills whose observed success rate is unacceptable.
@@ -765,5 +886,98 @@ body two
         assert!(quarantined.is_empty());
         assert!(hand.join("SKILL.md").exists());
         assert!(fresh.join("SKILL.md").exists());
+    }
+
+    #[test]
+    fn auto_weave_gate_disabled_and_too_soon() {
+        let dir = tempfile::tempdir().unwrap();
+        let weaver = weaver_dir(dir.path());
+        fs::create_dir_all(&weaver).unwrap();
+
+        assert_eq!(
+            auto_weave_gate(&weaver, dir.path(), false, false).unwrap(),
+            WeaveGate::Disabled
+        );
+
+        // Fresh marker → too soon even when enabled.
+        fs::write(weaver.join(LAST_WEAVE_FILENAME), b"").unwrap();
+        assert!(matches!(
+            auto_weave_gate(&weaver, dir.path(), true, false).unwrap(),
+            WeaveGate::TooSoon { .. }
+        ));
+
+        // Force bypasses everything but the lock.
+        assert_eq!(
+            auto_weave_gate(&weaver, dir.path(), true, true).unwrap(),
+            WeaveGate::Ready
+        );
+    }
+
+    #[test]
+    fn auto_weave_gate_locked_when_lock_file_present() {
+        let dir = tempfile::tempdir().unwrap();
+        let weaver = weaver_dir(dir.path());
+        fs::create_dir_all(&weaver).unwrap();
+        fs::write(weaver.join(WEAVE_LOCK_FILENAME), b"pid=1").unwrap();
+
+        assert_eq!(
+            auto_weave_gate(&weaver, dir.path(), true, false).unwrap(),
+            WeaveGate::Locked
+        );
+        // Force still respects the lock.
+        assert_eq!(
+            auto_weave_gate(&weaver, dir.path(), true, true).unwrap(),
+            WeaveGate::Locked
+        );
+    }
+
+    #[test]
+    fn auto_weave_gate_requires_enough_sessions() {
+        let dir = tempfile::tempdir().unwrap();
+        let weaver = weaver_dir(dir.path());
+        fs::create_dir_all(&weaver).unwrap();
+        // Enabled, no marker, but 0 sessions → TooFewSessions.
+        assert!(matches!(
+            auto_weave_gate(&weaver, dir.path(), true, false).unwrap(),
+            WeaveGate::TooFewSessions {
+                touched: 0,
+                required: 3
+            }
+        ));
+
+        let sessions = crate::session::workspace_sessions_dir(dir.path()).unwrap();
+        fs::create_dir_all(&sessions).unwrap();
+        for i in 0..3 {
+            fs::write(sessions.join(format!("s{i}.jsonl")), "session\n").unwrap();
+        }
+        assert_eq!(
+            auto_weave_gate(&weaver, dir.path(), true, false).unwrap(),
+            WeaveGate::Ready
+        );
+    }
+
+    #[test]
+    fn is_quarantined_reflects_parked_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let skill_dir = dir.path().join(".claw/skills/learned/flaky-skill");
+        fs::create_dir_all(&skill_dir).unwrap();
+        fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: flaky-skill\ndescription: test\n---\nbody\n",
+        )
+        .unwrap();
+
+        assert!(!is_quarantined(dir.path(), "flaky-skill"));
+        quarantine_skill(dir.path(), "flaky-skill").unwrap();
+        assert!(is_quarantined(dir.path(), "flaky-skill"));
+        restore_skill(dir.path(), "flaky-skill").unwrap();
+        assert!(!is_quarantined(dir.path(), "flaky-skill"));
+    }
+
+    #[test]
+    fn is_valid_skill_name_matches_convention() {
+        assert!(is_valid_skill_name("fix-clippy-warnings"));
+        assert!(!is_valid_skill_name("../evil"));
+        assert!(!is_valid_skill_name("ab"));
     }
 }

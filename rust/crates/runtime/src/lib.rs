@@ -76,7 +76,7 @@ pub use config::{
     ConfigSource, McpConfigCollection, McpInvalidServerConfig,
     McpManagedProxyServerConfig, McpOAuthConfig, McpRemoteServerConfig, McpSdkServerConfig,
     McpServerConfig, McpStdioServerConfig, McpTransport, McpWebSocketServerConfig, MemoryConfig,
-    OAuthConfig, ProviderFallbackConfig, ResolvedPermissionMode, RuntimeConfig,
+    OAuthConfig, ProviderFallbackConfig, ResolvedPermissionMode, RuntimeConfig, WeaverConfig,
     RuntimeFeatureConfig, RuntimeHookConfig, RuntimeInvalidHookConfig, RuntimePermissionRuleConfig,
     RuntimePluginConfig, RuntimeProviderConfig, ScopedMcpServerConfig, WorkflowGateMode,
     load_user_model_aliases, load_user_model_aliases_in_home, remove_user_model_alias,

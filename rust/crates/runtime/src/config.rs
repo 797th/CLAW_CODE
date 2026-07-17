@@ -152,6 +152,7 @@ pub struct RuntimeFeatureConfig {
     hooks: RuntimeHookConfig,
     plugins: RuntimePluginConfig,
     memory: MemoryConfig,
+    weaver: WeaverConfig,
     mcp: McpConfigCollection,
     oauth: Option<OAuthConfig>,
     model: Option<String>,
@@ -301,6 +302,28 @@ pub struct MemoryConfig {
     auto_memory_enabled: bool,
     auto_memory_directory: Option<String>,
     auto_dream_enabled: bool,
+}
+
+/// Skill Weaver settings: whether to run an auto-weave pass after successful
+/// turns, and the per-pass session-transcript input budget. Parsed from the
+/// `weaver` object in merged settings (mirrors `MemoryConfig`'s shape/style).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WeaverConfig {
+    auto_weave: bool,
+    max_input_bytes: usize,
+}
+
+impl Default for WeaverConfig {
+    fn default() -> Self {
+        Self {
+            auto_weave: false,
+            max_input_bytes: default_weaver_max_input_bytes(),
+        }
+    }
+}
+
+fn default_weaver_max_input_bytes() -> usize {
+    64 * 1024
 }
 
 /// Collection of configured MCP servers after scope-aware merging.
@@ -816,6 +839,7 @@ fn build_runtime_config(
         hooks: parse_optional_hooks_config(&merged_value)?,
         plugins: parse_optional_plugin_config(&merged_value)?,
         memory: parse_optional_memory_config(&merged_value)?,
+        weaver: parse_optional_weaver_config(&merged_value)?,
         mcp,
         oauth: parse_optional_oauth_config(&merged_value, "merged settings.oauth")?,
         model: parse_optional_model(&merged_value),
@@ -901,6 +925,11 @@ impl RuntimeConfig {
     #[must_use]
     pub fn memory(&self) -> &MemoryConfig {
         &self.feature_config.memory
+    }
+
+    #[must_use]
+    pub fn weaver(&self) -> &WeaverConfig {
+        &self.feature_config.weaver
     }
 
     #[must_use]
@@ -996,6 +1025,12 @@ impl RuntimeFeatureConfig {
         self
     }
 
+    #[must_use]
+    pub fn with_weaver(mut self, weaver: WeaverConfig) -> Self {
+        self.weaver = weaver;
+        self
+    }
+
     /// Override the workflow gate mode. Primarily a test/wiring seam; the
     /// production value is parsed from `settings.workflow_gates`.
     #[must_use]
@@ -1017,6 +1052,11 @@ impl RuntimeFeatureConfig {
     #[must_use]
     pub fn memory(&self) -> &MemoryConfig {
         &self.memory
+    }
+
+    #[must_use]
+    pub fn weaver(&self) -> &WeaverConfig {
+        &self.weaver
     }
 
     #[must_use]
@@ -1745,6 +1785,26 @@ impl MemoryConfig {
     }
 }
 
+impl WeaverConfig {
+    #[must_use]
+    pub fn new(auto_weave: bool, max_input_bytes: usize) -> Self {
+        Self {
+            auto_weave,
+            max_input_bytes,
+        }
+    }
+
+    #[must_use]
+    pub fn auto_weave(&self) -> bool {
+        self.auto_weave
+    }
+
+    #[must_use]
+    pub fn max_input_bytes(&self) -> usize {
+        self.max_input_bytes
+    }
+}
+
 impl McpConfigCollection {
     #[must_use]
     pub fn servers(&self) -> &BTreeMap<String, ScopedMcpServerConfig> {
@@ -2382,6 +2442,26 @@ fn parse_optional_memory_config(root: &JsonValue) -> Result<MemoryConfig, Config
         optional_string(object, "autoMemoryDirectory", "merged settings")?.map(str::to_string),
         optional_bool(object, "autoDreamEnabled", "merged settings")?.unwrap_or(false),
     ))
+}
+
+fn parse_optional_weaver_config(root: &JsonValue) -> Result<WeaverConfig, ConfigError> {
+    let Some(object) = root.as_object() else {
+        return Ok(WeaverConfig::default());
+    };
+    let Some(weaver_value) = object.get("weaver") else {
+        return Ok(WeaverConfig::default());
+    };
+    let weaver = expect_object(weaver_value, "merged settings.weaver")?;
+    let auto_weave = optional_bool(weaver, "autoWeave", "merged settings.weaver")?.unwrap_or(false);
+    let max_input_bytes = match optional_u64(weaver, "maxInputBytes", "merged settings.weaver")? {
+        Some(value) => usize::try_from(value).map_err(|_| {
+            ConfigError::Parse(
+                "merged settings.weaver: field maxInputBytes is out of range".to_string(),
+            )
+        })?,
+        None => default_weaver_max_input_bytes(),
+    };
+    Ok(WeaverConfig::new(auto_weave, max_input_bytes))
 }
 
 fn parse_optional_permission_mode(
