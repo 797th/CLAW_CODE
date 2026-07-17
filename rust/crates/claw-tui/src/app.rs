@@ -19,6 +19,8 @@ use crate::theme::Theme;
 const TICK: Duration = Duration::from_millis(75);
 const CARET_GLYPH: &str = "█";
 const PERMISSION_MODES: [&str; 4] = ["ask", "plan", "workspace", "bypass"];
+/// Endpoints that never answer `GET /models` should not hold the picker open.
+const MODEL_LIST_TIMEOUT: Duration = Duration::from_secs(5);
 
 fn configured_model() -> String {
     crate::config::configured_model()
@@ -146,6 +148,15 @@ impl Status {
         };
         Style::default().fg(color)
     }
+}
+
+/// Progress of the `GET /models` lookup backing the picker.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ModelListState {
+    Idle,
+    Loading,
+    Loaded(Vec<String>),
+    Failed(String),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -316,6 +327,8 @@ pub struct App {
     command_menu_selected: usize,
     overlay: Option<Overlay>,
     status: Status,
+    model_list_rx: Option<Receiver<Result<Vec<String>, String>>>,
+    model_list_state: ModelListState,
 }
 
 pub fn run() -> io::Result<()> {
@@ -329,6 +342,7 @@ pub fn run() -> io::Result<()> {
 fn run_loop(terminal: &mut crate::terminal::TuiTerminal, app: &mut App) -> io::Result<()> {
     loop {
         app.poll_stream();
+        app.poll_model_list();
         terminal.hide_cursor()?;
         terminal.draw(|frame| app.draw(frame))?;
 
@@ -361,6 +375,8 @@ impl App {
             command_menu_selected: 0,
             overlay: None,
             status: Status::default(),
+            model_list_rx: None,
+            model_list_state: ModelListState::Idle,
         }
     }
 
@@ -870,7 +886,29 @@ impl App {
         }
     }
 
+    /// Ask the configured endpoint which models it serves, on a worker thread
+    /// so the frame loop keeps running. `poll_model_list` installs the picker
+    /// once the answer lands.
     fn open_model_picker(&mut self) {
+        self.model_list_state = ModelListState::Loading;
+        self.overlay = Some(Overlay::ModelPicker {
+            title: self.model_picker_title(),
+            items: self.model_picker_items(&[]),
+            selected: 0,
+        });
+
+        let (tx, rx) = mpsc::channel();
+        let model_hint = self.status.model.clone();
+        thread::spawn(move || {
+            let result = api::list_models_blocking(&model_hint, MODEL_LIST_TIMEOUT)
+                .map_err(|error| error.to_string());
+            let _ = tx.send(result);
+        });
+        self.model_list_rx = Some(rx);
+    }
+
+    /// Rebuild picker rows from the endpoint's models plus local aliases.
+    fn model_picker_items(&self, available: &[String]) -> Vec<ModelChoice> {
         let aliases = crate::config::load_aliases();
         let mut items = Vec::new();
         if !self.status.model.trim().is_empty() {
@@ -881,6 +919,17 @@ impl App {
                 action: ModelChoiceAction::Switch,
             });
         }
+        items.extend(
+            available
+                .iter()
+                .filter(|model| **model != self.status.model)
+                .map(|model| ModelChoice {
+                    label: model.clone(),
+                    value: model.clone(),
+                    detail: "available on this endpoint".to_string(),
+                    action: ModelChoiceAction::Switch,
+                }),
+        );
         items.extend(aliases.into_iter().map(|(label, value)| ModelChoice {
             label,
             value: resolve_model_alias_with_config(&value),
@@ -899,15 +948,78 @@ impl App {
             detail: "persist a named model".to_string(),
             action: ModelChoiceAction::AddAlias,
         });
-        let selected = items
-            .iter()
-            .position(|item| item.value == self.status.model)
-            .unwrap_or(0);
-        self.overlay = Some(Overlay::ModelPicker {
-            title: format!("Select model · current {}", model_label(&self.status.model)),
+        items
+    }
+
+    /// Swap the endpoint's model list into an open picker once it arrives.
+    /// A failure leaves the alias-only rows in place and says why.
+    fn poll_model_list(&mut self) {
+        let Some(rx) = self.model_list_rx.take() else {
+            return;
+        };
+        let received = match rx.try_recv() {
+            Ok(received) => received,
+            Err(TryRecvError::Empty) => {
+                self.model_list_rx = Some(rx);
+                return;
+            }
+            Err(TryRecvError::Disconnected) => Err("model list worker stopped".to_string()),
+        };
+
+        self.model_list_state = match received {
+            Ok(models) if models.is_empty() => {
+                ModelListState::Failed("endpoint listed no models".to_string())
+            }
+            Ok(models) => ModelListState::Loaded(models),
+            Err(error) => ModelListState::Failed(error),
+        };
+
+        let Some(Overlay::ModelPicker {
+            title,
             items,
             selected,
+        }) = &mut self.overlay
+        else {
+            return;
+        };
+        // `open_remove_alias_picker` reuses this overlay; only refresh our own.
+        if !title.starts_with("Select model") {
+            return;
+        }
+        let available = match &self.model_list_state {
+            ModelListState::Loaded(models) => models.clone(),
+            ModelListState::Idle | ModelListState::Loading | ModelListState::Failed(_) => {
+                Vec::new()
+            }
+        };
+        let previous = items.get(*selected).map(|item| item.value.clone());
+        let refreshed = self.model_picker_items(&available);
+        let restored = previous
+            .and_then(|value| refreshed.iter().position(|item| item.value == value))
+            .unwrap_or(0);
+        self.overlay = Some(Overlay::ModelPicker {
+            title: self.model_picker_title(),
+            items: refreshed,
+            selected: restored,
         });
+    }
+
+    fn model_picker_title(&self) -> String {
+        let current = model_label(&self.status.model);
+        match &self.model_list_state {
+            ModelListState::Loaded(models) => {
+                format!(
+                    "Select model · current {current} · {} available",
+                    models.len()
+                )
+            }
+            ModelListState::Failed(error) => {
+                format!("Select model · current {current} · endpoint list failed: {error}")
+            }
+            ModelListState::Idle | ModelListState::Loading => {
+                format!("Select model · current {current} · loading endpoint models…")
+            }
+        }
     }
 
     fn open_remove_alias_picker(&mut self) {
@@ -1912,8 +2024,59 @@ mod tests {
 
     use super::{
         mock_events, model_label, resolve_model_alias_with_config, App, LoginMode, Message,
-        MessageKind, Overlay, StreamEvent,
+        MessageKind, ModelChoiceAction, ModelListState, Overlay, StreamEvent,
     };
+
+    #[test]
+    fn picker_lists_endpoint_models_as_selectable_rows() {
+        let mut app = App::empty();
+        app.status.model = "gpt-4.1".to_string();
+
+        let items = app.model_picker_items(&[
+            "gpt-4.1".to_string(),
+            "o3-mini".to_string(),
+            "gpt-5".to_string(),
+        ]);
+
+        let rows: Vec<(&str, &str)> = items
+            .iter()
+            .map(|item| (item.label.as_str(), item.value.as_str()))
+            .collect();
+        assert!(
+            rows.contains(&("o3-mini", "o3-mini")) && rows.contains(&("gpt-5", "gpt-5")),
+            "endpoint models should be selectable rows: {rows:?}"
+        );
+        assert_eq!(
+            rows.iter().filter(|(_, value)| *value == "gpt-4.1").count(),
+            1,
+            "the active model should appear once, as `current`: {rows:?}"
+        );
+        assert!(
+            items
+                .iter()
+                .any(|item| item.action == ModelChoiceAction::Custom),
+            "custom entry must survive so unlisted models stay reachable"
+        );
+    }
+
+    #[test]
+    fn picker_title_reports_load_progress_and_endpoint_failures() {
+        let mut app = App::empty();
+        app.status.model = "gpt-4.1".to_string();
+
+        app.model_list_state = ModelListState::Loading;
+        assert!(app.model_picker_title().contains("loading endpoint models"));
+
+        app.model_list_state = ModelListState::Loaded(vec!["a".to_string(), "b".to_string()]);
+        assert!(app.model_picker_title().contains("2 available"));
+
+        app.model_list_state = ModelListState::Failed("connection refused".to_string());
+        let title = app.model_picker_title();
+        assert!(
+            title.contains("endpoint list failed") && title.contains("connection refused"),
+            "a failed lookup must say so rather than look like an empty endpoint: {title}"
+        );
+    }
 
     #[test]
     fn mock_stream_contains_thinking_tool_and_answer_phases() {

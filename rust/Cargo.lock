@@ -522,6 +522,7 @@ dependencies = [
 name = "claw-tui"
 version = "0.1.3"
 dependencies = [
+ "api",
  "crossterm",
  "pulldown-cmark",
  "ratatui",

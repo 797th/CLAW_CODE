@@ -492,6 +492,26 @@ impl AnthropicClient {
         request_builder.send().await.map_err(ApiError::from)
     }
 
+    /// List the model ids the endpoint advertises at `GET /v1/models`.
+    ///
+    /// Anthropic-compatible endpoints are not required to implement the route;
+    /// callers are expected to fall back to configured aliases when this fails.
+    pub async fn list_models(&self) -> Result<Vec<String>, ApiError> {
+        let request_url = format!(
+            "{}/v1/models?limit=1000",
+            self.base_url.trim_end_matches('/')
+        );
+        let request_builder = self.auth.apply(self.http.get(&request_url));
+        let mut request_builder = request_builder;
+        for (header_name, header_value) in self.request_profile.header_pairs() {
+            request_builder = request_builder.header(header_name, header_value);
+        }
+        let response = request_builder.send().await.map_err(ApiError::from)?;
+        let response = expect_success(response).await?;
+        let body = response.text().await.map_err(ApiError::from)?;
+        super::openai_compat::parse_model_list("Anthropic", &body)
+    }
+
     fn build_request(&self, request_url: &str) -> reqwest::RequestBuilder {
         let request_builder = self
             .http

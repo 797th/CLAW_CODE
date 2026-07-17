@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use crate::error::ApiError;
 use crate::prompt_cache::{PromptCache, PromptCacheRecord, PromptCacheStats};
 use crate::providers::anthropic::{self, AnthropicClient, AuthSource};
@@ -36,8 +38,7 @@ impl ProviderClient {
                 // DashScope models (qwen-*) also return ProviderKind::OpenAi because they
                 // speak the OpenAI wire format, but they need the DashScope config which
                 // reads DASHSCOPE_API_KEY and points at dashscope.aliyuncs.com.
-                let config = if providers::configured_provider_kind()
-                    == Some(ProviderKind::OpenAi)
+                let config = if providers::configured_provider_kind() == Some(ProviderKind::OpenAi)
                 {
                     OpenAiCompatConfig::openai()
                 } else {
@@ -117,6 +118,45 @@ impl ProviderClient {
                 .map(MessageStream::OpenAiCompat),
         }
     }
+
+    /// List the model ids the configured endpoint advertises.
+    pub async fn list_models(&self) -> Result<Vec<String>, ApiError> {
+        match self {
+            Self::Anthropic(client) => client.list_models().await,
+            Self::Xai(client) | Self::OpenAi(client) | Self::NvidiaNim(client) => {
+                client.list_models().await
+            }
+        }
+    }
+}
+
+/// List the models the configured endpoint advertises, from synchronous code.
+///
+/// The frontend model picker is sync and has no ambient reactor, so this owns a
+/// short-lived current-thread runtime. `model_hint` only selects which provider
+/// to ask — pass the session's current model.
+///
+/// # Panics
+/// Panics if called from inside a Tokio runtime.
+pub fn list_models_blocking(model_hint: &str, timeout: Duration) -> Result<Vec<String>, ApiError> {
+    let client = ProviderClient::from_model(model_hint)?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(ApiError::Io)?;
+    runtime.block_on(async move {
+        tokio::time::timeout(timeout, client.list_models())
+            .await
+            .unwrap_or_else(|_| {
+                Err(ApiError::Io(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    format!(
+                        "timed out after {}s waiting for the endpoint to list models",
+                        timeout.as_secs()
+                    ),
+                )))
+            })
+    })
 }
 
 #[derive(Debug)]

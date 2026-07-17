@@ -313,6 +313,23 @@ impl OpenAiCompatClient {
         })
     }
 
+    /// List the model ids the endpoint advertises at `GET /models`.
+    ///
+    /// Not every OpenAI-compatible endpoint implements the route; callers are
+    /// expected to fall back to configured aliases when this fails.
+    pub async fn list_models(&self) -> Result<Vec<String>, ApiError> {
+        let response = self
+            .http
+            .get(models_endpoint(&self.base_url))
+            .bearer_auth(&self.api_key)
+            .send()
+            .await
+            .map_err(ApiError::from)?;
+        let response = expect_success(response).await?;
+        let body = response.text().await.map_err(ApiError::from)?;
+        parse_model_list(self.config.provider_name, &body)
+    }
+
     async fn send_with_retry(
         &self,
         request: &MessageRequest,
@@ -1767,6 +1784,43 @@ fn chat_completions_endpoint(base_url: &str) -> String {
     }
 }
 
+/// Resolve `GET /models` against a base URL that may already point at the
+/// chat route (setup writes either shape into `OPENAI_BASE_URL`).
+fn models_endpoint(base_url: &str) -> String {
+    let trimmed = base_url
+        .trim_end_matches('/')
+        .trim_end_matches("/chat/completions")
+        .trim_end_matches('/');
+    if trimmed.ends_with("/models") {
+        trimmed.to_string()
+    } else {
+        format!("{trimmed}/models")
+    }
+}
+
+/// Read model ids out of an OpenAI-style `{"data": [{"id": ...}]}` list.
+/// Anthropic's `/v1/models` uses the same shape, so both providers share this.
+pub(crate) fn parse_model_list(provider: &str, body: &str) -> Result<Vec<String>, ApiError> {
+    let payload = serde_json::from_str::<Value>(body)
+        .map_err(|error| ApiError::json_deserialize(provider, "models", body, error))?;
+    let mut ids: Vec<String> = payload
+        .get("data")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| item.get("id").and_then(Value::as_str))
+                .map(str::trim)
+                .filter(|id| !id.is_empty())
+                .map(ToOwned::to_owned)
+                .collect()
+        })
+        .unwrap_or_default();
+    ids.sort();
+    ids.dedup();
+    Ok(ids)
+}
+
 fn request_id_from_headers(headers: &reqwest::header::HeaderMap) -> Option<String> {
     headers
         .get(REQUEST_ID_HEADER)
@@ -1881,8 +1935,9 @@ mod tests {
     use super::{
         build_chat_completion_request, build_chat_completion_request_for_base_url,
         chat_completions_endpoint, is_reasoning_model, model_requires_reasoning_content_in_history,
-        normalize_finish_reason, normalize_response, openai_tool_choice, parse_tool_arguments,
-        OpenAiCompatClient, OpenAiCompatConfig, StreamState,
+        models_endpoint, normalize_finish_reason, normalize_response, openai_tool_choice,
+        parse_model_list, parse_tool_arguments, OpenAiCompatClient, OpenAiCompatConfig,
+        StreamState,
     };
     use crate::error::ApiError;
     use crate::types::{
@@ -1894,6 +1949,66 @@ mod tests {
     use std::borrow::Cow;
     use std::collections::BTreeMap;
     use std::sync::{Mutex, OnceLock};
+
+    #[test]
+    fn models_endpoint_resolves_from_every_configured_base_url_shape() {
+        assert_eq!(
+            models_endpoint("https://api.openai.com/v1"),
+            "https://api.openai.com/v1/models"
+        );
+        assert_eq!(
+            models_endpoint("https://api.openai.com/v1/"),
+            "https://api.openai.com/v1/models"
+        );
+        // Setup also accepts a base URL pointed straight at the chat route.
+        assert_eq!(
+            models_endpoint("https://api.openai.com/v1/chat/completions"),
+            "https://api.openai.com/v1/models"
+        );
+        // Already-resolved list URLs must not gain a second /models segment.
+        assert_eq!(
+            models_endpoint("https://api.openai.com/v1/models"),
+            "https://api.openai.com/v1/models"
+        );
+    }
+
+    #[test]
+    fn parse_model_list_reads_sorted_unique_ids_and_skips_malformed_entries() {
+        let body = json!({
+            "object": "list",
+            "data": [
+                {"id": "gpt-4.1"},
+                {"id": "claude-opus-4-8"},
+                {"id": "gpt-4.1"},
+                {"id": "  "},
+                {"object": "model"},
+            ]
+        })
+        .to_string();
+
+        let models = parse_model_list("OpenAI", &body).expect("well-formed list should parse");
+
+        assert_eq!(models, vec!["claude-opus-4-8", "gpt-4.1"]);
+    }
+
+    #[test]
+    fn parse_model_list_treats_a_missing_data_array_as_no_models() {
+        let models = parse_model_list("OpenAI", &json!({"object": "list"}).to_string())
+            .expect("valid json without data should not error");
+
+        assert!(models.is_empty(), "expected no models, got {models:?}");
+    }
+
+    #[test]
+    fn parse_model_list_reports_non_json_bodies_as_parse_failures() {
+        let error = parse_model_list("OpenAI", "<html>gateway timeout</html>")
+            .expect_err("html body should not parse as a model list");
+
+        assert!(
+            matches!(error, ApiError::Json { .. }),
+            "expected a Json error, got {error:?}"
+        );
+    }
 
     #[test]
     fn request_translation_uses_openai_compatible_shape() {
