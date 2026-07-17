@@ -155,12 +155,7 @@ fn session_end_hook_runs_on_process_exit() {
     );
 }
 
-fn run_claw_one_shot(
-    workspace: &Path,
-    config_home: &Path,
-    home: &Path,
-    base_url: &str,
-) -> Output {
+fn run_claw_one_shot(workspace: &Path, config_home: &Path, home: &Path, base_url: &str) -> Output {
     let mut command = Command::new(env!("CARGO_BIN_EXE_clawcli"));
     command
         .current_dir(workspace)

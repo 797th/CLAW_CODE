@@ -1002,11 +1002,7 @@ fn build_assistant_message_with_mode(
     ))
 }
 
-fn flush_text_block(
-    text: &mut String,
-    blocks: &mut Vec<ContentBlock>,
-    caveman_compression: bool,
-) {
+fn flush_text_block(text: &mut String, blocks: &mut Vec<ContentBlock>, caveman_compression: bool) {
     if !text.is_empty() {
         blocks.push(ContentBlock::Text {
             text: if caveman_compression {
@@ -1084,10 +1080,9 @@ impl ToolExecutor for StaticToolExecutor {
 mod tests {
     use super::{
         auto_compaction_target_estimate, build_assistant_message_with_mode,
-        parse_auto_compaction_threshold,
-        ApiClient, ApiRequest, AssistantEvent, AutoCompactionEvent, ConversationRuntime,
-        PromptCacheEvent, RuntimeError, StaticToolExecutor, ToolExecutor,
-        DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD,
+        parse_auto_compaction_threshold, ApiClient, ApiRequest, AssistantEvent,
+        AutoCompactionEvent, ConversationRuntime, PromptCacheEvent, RuntimeError,
+        StaticToolExecutor, ToolExecutor, DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD,
     };
     use crate::compact::CompactionConfig;
     use crate::config::{RuntimeFeatureConfig, RuntimeHookCommand, RuntimeHookConfig};
@@ -1985,9 +1980,8 @@ mod tests {
         let events = vec![AssistantEvent::MessageStop];
 
         // when
-        let error =
-            build_assistant_message_with_mode(events, false)
-                .expect_err("assistant messages should require content");
+        let error = build_assistant_message_with_mode(events, false)
+            .expect_err("assistant messages should require content");
 
         // then
         assert!(error

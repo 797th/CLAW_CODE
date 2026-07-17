@@ -169,8 +169,7 @@ impl WorkingInputSession {
                     (Err(error), Ok(())) => Err(error),
                     (Ok(()), Err(error)) | (Err(_), Err(error)) => Err(error),
                 }
-            })
-        {
+            }) {
             Ok(join_handle) => join_handle,
             Err(error) => {
                 let _ = terminal::disable_raw_mode();
@@ -191,8 +190,7 @@ impl WorkingInputSession {
     }
 
     pub fn finish(&mut self) -> io::Result<WorkingInputResult> {
-        self.stop
-            .store(true, std::sync::atomic::Ordering::Release);
+        self.stop.store(true, std::sync::atomic::Ordering::Release);
         if let Some(join_handle) = self.join_handle.take() {
             match join_handle.join() {
                 Ok(result) => result?,
@@ -252,9 +250,21 @@ fn permission_display_for_index(index: u8) -> &'static str {
 /// red (bypass).
 fn permission_mode_color(index: u8) -> Color {
     match index % 4 {
-        1 => Color::Rgb { r: 96, g: 165, b: 250 },
-        2 => Color::Rgb { r: 52, g: 211, b: 153 },
-        3 => Color::Rgb { r: 248, g: 113, b: 113 },
+        1 => Color::Rgb {
+            r: 96,
+            g: 165,
+            b: 250,
+        },
+        2 => Color::Rgb {
+            r: 52,
+            g: 211,
+            b: 153,
+        },
+        3 => Color::Rgb {
+            r: 248,
+            g: 113,
+            b: 113,
+        },
         _ => Color::Rgb {
             r: 148,
             g: 163,
@@ -326,7 +336,10 @@ fn permission_segment_for_index(index: u8) -> String {
     if env::var_os("NO_COLOR").is_some() {
         return format!("· {label}");
     }
-    format!("{}", style(format!("· {label}")).with(permission_mode_color(index)))
+    format!(
+        "{}",
+        style(format!("· {label}")).with(permission_mode_color(index))
+    )
 }
 
 fn redraw_footer_line(footer: &str) {
@@ -338,10 +351,7 @@ fn redraw_footer_line(footer: &str) {
     let mut stdout = io::stdout();
     // Save the cursor while rustyline owns the editable input row, redraw the
     // pinned footer, then restore the cursor so the current line stays intact.
-    let _ = write!(
-        stdout,
-        "\x1b7\x1b[{rows};1H\x1b[2K{footer}\x1b8"
-    );
+    let _ = write!(stdout, "\x1b7\x1b[{rows};1H\x1b[2K{footer}\x1b8");
     let _ = stdout.flush();
 }
 
@@ -380,16 +390,12 @@ impl PermissionToggleState {
 
         let old_segment = permission_segment_for_index(current);
         let new_segment = permission_segment_for_index(next);
-        let footer = self
-            .footer
-            .lock()
-            .ok()
-            .map(|mut footer| {
-                if let Some(pos) = footer.find(&old_segment) {
-                    footer.replace_range(pos..pos + old_segment.len(), &new_segment);
-                }
-                footer.clone()
-            });
+        let footer = self.footer.lock().ok().map(|mut footer| {
+            if let Some(pos) = footer.find(&old_segment) {
+                footer.replace_range(pos..pos + old_segment.len(), &new_segment);
+            }
+            footer.clone()
+        });
         if let Some(footer) = footer {
             if let Ok(mut shared_footer) = self.footer.lock() {
                 *shared_footer = footer.clone();
@@ -922,9 +928,7 @@ fn path_completion_candidates(path_fragment: &str) -> Vec<PathCompletionCandidat
         .collect()
 }
 
-fn resolve_path_completion_context(
-    path_fragment: &str,
-) -> io::Result<(PathBuf, String, String)> {
+fn resolve_path_completion_context(path_fragment: &str) -> io::Result<(PathBuf, String, String)> {
     if path_fragment.is_empty() {
         return Ok((PathBuf::from("."), String::new(), String::new()));
     }
@@ -990,13 +994,13 @@ mod tests {
         permission_mode_for_index, permission_mode_index, prompt_cursor_column,
         slash_command_prefix, LineEditor, SlashCommandHelper,
     };
-    use std::fs;
-    use std::path::PathBuf;
-    use std::time::{SystemTime, UNIX_EPOCH};
     use rustyline::completion::Completer;
     use rustyline::highlight::Highlighter;
     use rustyline::history::{DefaultHistory, History};
     use rustyline::Context;
+    use std::fs;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn extracts_terminal_slash_command_prefixes_with_arguments() {
@@ -1089,21 +1093,9 @@ mod tests {
     fn slash_command_highlighting_refreshes_as_each_token_character_is_typed() {
         let helper = SlashCommandHelper::new(Vec::new());
 
-        assert!(helper.highlight_char(
-            "/",
-            1,
-            rustyline::highlight::CmdKind::Other
-        ));
-        assert!(helper.highlight_char(
-            "/model",
-            6,
-            rustyline::highlight::CmdKind::Other
-        ));
-        assert!(!helper.highlight_char(
-            "normal text",
-            11,
-            rustyline::highlight::CmdKind::Other
-        ));
+        assert!(helper.highlight_char("/", 1, rustyline::highlight::CmdKind::Other));
+        assert!(helper.highlight_char("/model", 6, rustyline::highlight::CmdKind::Other));
+        assert!(!helper.highlight_char("normal text", 11, rustyline::highlight::CmdKind::Other));
     }
 
     #[test]
@@ -1151,11 +1143,7 @@ mod tests {
         let footer = format!("• model {}", super::styled_permission_segment("prompt"));
         state.set_footer(footer);
         state.cycle();
-        let updated = state
-            .footer
-            .lock()
-            .expect("footer lock")
-            .clone();
+        let updated = state.footer.lock().expect("footer lock").clone();
         // After cycling, the footer carries the plan segment, not the ask one.
         assert!(updated.contains(&super::styled_permission_segment("read-only")));
         assert!(!updated.contains(&super::styled_permission_segment("prompt")));
@@ -1209,8 +1197,14 @@ mod tests {
 
         assert_eq!(start, "/export ".len());
         assert_eq!(matches.len(), 2);
-        assert_eq!(matches[0].replacement, format!("{}/nested/", temp_dir.display()));
-        assert_eq!(matches[1].replacement, format!("{}/notes.txt", temp_dir.display()));
+        assert_eq!(
+            matches[0].replacement,
+            format!("{}/nested/", temp_dir.display())
+        );
+        assert_eq!(
+            matches[1].replacement,
+            format!("{}/notes.txt", temp_dir.display())
+        );
 
         fs::remove_dir_all(&temp_dir).expect("temp dir should be removed");
     }

@@ -18,9 +18,8 @@ host platform, and hands off to the matching native backend under
     Windows        ->  powershell backends/windows.ps1 <flags>
 
 The backends own the real build/copy/PATH logic so each one stays in its OS's
-idiomatic shell and is independently runnable and debuggable. Both ``clawcli`` and
-``cliclaw`` are built and installed on every OS (same binary, two names — the
-``cliclaw`` name relaxes the working-directory guard at runtime).
+idiomatic shell and is independently runnable and debuggable. The single
+``clawcli`` binary is built and installed on every OS.
 """
 
 from __future__ import annotations
@@ -300,7 +299,7 @@ def main(argv: list[str]) -> int:
     # Steps 4-6 (build, install, verify/next-steps) run inside the native
     # backend — the backend owns the real build/copy/PATH/verify logic.
     info(
-        f"handing off to {os_family} backend — building both clawcli + cliclaw "
+        f"handing off to {os_family} backend — building clawcli "
         f"({opts.profile}); first build may take a few minutes"
     )
 

@@ -654,12 +654,7 @@ impl ConfigLoader {
                 ));
                 continue;
             }
-            warnings.extend(
-                validation
-                    .warnings
-                    .iter()
-                    .map(ToString::to_string),
-            );
+            warnings.extend(validation.warnings.iter().map(ToString::to_string));
 
             if let Err(error) = validate_optional_hooks_config(&parsed.object, &entry.path) {
                 let detail = error.to_string();
@@ -1410,7 +1405,9 @@ pub fn load_user_model_aliases_in_home(
 
 /// Extract a mutable copy of the `aliases` object from `root`, or return an
 /// empty object when absent. Non-object `aliases` values are replaced.
-fn take_aliases_object(root: &mut serde_json::Map<String, serde_json::Value>) -> serde_json::Map<String, serde_json::Value> {
+fn take_aliases_object(
+    root: &mut serde_json::Map<String, serde_json::Value>,
+) -> serde_json::Map<String, serde_json::Value> {
     match root.remove("aliases") {
         Some(serde_json::Value::Object(map)) => map,
         _ => serde_json::Map::new(),
@@ -3990,7 +3987,10 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&raw).expect("valid json");
         assert_eq!(v["model"], serde_json::json!("opus"));
         assert_eq!(v["env"]["A"], serde_json::json!("1"));
-        assert_eq!(v["aliases"]["fast"], serde_json::json!("claude-haiku-4-5-20251213"));
+        assert_eq!(
+            v["aliases"]["fast"],
+            serde_json::json!("claude-haiku-4-5-20251213")
+        );
 
         fs::remove_dir_all(root).expect("cleanup temp dir");
     }
@@ -4492,11 +4492,8 @@ mod tests {
         let home = root.join("home").join(".claw");
         fs::create_dir_all(&home).expect("home config dir");
         fs::create_dir_all(&cwd).expect("project dir");
-        fs::write(
-            cwd.join(".claw.json"),
-            r#"{"workflow_gates":"Advisory"}"#,
-        )
-        .expect("write project config");
+        fs::write(cwd.join(".claw.json"), r#"{"workflow_gates":"Advisory"}"#)
+            .expect("write project config");
 
         let loaded = ConfigLoader::new(&cwd, &home)
             .load()

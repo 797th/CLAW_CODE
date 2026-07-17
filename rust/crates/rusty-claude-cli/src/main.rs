@@ -3749,51 +3749,12 @@ fn permission_mode_from_resolved(mode: ResolvedPermissionMode) -> PermissionMode
     }
 }
 
-fn launcher_name_from_value(value: &str) -> Option<String> {
-    let trimmed = value.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    Path::new(trimmed)
-        .file_stem()
-        .and_then(|stem| stem.to_str())
-        .map(ToString::to_string)
-}
-
-fn current_launcher_name() -> Option<String> {
-    env::var("RUSTY_CLAUDE_LAUNCHER_NAME")
-        .ok()
-        .and_then(|value| launcher_name_from_value(&value))
-        .or_else(|| {
-            env::current_exe().ok().and_then(|path| {
-                path.file_stem()
-                    .and_then(|stem| stem.to_str())
-                    .map(ToString::to_string)
-            })
-        })
-}
-
-fn is_permissive_windows_launcher(name: &str) -> bool {
-    name.eq_ignore_ascii_case("cliclaw") || name.eq_ignore_ascii_case("cli797")
-}
-
 fn display_command_name() -> String {
-    match current_launcher_name().as_deref() {
-        Some(name) if name.eq_ignore_ascii_case("cliclaw") => "cliclaw".to_string(),
-        Some(name) if name.eq_ignore_ascii_case("cli797") => "cli797".to_string(),
-        Some(name) if name.eq_ignore_ascii_case("clawcli") => "clawcli".to_string(),
-        _ => "clawcli".to_string(),
-    }
+    "clawcli".to_string()
 }
 
 fn launcher_defaults() -> LauncherDefaults {
-    match current_launcher_name().as_deref() {
-        Some(name) if is_permissive_windows_launcher(name) => LauncherDefaults {
-            permission_mode_override: Some(PermissionMode::DangerFullAccess),
-            allow_broad_cwd: true,
-        },
-        _ => LauncherDefaults::default(),
-    }
+    LauncherDefaults::default()
 }
 
 fn default_permission_mode() -> PermissionMode {
@@ -16226,8 +16187,14 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
         out,
         "  {command_name} [--model MODEL] [--allowedTools TOOL[,TOOL...]]"
     )?;
-    writeln!(out, "      Start the full-screen TUI (default interactive experience)")?;
-    writeln!(out, "      Use {command_name} --repl for the line-based REPL")?;
+    writeln!(
+        out,
+        "      Start the full-screen TUI (default interactive experience)"
+    )?;
+    writeln!(
+        out,
+        "      Use {command_name} --repl for the line-based REPL"
+    )?;
     writeln!(
         out,
         "  {command_name} [--model MODEL] [--output-format text|json] prompt TEXT"
@@ -16978,7 +16945,10 @@ mod tests {
     fn tui_and_repl_launcher_flags_are_distinct() {
         assert!(super::should_launch_tui(&["--tui".to_string()]));
         assert!(!super::should_launch_tui(&["--repl".to_string()]));
-        assert!(!super::should_launch_tui(&["--tui".to_string(), "extra".to_string()]));
+        assert!(!super::should_launch_tui(&[
+            "--tui".to_string(),
+            "extra".to_string()
+        ]));
     }
 
     #[test]
@@ -17495,49 +17465,6 @@ mod tests {
     }
 
     #[test]
-    fn cliclaw_launcher_defaults_to_danger_full_access_and_broad_cwd() {
-        let _guard = env_lock();
-        std::env::set_var("RUSTY_CLAUDE_PERMISSION_MODE", "read-only");
-        std::env::set_var("RUSTY_CLAUDE_LAUNCHER_NAME", "cliclaw");
-        let parsed = parse_args(&[]).expect("args should parse");
-        std::env::remove_var("RUSTY_CLAUDE_LAUNCHER_NAME");
-        std::env::remove_var("RUSTY_CLAUDE_PERMISSION_MODE");
-
-        assert_eq!(
-            parsed,
-            CliAction::Repl {
-                model: DEFAULT_MODEL.to_string(),
-                allowed_tools: None,
-                permission_mode: PermissionMode::DangerFullAccess,
-                base_commit: None,
-                reasoning_effort: None,
-                allow_broad_cwd: true,
-            }
-        );
-    }
-
-    #[test]
-    fn cliclaw_launcher_allows_explicit_permission_override() {
-        let _guard = env_lock();
-        std::env::set_var("RUSTY_CLAUDE_LAUNCHER_NAME", "cliclaw.exe");
-        let args = vec!["--permission-mode=read-only".to_string()];
-        let parsed = parse_args(&args).expect("args should parse");
-        std::env::remove_var("RUSTY_CLAUDE_LAUNCHER_NAME");
-
-        assert_eq!(
-            parsed,
-            CliAction::Repl {
-                model: DEFAULT_MODEL.to_string(),
-                allowed_tools: None,
-                permission_mode: PermissionMode::ReadOnly,
-                base_commit: None,
-                reasoning_effort: None,
-                allow_broad_cwd: true,
-            }
-        );
-    }
-
-    #[test]
     fn parses_allowed_tools_flags_with_aliases_and_lists() {
         let _guard = env_lock();
         std::env::remove_var("RUSTY_CLAUDE_PERMISSION_MODE");
@@ -17560,28 +17487,6 @@ mod tests {
                 base_commit: None,
                 reasoning_effort: None,
                 allow_broad_cwd: false,
-            }
-        );
-    }
-
-    #[test]
-    fn legacy_cli797_launcher_still_uses_permissive_defaults() {
-        let _guard = env_lock();
-        std::env::set_var("RUSTY_CLAUDE_PERMISSION_MODE", "read-only");
-        std::env::set_var("RUSTY_CLAUDE_LAUNCHER_NAME", "cli797");
-        let parsed = parse_args(&[]).expect("args should parse");
-        std::env::remove_var("RUSTY_CLAUDE_LAUNCHER_NAME");
-        std::env::remove_var("RUSTY_CLAUDE_PERMISSION_MODE");
-
-        assert_eq!(
-            parsed,
-            CliAction::Repl {
-                model: DEFAULT_MODEL.to_string(),
-                allowed_tools: None,
-                permission_mode: PermissionMode::DangerFullAccess,
-                base_commit: None,
-                reasoning_effort: None,
-                allow_broad_cwd: true,
             }
         );
     }
@@ -20278,21 +20183,6 @@ mod tests {
     }
 
     #[test]
-    fn cliclaw_help_uses_launcher_name() {
-        let _guard = env_lock();
-        std::env::set_var("RUSTY_CLAUDE_LAUNCHER_NAME", "cliclaw");
-        let mut help = Vec::new();
-        print_help_to(&mut help).expect("help should render");
-        std::env::remove_var("RUSTY_CLAUDE_LAUNCHER_NAME");
-
-        let help = String::from_utf8(help).expect("help should be utf8");
-        assert!(help.contains("cliclaw v"));
-        assert!(help.contains("cliclaw help"));
-        assert!(help.contains("cliclaw doctor"));
-        assert!(help.contains("cliclaw --model gpt-oss"));
-    }
-
-    #[test]
     fn model_report_uses_sectioned_layout() {
         let report = format_model_report("claude-sonnet", 12, 4);
         assert!(report.contains("Model"));
@@ -21448,17 +21338,22 @@ UU conflicted.rs",
 
     #[test]
     fn caveman_conversion_keeps_signed_thinking_verbatim() {
-        let messages = vec![ConversationMessage::assistant(vec![ContentBlock::Thinking {
-            thinking: "Please preserve this signed provider trace exactly.".to_string(),
-            signature: Some("sig".to_string()),
-        }])];
+        let messages = vec![ConversationMessage::assistant(vec![
+            ContentBlock::Thinking {
+                thinking: "Please preserve this signed provider trace exactly.".to_string(),
+                signature: Some("sig".to_string()),
+            },
+        ])];
 
         let converted = super::convert_messages_with_mode(&messages, true);
         let thinking = match &converted[0].content[0] {
             InputContentBlock::Thinking { thinking, .. } => thinking,
             other => panic!("expected thinking block, got {other:?}"),
         };
-        assert_eq!(thinking, "Please preserve this signed provider trace exactly.");
+        assert_eq!(
+            thinking,
+            "Please preserve this signed provider trace exactly."
+        );
     }
 
     #[test]

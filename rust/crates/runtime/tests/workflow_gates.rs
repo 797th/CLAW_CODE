@@ -55,7 +55,9 @@ fn spec_to_implement_blocked_without_acceptance_criteria() {
 #[test]
 fn spec_to_implement_passes_with_acceptance_criteria() {
     let mut state = started_state();
-    state.acceptance_criteria.push("returns 200 on success".to_string());
+    state
+        .acceptance_criteria
+        .push("returns 200 on success".to_string());
 
     let check = state.try_advance();
     assert!(matches!(check, GateCheck::Pass));
@@ -88,7 +90,9 @@ fn spec_to_implement_passes_with_one_real_ac_among_empties() {
     let mut state = started_state();
     state.acceptance_criteria.push(String::new());
     state.acceptance_criteria.push("   ".to_string());
-    state.acceptance_criteria.push("returns 200 on success".to_string());
+    state
+        .acceptance_criteria
+        .push("returns 200 on success".to_string());
 
     let check = state.try_advance();
     assert!(matches!(check, GateCheck::Pass));
@@ -345,10 +349,14 @@ fn write_runtime(
 #[test]
 fn enforced_mode_blocks_write_in_spec_phase() {
     let mut runtime = write_runtime(spec_session(), WorkflowGateMode::Enforced);
-    let summary = runtime.run_turn("edit the file", None).expect("turn resolves");
+    let summary = runtime
+        .run_turn("edit the file", None)
+        .expect("turn resolves");
 
     assert_eq!(summary.tool_results.len(), 1);
-    let ContentBlock::ToolResult { is_error, output, .. } = &summary.tool_results[0].blocks[0]
+    let ContentBlock::ToolResult {
+        is_error, output, ..
+    } = &summary.tool_results[0].blocks[0]
     else {
         panic!("expected tool result");
     };
@@ -371,10 +379,14 @@ fn enforced_mode_blocks_write_in_spec_phase() {
 #[test]
 fn advisory_mode_allows_write_but_injects_context_and_warning() {
     let mut runtime = write_runtime(spec_session(), WorkflowGateMode::Advisory);
-    let summary = runtime.run_turn("edit the file", None).expect("turn resolves");
+    let summary = runtime
+        .run_turn("edit the file", None)
+        .expect("turn resolves");
 
     assert_eq!(summary.tool_results.len(), 1);
-    let ContentBlock::ToolResult { is_error, output, .. } = &summary.tool_results[0].blocks[0]
+    let ContentBlock::ToolResult {
+        is_error, output, ..
+    } = &summary.tool_results[0].blocks[0]
     else {
         panic!("expected tool result");
     };
@@ -403,9 +415,13 @@ fn advisory_mode_allows_write_but_injects_context_and_warning() {
 #[test]
 fn off_mode_leaves_write_untouched() {
     let mut runtime = write_runtime(spec_session(), WorkflowGateMode::Off);
-    let summary = runtime.run_turn("edit the file", None).expect("turn resolves");
+    let summary = runtime
+        .run_turn("edit the file", None)
+        .expect("turn resolves");
 
-    let ContentBlock::ToolResult { is_error, output, .. } = &summary.tool_results[0].blocks[0]
+    let ContentBlock::ToolResult {
+        is_error, output, ..
+    } = &summary.tool_results[0].blocks[0]
     else {
         panic!("expected tool result");
     };
@@ -419,7 +435,9 @@ fn off_mode_leaves_write_untouched() {
 fn no_workflow_session_is_untouched_even_when_enforced() {
     // Session has no workflow at all.
     let mut runtime = write_runtime(Session::new(), WorkflowGateMode::Enforced);
-    let summary = runtime.run_turn("edit the file", None).expect("turn resolves");
+    let summary = runtime
+        .run_turn("edit the file", None)
+        .expect("turn resolves");
 
     let ContentBlock::ToolResult { is_error, .. } = &summary.tool_results[0].blocks[0] else {
         panic!("expected tool result");
@@ -439,7 +457,9 @@ fn enforced_stop_gate_reprompts_in_verify_without_evidence() {
         &features(WorkflowGateMode::Enforced),
     );
 
-    let summary = runtime.run_turn("finish up", None).expect("capped stop loop resolves");
+    let summary = runtime
+        .run_turn("finish up", None)
+        .expect("capped stop loop resolves");
 
     // Re-prompted up to the 3-strike cap, then forced to stop: 4 iterations.
     assert_eq!(summary.iterations, 4);
@@ -449,10 +469,12 @@ fn enforced_stop_gate_reprompts_in_verify_without_evidence() {
         .iter()
         .filter(|message| {
             message.role == MessageRole::User
-                && message.blocks.iter().any(|block| matches!(
-                    block,
-                    ContentBlock::Text { text } if text.contains("QAS gate")
-                ))
+                && message.blocks.iter().any(|block| {
+                    matches!(
+                        block,
+                        ContentBlock::Text { text } if text.contains("QAS gate")
+                    )
+                })
         })
         .count();
     assert_eq!(reprompts, 3, "QAS gate should re-prompt exactly 3 times");
@@ -475,7 +497,10 @@ fn enforced_stop_gate_allows_stop_with_test_run_evidence() {
 
     let summary = runtime.run_turn("finish up", None).expect("turn resolves");
 
-    assert_eq!(summary.iterations, 1, "evidence present -> stop allowed immediately");
+    assert_eq!(
+        summary.iterations, 1,
+        "evidence present -> stop allowed immediately"
+    );
     assert!(summary.gate_events.is_empty());
     let _ = GateCheck::Pass; // keep GateCheck import exercised
 }

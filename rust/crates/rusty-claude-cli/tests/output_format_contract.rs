@@ -783,10 +783,7 @@ fn status_json_accepts_namespaced_model_env_and_surfaces_alias_426() {
     assert_eq!(parsed["model"], "claude-opus-4-6");
     assert_eq!(parsed["model_source"], "env");
     assert_eq!(parsed["model_raw"], "opus");
-    assert_eq!(
-        parsed["model_alias_resolved_to"],
-        "claude-opus-4-6"
-    );
+    assert_eq!(parsed["model_alias_resolved_to"], "claude-opus-4-6");
     assert_eq!(parsed["model_env_var"], "CLAW_MODEL");
 }
 
@@ -2815,7 +2812,7 @@ fn diff_json_changed_file_count_deduplication_733() {
         .expect("git commit");
 
     // Clean state: changed_file_count must be 0
-    let bin = env!("CARGO_BIN_EXE_claw");
+    let bin = env!("CARGO_BIN_EXE_clawcli");
     let clean = Command::new(bin)
         .current_dir(&root)
         .args(["--output-format", "json", "diff"])
@@ -2866,7 +2863,7 @@ fn prompt_no_arg_json_error_kind_750() {
     use std::process::Command;
     let root = unique_temp_dir("prompt-no-arg");
     fs::create_dir_all(&root).expect("temp dir");
-    let bin = env!("CARGO_BIN_EXE_claw");
+    let bin = env!("CARGO_BIN_EXE_clawcli");
 
     let output = Command::new(bin)
         .current_dir(&root)
@@ -2915,7 +2912,7 @@ fn prompt_empty_arg_json_stdout_missing_prompt_823() {
     use std::process::Command;
     let root = unique_temp_dir("prompt-empty-arg-823");
     fs::create_dir_all(&root).expect("temp dir");
-    let bin = env!("CARGO_BIN_EXE_claw");
+    let bin = env!("CARGO_BIN_EXE_clawcli");
 
     let output = Command::new(bin)
         .current_dir(&root)
@@ -2959,7 +2956,7 @@ fn flag_value_errors_have_error_kind_and_hint_756() {
     use std::process::Command;
     let root = unique_temp_dir("flag-value-errors");
     fs::create_dir_all(&root).expect("temp dir");
-    let bin = env!("CARGO_BIN_EXE_claw");
+    let bin = env!("CARGO_BIN_EXE_clawcli");
 
     // Case 1: --reasoning-effort with invalid value
     let out = Command::new(bin)
@@ -3209,7 +3206,7 @@ fn short_p_flag_swallows_no_flags_755() {
     use std::process::Command;
     let root = unique_temp_dir("short-p-flags");
     fs::create_dir_all(&root).expect("temp dir");
-    let bin = env!("CARGO_BIN_EXE_claw");
+    let bin = env!("CARGO_BIN_EXE_clawcli");
 
     // -p hello --output-format json: with no credentials, should fail with
     // missing_credentials (not missing_prompt), proving --output-format json was parsed.
@@ -3270,7 +3267,7 @@ fn short_p_flag_no_arg_json_error_kind_753() {
     use std::process::Command;
     let root = unique_temp_dir("short-p-no-arg");
     fs::create_dir_all(&root).expect("temp dir");
-    let bin = env!("CARGO_BIN_EXE_claw");
+    let bin = env!("CARGO_BIN_EXE_clawcli");
 
     let output = Command::new(bin)
         .current_dir(&root)
@@ -3316,7 +3313,7 @@ fn bare_slash_command_hint_745() {
     use std::process::Command;
     let root = unique_temp_dir("bare-slash-hint");
     fs::create_dir_all(&root).expect("temp dir");
-    let bin = env!("CARGO_BIN_EXE_claw");
+    let bin = env!("CARGO_BIN_EXE_clawcli");
 
     // issue and pr are non-resume-supported; commit is resume-supported.
     // All must emit non-null hint in their interactive_only error envelope.
@@ -3365,7 +3362,7 @@ fn config_unsupported_section_json_hint_741() {
     use std::process::Command;
     let root = unique_temp_dir("config-unsupported-section");
     fs::create_dir_all(&root).expect("temp dir");
-    let bin = env!("CARGO_BIN_EXE_claw");
+    let bin = env!("CARGO_BIN_EXE_clawcli");
 
     for section in &["list", "show", "bogus"] {
         let output = Command::new(bin)
@@ -3411,7 +3408,7 @@ fn config_help_returns_structured_section_list_344() {
     use std::process::Command;
     let root = unique_temp_dir("config-help");
     fs::create_dir_all(&root).expect("temp dir");
-    let bin = env!("CARGO_BIN_EXE_claw");
+    let bin = env!("CARGO_BIN_EXE_clawcli");
     let output = Command::new(bin)
         .current_dir(&root)
         .args(["--output-format", "json", "config", "help"])
@@ -3445,7 +3442,7 @@ fn export_json_has_kind_702() {
 
     // Run without asserting exit code — may fail with no sessions or legacy sessions.
     use std::process::Command;
-    let bin = env!("CARGO_BIN_EXE_claw");
+    let bin = env!("CARGO_BIN_EXE_clawcli");
     let output = Command::new(bin)
         .current_dir(&root)
         .args(["--output-format", "json", "export"])
@@ -5742,8 +5739,7 @@ fn model_add_persists_alias_via_resume() {
     let settings_json: Value =
         serde_json::from_str(&settings).expect("settings should be valid json");
     assert_eq!(
-        settings_json["aliases"]["mini"],
-        "openai/gpt-4.1-mini",
+        settings_json["aliases"]["mini"], "openai/gpt-4.1-mini",
         "alias should persist: {settings_json}"
     );
 
@@ -5768,10 +5764,16 @@ fn model_add_persists_alias_via_resume() {
         String::from_utf8_lossy(&remove_output.stderr),
     );
     let remove_stdout = String::from_utf8_lossy(&remove_output.stdout);
-    let remove_json: Value = serde_json::from_str(remove_stdout.trim())
-        .expect("/model remove must emit JSON");
-    assert_eq!(remove_json["action"], "remove", "/model remove action: {remove_json}");
-    assert_eq!(remove_json["removed"], true, "/model remove removed: {remove_json}");
+    let remove_json: Value =
+        serde_json::from_str(remove_stdout.trim()).expect("/model remove must emit JSON");
+    assert_eq!(
+        remove_json["action"], "remove",
+        "/model remove action: {remove_json}"
+    );
+    assert_eq!(
+        remove_json["removed"], true,
+        "/model remove removed: {remove_json}"
+    );
 
     let after =
         fs::read_to_string(config_home.join("settings.json")).expect("settings should still exist");

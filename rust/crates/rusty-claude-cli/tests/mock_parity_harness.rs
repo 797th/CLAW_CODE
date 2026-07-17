@@ -480,7 +480,7 @@ fn prepare_plugin_fixture(workspace: &HarnessWorkspace) {
 fn assert_streaming_text(_: &HarnessWorkspace, run: &ScenarioRun) {
     assert_eq!(
         run.response["message"],
-        Value::String("Mock streaming says hello from the parity harness.".to_string())
+        Value::String("Mock streaming says hello from parity harness.".to_string())
     );
     assert_eq!(run.response["iterations"], Value::from(1));
     assert_eq!(run.response["tool_uses"], Value::Array(Vec::new()));

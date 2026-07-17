@@ -4,7 +4,7 @@
 # Invoked by install/install.py. Also runnable standalone:
 #   bash install/backends/macos.sh --release
 #
-# Builds both `clawcli` and `cliclaw` from rust/, copies them into a bin directory,
+# Builds `clawcli` from rust/, copies it into a bin directory,
 # adds that directory to the user PATH (idempotently), and runs a smoke test.
 set -euo pipefail
 
@@ -88,23 +88,27 @@ info "running: cargo ${CARGO_FLAGS[*]}"
     CARGO_TERM_COLOR="${CARGO_TERM_COLOR:-always}" cargo "${CARGO_FLAGS[@]}"
 )
 
-for BIN_NAME in clawcli cliclaw; do
-    BIN_PATH="${TARGET_DIR}/${BIN_NAME}"
-    if [ ! -x "${BIN_PATH}" ]; then
-        error "Expected binary not found: ${BIN_PATH}"
-        exit 1
-    fi
-    ok "built ${BIN_PATH}"
-done
+BIN_PATH="${TARGET_DIR}/clawcli"
+if [ ! -x "${BIN_PATH}" ]; then
+    error "Expected binary not found: ${BIN_PATH}"
+    exit 1
+fi
+ok "built ${BIN_PATH}"
 
 # ---------------------------------------------------------------------------
-# Install (copy both binaries)
+# Install
 # ---------------------------------------------------------------------------
 
 mkdir -p "${INSTALL_DIR}"
-for BIN_NAME in clawcli cliclaw; do
-    install -m 0755 "${TARGET_DIR}/${BIN_NAME}" "${INSTALL_DIR}/${BIN_NAME}"
-    ok "installed ${INSTALL_DIR}/${BIN_NAME}"
+install -m 0755 "${TARGET_DIR}/clawcli" "${INSTALL_DIR}/clawcli"
+ok "installed ${INSTALL_DIR}/clawcli"
+
+for LEGACY_BIN in claw cliclaw; do
+    if [ -e "${INSTALL_DIR}/${LEGACY_BIN}" ] || [ -L "${INSTALL_DIR}/${LEGACY_BIN}" ]; then
+        rm -f "${INSTALL_DIR}/${LEGACY_BIN}"
+        ok "removed legacy ${INSTALL_DIR}/${LEGACY_BIN}"
+    fi
+    rm -f "${TARGET_DIR}/${LEGACY_BIN}"
 done
 
 # ---------------------------------------------------------------------------
@@ -159,14 +163,12 @@ cat <<EOF
 
 ${C_GREEN}Claw Code is built and installed.${C_RESET}
 
-  Binaries:  ${C_BOLD}${INSTALL_DIR}/clawcli${C_RESET}  and  ${C_BOLD}${INSTALL_DIR}/cliclaw${C_RESET}
+  Binary:    ${C_BOLD}${INSTALL_DIR}/clawcli${C_RESET}
   Profile:   ${PROFILE}
 
   ${C_DIM}# clawcli — the standard CLI${C_RESET}
   clawcli prompt "summarize this repository"
 
-  ${C_DIM}# cliclaw — same binary, relaxes the working-directory guard${C_RESET}
-  cliclaw prompt "review this repository"
 EOF
 
 if [ -n "${UPDATED_RC}" ]; then

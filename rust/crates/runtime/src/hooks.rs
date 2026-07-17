@@ -549,8 +549,9 @@ impl HookRunner {
                         }
                     }
                     Some(2) => HookCommandOutcome::Deny {
-                        parsed: parsed
-                            .with_fallback_message(deny_fallback_message(event, tool_name, &stderr)),
+                        parsed: parsed.with_fallback_message(deny_fallback_message(
+                            event, tool_name, &stderr,
+                        )),
                     },
                     // Any other exit code (or a signal-terminated process,
                     // below) is a non-blocking failure *unless* the hook's
@@ -663,7 +664,9 @@ impl HookOutcome {
 pub enum HookDecision {
     #[default]
     Allow,
-    Block { reason: String },
+    Block {
+        reason: String,
+    },
 }
 
 /// Runs a single hook `command` for `event`, sending `payload` (with
@@ -758,14 +761,12 @@ fn classify_hook_exit(stdout: &str, stderr: &str, code: Option<i32>) -> HookOutc
     }
 
     let (decision, warning) = exit_code_decision(code, stderr);
-    let additional_context = if matches!(decision, HookDecision::Allow)
-        && warning.is_none()
-        && !stdout.is_empty()
-    {
-        Some(stdout.to_string())
-    } else {
-        None
-    };
+    let additional_context =
+        if matches!(decision, HookDecision::Allow) && warning.is_none() && !stdout.is_empty() {
+            Some(stdout.to_string())
+        } else {
+            None
+        };
     HookOutcome {
         decision,
         additional_context,
@@ -1241,14 +1242,8 @@ mod tests {
 
         assert!(result.is_denied());
         assert!(!result.is_failed());
-        assert_eq!(
-            result.permission_override(),
-            Some(PermissionOverride::Deny)
-        );
-        assert!(result
-            .messages()
-            .iter()
-            .any(|message| message == "custom"));
+        assert_eq!(result.permission_override(), Some(PermissionOverride::Deny));
+        assert!(result.messages().iter().any(|message| message == "custom"));
     }
 
     #[test]
@@ -1508,7 +1503,9 @@ mod tests {
             HookEvent::PreToolUse,
             &json!({"tool_name":"Bash"}),
         );
-        assert!(matches!(out.decision, HookDecision::Block { ref reason } if reason.contains("nope")));
+        assert!(
+            matches!(out.decision, HookDecision::Block { ref reason } if reason.contains("nope"))
+        );
     }
 
     #[cfg(unix)]
@@ -1542,7 +1539,9 @@ mod tests {
             HookEvent::Stop,
             &json!({}),
         );
-        assert!(matches!(out.decision, HookDecision::Block { ref reason } if reason == "missing AC"));
+        assert!(
+            matches!(out.decision, HookDecision::Block { ref reason } if reason == "missing AC")
+        );
     }
 
     #[cfg(unix)]

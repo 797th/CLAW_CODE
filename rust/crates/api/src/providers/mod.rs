@@ -49,9 +49,7 @@ pub fn configured_provider_kind() -> Option<ProviderKind> {
         .filter(|value| !value.trim().is_empty())
         .or_else(|| dotenv_value("CLAW_ENDPOINT_TYPE"))?;
     match value.trim().to_ascii_lowercase().as_str() {
-        "openai" | "openai-compatible" | "openai_custom_endpoint" => {
-            Some(ProviderKind::OpenAi)
-        }
+        "openai" | "openai-compatible" | "openai_custom_endpoint" => Some(ProviderKind::OpenAi),
         "anthropic" | "anthropic-compatible" => Some(ProviderKind::Anthropic),
         _ => None,
     }

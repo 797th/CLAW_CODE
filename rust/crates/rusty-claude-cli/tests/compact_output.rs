@@ -478,7 +478,7 @@ fn run_claw_with_stdin(
     args: &[&str],
     stdin: &str,
 ) -> Output {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_claw"))
+    let mut child = Command::new(env!("CARGO_BIN_EXE_clawcli"))
         .current_dir(cwd)
         .env_clear()
         .env("ANTHROPIC_API_KEY", "test-compact-key")
@@ -510,7 +510,7 @@ fn run_claw_closed_stdin_with_timeout(
     args: &[&str],
     timeout: Duration,
 ) -> Output {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_claw"))
+    let mut child = Command::new(env!("CARGO_BIN_EXE_clawcli"))
         .current_dir(cwd)
         .env_clear()
         .env("CLAW_CONFIG_HOME", config_home)

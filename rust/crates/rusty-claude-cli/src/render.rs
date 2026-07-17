@@ -1,5 +1,5 @@
-use std::fmt::Write as FmtWrite;
 use std::env;
+use std::fmt::Write as FmtWrite;
 use std::io::{self, Write};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread::{self, JoinHandle};
@@ -326,11 +326,7 @@ fn animate_spinner(
                 )?;
             }
             let cursor_column = if let Some(working_input) = working_input.as_ref() {
-                if let Some(snapshot) = working_input
-                    .lock()
-                    .ok()
-                    .map(|state| state.snapshot())
-                {
+                if let Some(snapshot) = working_input.lock().ok().map(|state| state.snapshot()) {
                     queue!(
                         stdout,
                         MoveTo(0, input_row),
@@ -344,11 +340,7 @@ fn animate_spinner(
             } else {
                 composer_column.unwrap_or_default()
             };
-            queue!(
-                stdout,
-                MoveTo(cursor_column, input_row),
-                Show
-            )?;
+            queue!(stdout, MoveTo(cursor_column, input_row), Show)?;
             stdout.flush()?;
         } else {
             spinner.tick_elapsed(&label, started_at.elapsed(), &theme, &mut stdout)?;
@@ -1458,8 +1450,10 @@ mod tests {
             .expect("tick should queue successfully");
         assert_eq!(out.flushes, 0);
 
-        out.write_all(b"\x1b8").expect("cursor restore should write");
-        out.flush().expect("frame should flush after cursor restore");
+        out.write_all(b"\x1b8")
+            .expect("cursor restore should write");
+        out.flush()
+            .expect("frame should flush after cursor restore");
         assert_eq!(out.flushes, 1);
     }
 }

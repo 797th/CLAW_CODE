@@ -35,7 +35,7 @@ python3 install/install.py            # debug build (default)
 python3 install/install.py --release  # optimized build
 ```
 
-This works identically on macOS, Linux, and Windows. It builds both `clawcli` and `cliclaw`, copies them into a bin directory (`$CARGO_HOME/bin`, `~/.cargo/bin`, or `~/.local/bin` on Unix; the equivalent on Windows), and adds that directory to your PATH. Open a new terminal afterward so the PATH change takes effect. Prerequisites: Python 3 and a Rust toolchain (`cargo` + `rustc`) on PATH. See `README.md` for details and the `--install-dir` / `--no-path-update` flags.
+This works identically on macOS, Linux, and Windows. It builds the single `clawcli` binary, copies it into a bin directory (`$CARGO_HOME/bin`, `~/.cargo/bin`, or `~/.local/bin` on Unix; the equivalent on Windows), and adds that directory to your PATH. Open a new terminal afterward so the PATH change takes effect. Prerequisites: Python 3 and a Rust toolchain (`cargo` + `rustc`) on PATH. See `README.md` for details and the `--install-dir` / `--no-path-update` flags.
 
 ### Manual build
 
@@ -64,18 +64,18 @@ export OPENAI_API_KEY="..."
 The default model fallback remains `openai/gpt-oss-120b`; set `OPENAI_MODEL` or
 the `model` setting when your endpoint exposes a different model.
 
-The installer builds **both** `clawcli` and `cliclaw` on every OS. On Windows these are `clawcli.exe` and `cliclaw.exe`. They share one `main.rs`; the filename changes behavior at runtime — when launched as `cliclaw`, the CLI keeps the directory you launched from as the active workspace, defaults to `danger-full-access`, and allows broad-CWD runs.
+The installer builds the single `clawcli` executable on every OS. On Windows it is
+`clawcli.exe`.
 
-## Global launcher (`cliclaw`)
+## Global command
 
-If you want a Claude Code-style global command from any terminal window, the installer already provides it:
+The installer puts `clawcli` in a user-level bin directory and adds that directory
+to your PATH when needed:
 
 ```bash
-python3 install/install.py        # builds + installs both clawcli and cliclaw
-cliclaw                           # now available from any directory, any OS
+python3 install/install.py        # builds + installs clawcli
+clawcli                           # now available from any directory, any OS
 ```
-
-The installer copies `cliclaw` into a user-level bin directory and adds that directory to your PATH when needed. After installation, running `cliclaw` from `C:\some\project` (Windows) or any folder (macOS/Linux) starts the CLI right there.
 
 ## Quick start
 
@@ -146,7 +146,7 @@ cd rust
 Pipe prompt text through stdin when automation already produces the prompt body:
 
 ```bash
-printf 'summarize this repository\n' | ./target/debug/claw prompt --output-format json
+printf 'summarize this repository\n' | ./target/debug/clawcli prompt --output-format json
 ```
 
 ### Shorthand prompt mode
@@ -159,7 +159,7 @@ cd rust
 Use the POSIX `--` end-of-flags separator when the shorthand prompt itself begins with `-` or `--`:
 
 ```bash
-./target/debug/claw -- "-summarize this dash-prefixed text"
+./target/debug/clawcli -- "-summarize this dash-prefixed text"
 ```
 
 ### JSON output for scripting
@@ -258,18 +258,9 @@ cd rust
 ./target/debug/clawcli --allowedTools read,glob "inspect the runtime crate"
 ```
 
-`cliclaw` bakes in the broad/full-access defaults already, so launching through `cliclaw` (any OS) behaves like:
-
-```bash
-cliclaw
-cliclaw prompt "review this repository"
-```
-
-Older `cli797` binaries still map to the same permissive launcher defaults for compatibility.
-
 Supported permission modes:
 
-`--allowedTools` accepts canonical snake_case tool names (for example `read_file`, `glob_search`, `web_fetch`) plus documented aliases such as `read`, `glob`, `Read`, and `WebFetch`. `claw status --output-format json` exposes `allowed_tools.available` and `allowed_tools.aliases`, and invalid values return typed `invalid_tool_name` JSON with `tool_name`, `available`, and `tool_aliases`. A missing value before a subcommand or another flag returns `missing_argument` with `argument:"--allowedTools"`.
+`--allowedTools` accepts canonical snake_case tool names (for example `read_file`, `glob_search`, `web_fetch`) plus documented aliases such as `read`, `glob`, `Read`, and `WebFetch`. `clawcli status --output-format json` exposes `allowed_tools.available` and `allowed_tools.aliases`, and invalid values return typed `invalid_tool_name` JSON with `tool_name`, `available`, and `tool_aliases`. A missing value before a subcommand or another flag returns `missing_argument` with `argument:"--allowedTools"`.
 
 `--output-format` accepts `text` or `json` case-insensitively and normalizes to the canonical lowercase modes. `CLAW_OUTPUT_FORMAT=json` sets the default output format for scripts, while an explicit `--output-format` flag takes precedence. Repeating the flag emits a stderr warning and JSON status envelopes expose `format_source`, `format_raw`, and `format_overridden` so composed flag arrays are auditable; invalid values return typed `invalid_output_format` JSON with `value` and `expected:["text","json"]`.
 
@@ -341,18 +332,18 @@ The same provider rules work in PowerShell. Use placeholder values in docs and t
 $env:ANTHROPIC_API_KEY = "sk-ant-REPLACE_ME"
 Remove-Item Env:\OPENAI_BASE_URL -ErrorAction SilentlyContinue
 Remove-Item Env:\OPENAI_API_KEY -ErrorAction SilentlyContinue
-.\target\debug\claw.exe --model "sonnet" prompt "reply with ready"
+.\target\debug\clawcli.exe --model "sonnet" prompt "reply with ready"
 
 # OpenAI-compatible gateway / OpenRouter
 Remove-Item Env:\ANTHROPIC_API_KEY -ErrorAction SilentlyContinue
 $env:OPENAI_BASE_URL = "https://openrouter.ai/api/v1"
 $env:OPENAI_API_KEY = "sk-or-v1-REPLACE_ME"
-.\target\debug\claw.exe --model "openai/gpt-4.1-mini" prompt "reply with ready"
+.\target\debug\clawcli.exe --model "openai/gpt-4.1-mini" prompt "reply with ready"
 
 # Local OpenAI-compatible server
 $env:OPENAI_BASE_URL = "http://127.0.0.1:11434/v1"
 Remove-Item Env:\OPENAI_API_KEY -ErrorAction SilentlyContinue
-.\target\debug\claw.exe --model "llama3.2" prompt "reply with ready"
+.\target\debug\clawcli.exe --model "llama3.2" prompt "reply with ready"
 ```
 
 See the full [Windows install and release quickstart](./docs/windows-install-release.md) for release artifact setup, persistent `setx` usage, and WSL notes.
@@ -414,7 +405,7 @@ For Ollama tags with punctuation (for example `qwen2.5-coder:7b`), both approach
 export OLLAMA_HOST="http://127.0.0.1:11434"
 
 cd rust
-./target/debug/claw --model "qwen2.5-coder:7b" prompt "reply with ready"
+./target/debug/clawcli --model "qwen2.5-coder:7b" prompt "reply with ready"
 ```
 
 If the local server exposes a slash-containing model ID, prefix it with `local/` so Claw selects the OpenAI-compatible transport while sending the remainder verbatim on the wire: `--model "local/Qwen/Qwen3.6-27B-FP8"`.
@@ -504,7 +495,7 @@ You can add custom aliases in any settings file (`~/.claw/settings.json`, `.claw
 
 Local project settings override user-level settings. Aliases resolve through the built-in table, so `"fast": "haiku"` also works.
 
-Model selection precedence is CLI flag, environment, config, then default. The environment model slot accepts `CLAW_MODEL`, `ANTHROPIC_MODEL`, and `ANTHROPIC_DEFAULT_MODEL` in that order; aliases from those variables are resolved and validated before provider startup. `claw --output-format json status` exposes `model_raw`, `model_alias_resolved_to`, and `model_env_var` so automation can see the winning value.
+Model selection precedence is CLI flag, environment, config, then default. The environment model slot accepts `CLAW_MODEL`, `ANTHROPIC_MODEL`, and `ANTHROPIC_DEFAULT_MODEL` in that order; aliases from those variables are resolved and validated before provider startup. `clawcli --output-format json status` exposes `model_raw`, `model_alias_resolved_to`, and `model_env_var` so automation can see the winning value.
 
 ### How provider detection works
 
@@ -577,7 +568,7 @@ let client = build_http_client_with(&config).expect("proxy client");
 
 ## Skills
 
-Use `/skills list` in the interactive REPL or `claw skills --output-format json` from the direct CLI to inspect installed skills. For offline/local installs, install the directory that contains `SKILL.md`, then verify the discovered name before invoking it. `skills install`, `skills uninstall`, and `agents create` are local filesystem lifecycle commands; they do not require provider credentials.
+Use `/skills list` in the interactive REPL or `clawcli skills --output-format json` from the direct CLI to inspect installed skills. For offline/local installs, install the directory that contains `SKILL.md`, then verify the discovered name before invoking it. `skills install`, `skills uninstall`, and `agents create` are local filesystem lifecycle commands; they do not require provider credentials.
 
 ```text
 /skills install /absolute/path/to/my-skill
@@ -586,7 +577,7 @@ Use `/skills list` in the interactive REPL or `claw skills --output-format json`
 /skills my-skill
 ```
 
-If install succeeds but invocation fails with a provider HTTP error, treat provider setup separately: run `claw doctor` and a one-shot prompt smoke test before reinstalling the skill. See [`docs/local-openai-compatible-providers.md`](./docs/local-openai-compatible-providers.md#local-skills-install-from-disk) for the full checklist.
+If install succeeds but invocation fails with a provider HTTP error, treat provider setup separately: run `clawcli doctor` and a one-shot prompt smoke test before reinstalling the skill. See [`docs/local-openai-compatible-providers.md`](./docs/local-openai-compatible-providers.md#local-skills-install-from-disk) for the full checklist.
 
 ## Learned skills (Skill Weaver)
 
@@ -651,7 +642,7 @@ cd rust
 
 ## Install an external skill
 
-`claw skills install <path>` accepts a local skill directory that contains
+`clawcli skills install <path>` accepts a local skill directory that contains
 `SKILL.md` or a standalone markdown file. This is useful when a companion
 repository ships a skill prompt that should be available through `/skills`.
 
@@ -661,9 +652,9 @@ For example, install TweetClaw as an X/Twitter automation skill:
 # From a parent directory that contains claw-code
 git clone https://github.com/Xquik-dev/tweetclaw
 cd claw-code/rust
-./target/debug/claw skills install ../../tweetclaw/skills/tweetclaw
-./target/debug/claw skills show tweetclaw
-./target/debug/claw skills uninstall tweetclaw
+./target/debug/clawcli skills install ../../tweetclaw/skills/tweetclaw
+./target/debug/clawcli skills show tweetclaw
+./target/debug/clawcli skills uninstall tweetclaw
 ```
 
 TweetClaw gives `claw` users a local skill guide for OpenClaw/Xquik workflows
@@ -673,11 +664,11 @@ avoid pasting API keys into chat.
 
 ## Author a local agent
 
-`claw agents create <name>` scaffolds a local `.claw/agents/<name>.toml` file for the current workspace. The scaffold is intentionally small so you can edit the description, model, and reasoning effort before listing or invoking agents:
+`clawcli agents create <name>` scaffolds a local `.claw/agents/<name>.toml` file for the current workspace. The scaffold is intentionally small so you can edit the description, model, and reasoning effort before listing or invoking agents:
 
 ```bash
-./target/debug/claw agents create release-checker
-./target/debug/claw agents list
+./target/debug/clawcli agents create release-checker
+./target/debug/clawcli agents list
 ```
 
 ## Session management
@@ -702,11 +693,11 @@ Runtime config is loaded in this order, with later entries overriding earlier on
 4. `<repo>/.claw/settings.json`
 5. `<repo>/.claw/settings.local.json`
 
-The list is also the precedence chain: project-local settings override project settings, project settings override the legacy project `.claw.json`, and project files override user files. `claw --output-format json config` includes each discovered file's `precedence_rank`, `wins_for_keys`, and `shadowed_keys` so automation can see which file controls each effective key without reimplementing the merge order.
+The list is also the precedence chain: project-local settings override project settings, project settings override the legacy project `.claw.json`, and project files override user files. `clawcli --output-format json config` includes each discovered file's `precedence_rank`, `wins_for_keys`, and `shadowed_keys` so automation can see which file controls each effective key without reimplementing the merge order.
 
 ## MCP server validation
 
-`claw mcp --output-format json` loads valid `mcpServers` entries even when sibling entries are malformed. The JSON list envelope distinguishes the total configured entries from the valid and invalid subsets:
+`clawcli mcp --output-format json` loads valid `mcpServers` entries even when sibling entries are malformed. The JSON list envelope distinguishes the total configured entries from the valid and invalid subsets:
 
 ```json
 {
@@ -758,7 +749,7 @@ In addition to root instruction files such as `CLAUDE.md`, `CLAW.md`, `AGENTS.md
 - `<repo>/.claw/rules/` (`.md`, `.txt`, `.mdc`) for shared project rules.
 - `<repo>/.claw/rules.local/` for personal local rules; this path is gitignored.
 
-Root instruction-file priority is `CLAUDE.md`, then `CLAW.md`, then `AGENTS.md` for each discovered directory. Discovery is bounded to the current git root when one exists, otherwise to the current directory only, so stale parent files outside the project do not silently bleed into the prompt. All loaded files contribute to the system prompt and to `status --output-format json` as `workspace.memory_files:[{path, source, origin, scope_path, outside_project, chars, contributes}]`; `claw doctor --output-format json` includes a `memory` check so automation can detect loaded and unexpected unloaded memory-file candidates without parsing prompt text.
+Root instruction-file priority is `CLAUDE.md`, then `CLAW.md`, then `AGENTS.md` for each discovered directory. Discovery is bounded to the current git root when one exists, otherwise to the current directory only, so stale parent files outside the project do not silently bleed into the prompt. All loaded files contribute to the system prompt and to `status --output-format json` as `workspace.memory_files:[{path, source, origin, scope_path, outside_project, chars, contributes}]`; `clawcli doctor --output-format json` includes a `memory` check so automation can detect loaded and unexpected unloaded memory-file candidates without parsing prompt text.
 
 By default, `claw` also imports detected rules from common AI coding tools such as Cursor (`.cursorrules`, `.cursor/rules/`), GitHub Copilot (`.github/copilot-instructions.md`), Windsurf, Plandex, and Crush. Control this with `rulesImport` in any settings file:
 

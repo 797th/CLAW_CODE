@@ -28,24 +28,17 @@ cargo run -p rusty-claude-cli --bin clawcli -- prompt "explain this codebase"
 
 # JSON output for automation
 cargo run -p rusty-claude-cli --bin clawcli -- --output-format json prompt "summarize src/main.rs"
-
-# The convenience launcher (same source, relaxed CWD guard)
-cargo run -p rusty-claude-cli --bin cliclaw --
 ```
 
-The workspace emits three entrypoints from the same `main.rs`:
+The workspace emits one executable entrypoint:
 
-- `clawcli`: canonical binary name used by the docs and tests
-- `claw`: compatibility launcher
-- `cliclaw`: convenience launcher — same binary under a name that relaxes the working-directory guard (handy for global, run-from-anywhere installs)
+- `clawcli`: the canonical and only executable
 
-To install **both** binaries on macOS, Linux, or Windows, use the repo-root installer (see `../README.md`):
+To install `clawcli` on macOS, Linux, or Windows, use the repo-root installer (see `../README.md`):
 
 ```bash
-python3 ../install/install.py        # builds + installs clawcli and cliclaw, updates PATH
+python3 ../install/install.py        # builds + installs clawcli, updates PATH
 ```
-
-Older `cli797` installs still get the same launcher defaults if you already have that binary lying around.
 
 ## Configuration
 
@@ -159,7 +152,6 @@ Representative current surface:
 
 ```text
 clawcli [OPTIONS] [COMMAND]
-cliclaw [OPTIONS] [COMMAND]
 
 Flags:
   --model MODEL
@@ -252,7 +244,7 @@ rust/
 
 - **~20K lines** of Rust
 - **10 crates** in workspace
-- **Binary names:** `clawcli`, `claw`, `cliclaw`
+- **Binary name:** `clawcli`
 - **Default model:** `openai/gpt-oss-120b`
 - **Default permissions:** `danger-full-access`
 

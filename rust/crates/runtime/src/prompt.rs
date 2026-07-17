@@ -3,7 +3,9 @@ use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use crate::config::{ConfigError, ConfigLoader, RulesImportConfig, RuntimeConfig, WorkflowGateMode};
+use crate::config::{
+    ConfigError, ConfigLoader, RulesImportConfig, RuntimeConfig, WorkflowGateMode,
+};
 use crate::dreamer::DreamerError;
 use crate::git_context::GitContext;
 use crate::harness_assets::SkillMeta;
@@ -275,11 +277,7 @@ impl SystemPromptBuilder {
     /// a workflow is active (`phase != Idle`) and gates are not `Off`, so the
     /// model can self-route based on the active gate mode.
     #[must_use]
-    pub fn with_workflow_status(
-        mut self,
-        phase: WorkflowPhase,
-        mode: WorkflowGateMode,
-    ) -> Self {
+    pub fn with_workflow_status(mut self, phase: WorkflowPhase, mode: WorkflowGateMode) -> Self {
         self.workflow_status = render_workflow_status(phase, mode);
         self
     }
@@ -901,8 +899,8 @@ mod tests {
         MAX_SKILL_INDEX_BYTES, SKILL_INDEX_TRUNCATION_NOTE, SYSTEM_PROMPT_DYNAMIC_BOUNDARY,
     };
     use crate::config::{ConfigLoader, WorkflowGateMode};
-    use crate::workflow::WorkflowPhase;
     use crate::harness_assets::SkillMeta;
+    use crate::workflow::WorkflowPhase;
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};

@@ -9,14 +9,6 @@ publish.workspace = true
 name = "clawcli"
 path = "src/main.rs"
 
-[[bin]]
-name = "claw"
-path = "src/main.rs"
-
-[[bin]]
-name = "cliclaw"
-path = "src/main.rs"
-
 [dependencies]
 api = { path = "../api" }
 claw-engine = { path = "../claw-engine" }

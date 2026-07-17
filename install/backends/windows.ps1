@@ -8,8 +8,8 @@ Invoked by install/install.py. Also runnable standalone:
     powershell -ExecutionPolicy Bypass -File install\backends\windows.ps1 -Release
     powershell -ExecutionPolicy Bypass -File install\backends\windows.ps1 -Debug
 
-Builds both `clawcli.exe` and `cliclaw.exe` from rust/, copies them into a
-user-level bin directory, adds that directory to the user PATH (idempotently),
+Builds `clawcli.exe` from rust/, copies it into a user-level bin directory,
+adds that directory to the user PATH (idempotently),
 and runs a smoke test. The build backend behavior differs from macOS/Linux
 (Visual Studio build tools instead of clang/gcc) but the contract is identical.
 #>
@@ -96,7 +96,7 @@ $buildArgs = @("build", "--package", "rusty-claude-cli", "--bins")
 if ($Profile -eq "release") { $buildArgs += "--release" }
 
 Write-Host ""
-Write-Host "Building clawcli + cliclaw..."
+Write-Host "Building clawcli..."
 Push-Location $rustDir
 try {
     & $cargo.Source @buildArgs
@@ -104,25 +104,32 @@ try {
     Pop-Location
 }
 
-# Build both binary names from the single main.rs.
-foreach ($binName in @("clawcli", "cliclaw")) {
-    $src = Join-Path $targetDir "$binName.exe"
-    if (-not (Test-Path -LiteralPath $src)) {
-        throw "Expected built binary at '$src'."
-    }
-    Write-Ok "built $src"
+# Build the single CLI binary.
+$src = Join-Path $targetDir "clawcli.exe"
+if (-not (Test-Path -LiteralPath $src)) {
+    throw "Expected built binary at '$src'."
 }
+Write-Ok "built $src"
 
 # ---------------------------------------------------------------------------
-# Install (copy both binaries)
+# Install
 # ---------------------------------------------------------------------------
 
 New-Item -ItemType Directory -Path $installDirFull -Force | Out-Null
-foreach ($binName in @("clawcli", "cliclaw")) {
-    $src = Join-Path $targetDir "$binName.exe"
-    $dst = Join-Path $installDirFull "$binName.exe"
-    Copy-Item -LiteralPath $src -Destination $dst -Force
-    Write-Ok "installed $dst"
+$dst = Join-Path $installDirFull "clawcli.exe"
+Copy-Item -LiteralPath $src -Destination $dst -Force
+Write-Ok "installed $dst"
+
+foreach ($legacyName in @("claw", "cliclaw")) {
+    $legacyInstall = Join-Path $installDirFull "$legacyName.exe"
+    if (Test-Path -LiteralPath $legacyInstall) {
+        Remove-Item -LiteralPath $legacyInstall -Force
+        Write-Ok "removed legacy $legacyInstall"
+    }
+    $legacyTarget = Join-Path $targetDir "$legacyName.exe"
+    if (Test-Path -LiteralPath $legacyTarget) {
+        Remove-Item -LiteralPath $legacyTarget -Force
+    }
 }
 
 # ---------------------------------------------------------------------------
@@ -178,22 +185,16 @@ if ($NoVerify) {
 Write-Host ""
 Write-Host "Claw Code is built and installed." -ForegroundColor Green
 Write-Host ""
-Write-Host "  Binaries:  $installDirFull\clawcli.exe  and  $installDirFull\cliclaw.exe"
+Write-Host "  Binary:    $installDirFull\clawcli.exe"
 Write-Host "  Profile:   $Profile"
 Write-Host ""
 Write-Host "Launch from any folder with:"
 Write-Host "  clawcli prompt `"summarize this repository`""
-Write-Host "  cliclaw prompt `"review this repository`"   (same binary, relaxes the CWD guard)"
-Write-Host ""
-Write-Host "Behavior:"
-Write-Host "  - clawcli:  the standard CLI (safe working-directory defaults)."
-Write-Host "  - cliclaw:  keeps the folder you launched from as the workspace and"
-Write-Host "              allows broad working directories such as your home folder."
 
 if ($pathWasUpdated) {
     Write-Host ""
     Write-Host "PATH was updated for your user account and the current PowerShell session."
-    Write-Host "Open a new terminal if another shell still cannot find clawcli/cliclaw."
+    Write-Host "Open a new terminal if another shell still cannot find clawcli."
 } elseif ($NoPathUpdate) {
     Write-Host ""
     Write-Host "PATH was not modified (-NoPathUpdate)."

@@ -42,14 +42,18 @@ impl PolicyRule {
 pub enum PolicyCondition {
     And(Vec<PolicyCondition>),
     Or(Vec<PolicyCondition>),
-    GreenAt { level: GreenLevel },
+    GreenAt {
+        level: GreenLevel,
+    },
     StaleBranch,
     StartupBlocked,
     LaneCompleted,
     LaneReconciled,
     ReviewPassed,
     ScopedDiff,
-    TimedOut { duration: Duration },
+    TimedOut {
+        duration: Duration,
+    },
     RetryAvailable,
     RebaseRequired,
     StaleCleanupRequired,

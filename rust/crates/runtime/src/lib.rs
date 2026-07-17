@@ -15,7 +15,6 @@ mod config;
 pub mod config_validate;
 mod conversation;
 pub mod dreamer;
-pub mod skill_weaver;
 mod file_ops;
 pub mod g004_conformance;
 mod git_context;
@@ -43,6 +42,7 @@ mod report_schema;
 pub mod sandbox;
 mod session;
 pub mod session_control;
+pub mod skill_weaver;
 pub mod trident;
 pub use session_control::SessionStore;
 mod sse;
@@ -67,26 +67,27 @@ pub use approval_tokens::{
 pub use bash::{execute_bash, BashCommandInput, BashCommandOutput};
 pub use bootstrap::{BootstrapPhase, BootstrapPlan};
 pub use branch_lock::{detect_branch_lock_collisions, BranchLockCollision, BranchLockIntent};
+pub use caveman::{
+    caveman_enabled, compress_caveman, estimate_tokens, fidelity_percent, measure_caveman,
+    CavemanMetrics, CAVEMAN_ENV_VAR,
+};
 pub use compact::{
     compact_session, compact_session_to_target, estimate_session_tokens, format_compact_summary,
     get_compact_continuation_message, should_compact, CompactionConfig, CompactionResult,
     DEFAULT_COMPACTION_KEEP_RECENT_TOKENS,
 };
-pub use caveman::{
-    caveman_enabled, compress_caveman, estimate_tokens, fidelity_percent, measure_caveman,
-    CavemanMetrics, CAVEMAN_ENV_VAR,
-};
 pub use config::{
-    ConfigEntry, ConfigError, ConfigFileReport, ConfigFileStatus, ConfigInspection, ConfigLoader,
-    ConfigSource, McpConfigCollection, McpInvalidServerConfig,
-    McpManagedProxyServerConfig, McpOAuthConfig, McpRemoteServerConfig, McpSdkServerConfig,
-    McpServerConfig, McpStdioServerConfig, McpTransport, McpWebSocketServerConfig, MemoryConfig,
-    OAuthConfig, ProviderFallbackConfig, ResolvedPermissionMode, RuntimeConfig, WeaverConfig,
-    RuntimeFeatureConfig, RuntimeHookConfig, RuntimeInvalidHookConfig, RuntimePermissionRuleConfig,
-    RuntimePluginConfig, RuntimeProviderConfig, ScopedMcpServerConfig, WorkflowGateMode,
     load_user_model_aliases, load_user_model_aliases_in_home, remove_user_model_alias,
     remove_user_model_alias_in_home, save_user_model_alias, save_user_model_alias_in_home,
-    save_user_provider_settings, suppress_config_warnings_for_json_mode, CLAW_SETTINGS_SCHEMA_NAME,
+    save_user_provider_settings, suppress_config_warnings_for_json_mode, ConfigEntry, ConfigError,
+    ConfigFileReport, ConfigFileStatus, ConfigInspection, ConfigLoader, ConfigSource,
+    McpConfigCollection, McpInvalidServerConfig, McpManagedProxyServerConfig, McpOAuthConfig,
+    McpRemoteServerConfig, McpSdkServerConfig, McpServerConfig, McpStdioServerConfig, McpTransport,
+    McpWebSocketServerConfig, MemoryConfig, OAuthConfig, ProviderFallbackConfig,
+    ResolvedPermissionMode, RuntimeConfig, RuntimeFeatureConfig, RuntimeHookConfig,
+    RuntimeInvalidHookConfig, RuntimePermissionRuleConfig, RuntimePluginConfig,
+    RuntimeProviderConfig, ScopedMcpServerConfig, WeaverConfig, WorkflowGateMode,
+    CLAW_SETTINGS_SCHEMA_NAME,
 };
 pub use config_validate::{
     check_unsupported_format, format_diagnostics, validate_config_file, ConfigDiagnostic,

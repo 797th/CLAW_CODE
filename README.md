@@ -190,7 +190,7 @@ clawcli doctor
 
 ## What the installer does
 
-1. Builds `clawcli` (and `cliclaw`, a copy that lets you run from any folder) from the Rust source in `rust/`.
+1. Builds the single `clawcli` binary from the Rust source in `rust/`.
 2. Copies it into a bin folder on your PATH (`~/.cargo/bin` on mac/linux, the equivalent on Windows).
 3. Runs `clawcli --version` to confirm it works.
 
@@ -210,14 +210,6 @@ Under the hood, `install.py` is a dispatcher that calls a per-OS backend in `ins
 
 ---
 
-## `clawcli` vs `cliclaw`
-
-The installer builds both. They're the **same program** — the only difference is the name:
-
-- **`clawcli`** — the normal command. Use this.
-- **`cliclaw`** — identical, but lets you run it from any folder (even your home directory) without it complaining. Handy if you want a global "run from anywhere" command.
-
----
 
 ## Troubleshooting
 

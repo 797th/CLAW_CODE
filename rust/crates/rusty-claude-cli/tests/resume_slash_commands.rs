@@ -336,8 +336,7 @@ fn resumed_status_command_emits_structured_json_when_requested() {
     // model is null in resume mode (not known without --model flag)
     assert!(parsed["model"].is_null());
     assert_eq!(
-        parsed["permission_mode"],
-        "danger-full-access",
+        parsed["permission_mode"], "danger-full-access",
         "resume status should reflect the current default bypass posture"
     );
     assert_eq!(parsed["usage"]["messages"], 1);

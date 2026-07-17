@@ -280,9 +280,7 @@ mod tests {
 
     #[test]
     fn no_workflow_or_idle_never_triggers() {
-        assert!(
-            evaluate_pre_tool_use_gate(WorkflowGateMode::Enforced, None, "Write").is_none()
-        );
+        assert!(evaluate_pre_tool_use_gate(WorkflowGateMode::Enforced, None, "Write").is_none());
         let idle = WorkflowState::default();
         assert!(
             evaluate_pre_tool_use_gate(WorkflowGateMode::Enforced, Some(&idle), "Write").is_none()
@@ -301,10 +299,12 @@ mod tests {
         assert_eq!(outcome.event.decision, GateDecision::Block);
 
         // Non-file tool: no gate.
-        assert!(
-            evaluate_pre_tool_use_gate(WorkflowGateMode::Enforced, Some(&workflow), "read_file")
-                .is_none()
-        );
+        assert!(evaluate_pre_tool_use_gate(
+            WorkflowGateMode::Enforced,
+            Some(&workflow),
+            "read_file"
+        )
+        .is_none());
     }
 
     #[test]

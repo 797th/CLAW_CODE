@@ -123,8 +123,10 @@ impl WorkflowState {
                 }
             }
             WorkflowPhase::Review => {
-                let has_review_evidence =
-                    self.evidence.iter().any(|e| e.gate == WorkflowPhase::Review && e.kind == "review");
+                let has_review_evidence = self
+                    .evidence
+                    .iter()
+                    .any(|e| e.gate == WorkflowPhase::Review && e.kind == "review");
                 if has_review_evidence {
                     self.phase = WorkflowPhase::Done;
                     GateCheck::Pass

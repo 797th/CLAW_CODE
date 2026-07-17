@@ -34,7 +34,7 @@ fi
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 RUST_DIR="$REPO_ROOT/rust"
 BINARY="$RUST_DIR/target/debug/clawcli"
-EXPECTED_SHA="$(git -C "$REPO_ROOT" rev-parse --short HEAD)"
+EXPECTED_SHA="$(git -C "$REPO_ROOT" rev-parse HEAD)"
 
 echo "▶ Building clawcli from $REPO_ROOT" >&2
 echo "  Commit: $(git -C "$REPO_ROOT" log --oneline -1)" >&2

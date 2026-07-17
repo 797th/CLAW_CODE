@@ -850,8 +850,7 @@ pub fn run_orchestrate(
         .await;
 
         // ── Step 1.4 (Task 11): QAS reviewer gate pass, one iteration ────
-        let (results, gate) =
-            run_gate(worker_client, worker_model, personas, results).await;
+        let (results, gate) = run_gate(worker_client, worker_model, personas, results).await;
 
         Ok(OrchestrationOutput { results, gate })
     })
@@ -1028,7 +1027,9 @@ mod persona_tests {
             .find(|p| p.name == "backend")
             .expect("backend persona should be present");
         assert!(backend.system_prompt.contains("CUSTOM BackendAgent"));
-        assert!(!backend.system_prompt.contains("BackendAgent \u{2014} a specialist"));
+        assert!(!backend
+            .system_prompt
+            .contains("BackendAgent \u{2014} a specialist"));
     }
 
     #[test]
@@ -1165,7 +1166,9 @@ mod persona_tests {
             occurrences <= 3,
             "expected no duplicate backend entries in the manager prompt, prompt was:\n{prompt}"
         );
-        assert!(!prompt.to_ascii_lowercase().contains("\"backend\" | \"backend\""));
+        assert!(!prompt
+            .to_ascii_lowercase()
+            .contains("\"backend\" | \"backend\""));
     }
 
     #[test]
@@ -1277,7 +1280,9 @@ mod gate_tests {
         /// client hitting a local, scripted `/v1/messages` endpoint rather
         /// than a hand-rolled trait mock.
         fn client(&self) -> ProviderClient {
-            ProviderClient::Anthropic(AnthropicClient::new("test-key").with_base_url(&self.base_url))
+            ProviderClient::Anthropic(
+                AnthropicClient::new("test-key").with_base_url(&self.base_url),
+            )
         }
     }
 
@@ -1453,7 +1458,11 @@ mod gate_tests {
             )
             .await;
 
-            assert_eq!(server.call_count(), 1, "pass verdict must not trigger a redispatch");
+            assert_eq!(
+                server.call_count(),
+                1,
+                "pass verdict must not trigger a redispatch"
+            );
             let gate = gate.expect("gate persona present");
             assert_eq!(gate.verdict, "pass");
             assert!(gate.findings.is_empty());
@@ -1487,7 +1496,10 @@ mod gate_tests {
                 "malformed gate reply must not trigger a redispatch"
             );
             let gate = gate.expect("gate persona present");
-            assert_eq!(gate.verdict, "pass", "malformed JSON must fall back to pass");
+            assert_eq!(
+                gate.verdict, "pass",
+                "malformed JSON must fall back to pass"
+            );
             assert!(gate.findings.is_empty());
             assert_eq!(final_results[0].output, "fn original() {}");
         });
@@ -1513,7 +1525,11 @@ mod gate_tests {
             )
             .await;
 
-            assert_eq!(server.call_count(), 0, "no Gate persona must mean zero provider calls");
+            assert_eq!(
+                server.call_count(),
+                0,
+                "no Gate persona must mean zero provider calls"
+            );
             assert!(gate.is_none());
             assert_eq!(final_results[0].output, results[0].output);
         });
@@ -1538,7 +1554,11 @@ mod gate_tests {
                 implementer_persona("backend"),
                 gate_persona("You are the QAS gate agent."),
             ]);
-            let results = vec![fixture_result(1, "backend", "fn original() { /* has a bug */ }")];
+            let results = vec![fixture_result(
+                1,
+                "backend",
+                "fn original() { /* has a bug */ }",
+            )];
 
             let (final_results, gate) = run_gate(
                 Arc::new(server.client()),
@@ -1601,7 +1621,10 @@ mod gate_tests {
                 "the block verdict itself must survive a garbage id, not fall back to pass"
             );
             assert_eq!(gate.findings.len(), 1);
-            assert_eq!(gate.findings[0].id, None, "a non-numeric id must become None");
+            assert_eq!(
+                gate.findings[0].id, None,
+                "a non-numeric id must become None"
+            );
             assert_eq!(gate.findings[0].issue, "unclear ownership");
             assert_eq!(
                 final_results[0].output, "fn original() {}",
