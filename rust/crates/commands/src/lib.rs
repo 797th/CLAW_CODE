@@ -5417,13 +5417,7 @@ pub fn render_skills_stats(cwd: &Path) -> Result<String, String> {
         } else {
             format!("{:.0}%", 100.0 * record.successes as f64 / judged as f64)
         };
-        let quarantined = cwd
-            .join(".claw")
-            .join("skills")
-            .join(runtime::skill_weaver::LEARNED_DIR_NAME)
-            .join(name)
-            .join("SKILL.md.quarantined")
-            .is_file();
+        let quarantined = runtime::skill_weaver::is_quarantined(cwd, name);
         out.push_str(&format!(
             "{name:<30} {inv:>4} {ok:>3} {fail:>5} {rate:>5}  {quarantined}\n",
             inv = record.invocations,
@@ -5438,6 +5432,9 @@ pub fn render_skills_stats(cwd: &Path) -> Result<String, String> {
 /// Record an explicit success/failure outcome for `skill` in the ledger.
 /// This is the manual honing signal until automatic attribution exists.
 pub fn run_skills_mark(cwd: &Path, skill: &str, verdict: &str) -> Result<String, String> {
+    if !runtime::skill_weaver::is_valid_skill_name(skill) {
+        return Err(format!("invalid_argument: invalid skill name '{skill}'"));
+    }
     let outcome = match verdict {
         "success" => runtime::skill_weaver::SkillOutcome::Success,
         "failure" => runtime::skill_weaver::SkillOutcome::Failure,
@@ -7303,6 +7300,18 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let error = run_skills_mark(dir.path(), "some-skill", "maybe").unwrap_err();
         assert!(error.starts_with("invalid_argument:"));
+    }
+
+    #[test]
+    fn skills_mark_rejects_invalid_skill_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let error = run_skills_mark(dir.path(), "../evil", "success").unwrap_err();
+        assert!(error.starts_with("invalid_argument:"));
+        // Nothing should have been recorded.
+        let ledger = runtime::skill_weaver::SkillLedger::load(&runtime::skill_weaver::weaver_dir(
+            dir.path(),
+        ));
+        assert!(ledger.is_empty());
     }
 
     #[test]
