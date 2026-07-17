@@ -9198,14 +9198,28 @@ impl LiveCli {
                         }
                     }
                 };
+                // Mirror run_dream: the in-session system prompt embeds the
+                // skill index, so a successful weave/hone (new skills
+                // written, others just quarantined) must rebuild it —
+                // otherwise new skills stay invisible and quarantined ones
+                // stay advertised until the next process restart.
+                self.system_prompt = build_system_prompt(&self.model)?;
                 println!(
-                    "wove {} skill(s) from {} session(s){}",
+                    "wove {} skill(s) from {} session(s){}{}",
                     run.files_written.len(),
                     run.episode_count,
                     if honed.is_empty() {
                         String::new()
                     } else {
                         format!("; quarantined: {}", honed.join(", "))
+                    },
+                    if run.skipped_quarantined.is_empty() {
+                        String::new()
+                    } else {
+                        format!(
+                            "; skipped (still quarantined): {}",
+                            run.skipped_quarantined.join(", ")
+                        )
                     }
                 );
                 for path in run.files_written {
@@ -9334,6 +9348,13 @@ impl LiveCli {
         let shutdown_result = runtime.shutdown_plugins();
         match (result, shutdown_result) {
             (Ok(Some(run)), Ok(())) => {
+                // Mirror maybe_auto_dream_after_success: rebuild the
+                // system prompt so newly woven skills are advertised (and
+                // any hone-quarantined ones drop out) without waiting for
+                // a fresh process.
+                if let Ok(system_prompt) = build_system_prompt(&self.model) {
+                    self.system_prompt = system_prompt;
+                }
                 eprintln!(
                     "auto-weave complete: wove {} skill(s) from {} session(s)",
                     run.files_written.len(),
