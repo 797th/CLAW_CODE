@@ -46,6 +46,11 @@ use api::{
     ToolDefinition, ToolResultContentBlock,
 };
 
+#[cfg(test)]
+use claw_engine::convert_messages_with_mode;
+use claw_engine::{
+    convert_messages, filter_tool_specs, format_user_visible_api_error, NEEDS_LOGIN_HINT,
+};
 use commands::{
     classify_skills_slash_command, handle_agents_slash_command, handle_agents_slash_command_json,
     handle_mcp_slash_command, handle_mcp_slash_command_json, handle_plugins_slash_command,
@@ -81,12 +86,6 @@ const DEFAULT_OPENAI_COMPAT_BASE_URL: &str = "https://api.openai.com/v1";
 const DEFAULT_ANTHROPIC_COMPAT_BASE_URL: &str = "https://api.anthropic.com";
 const DEFAULT_OPENAI_COMPAT_MODEL: &str = "gpt-4o-mini";
 const DEFAULT_ANTHROPIC_COMPAT_MODEL: &str = "claude-sonnet-4-6";
-
-/// Hint shown when the user tries to send a message before running `/login`.
-/// The REPL boots credential-free; this is the single source of truth for the
-/// "not connected" guidance so the banner, the message path, and `/status`
-/// stay in sync.
-const NEEDS_LOGIN_HINT: &str = "No API credentials configured. Run /login to connect a provider.";
 
 /// #148: Model provenance for `clawcli status` JSON/text output. Records where
 /// the resolved model string came from so claws don't have to re-read argv
@@ -4148,13 +4147,6 @@ fn print_superpowers_checklist() {
     for item in SUPERPOWERS_CHECKLIST {
         println!("  ☐ {item}");
     }
-}
-
-fn filter_tool_specs(
-    tool_registry: &GlobalToolRegistry,
-    allowed_tools: Option<&AllowedToolSet>,
-) -> Vec<ToolDefinition> {
-    tool_registry.definitions(allowed_tools)
 }
 
 fn parse_system_prompt_args(
@@ -15140,97 +15132,6 @@ fn extract_context_window_tokens_from_error(error_str: &str) -> Option<u32> {
     None
 }
 
-fn format_user_visible_api_error(session_id: &str, error: &api::ApiError) -> String {
-    if error.is_context_window_failure() {
-        format_context_window_blocked_error(session_id, error)
-    } else if error.is_generic_fatal_wrapper() {
-        let mut qualifiers = vec![format!("session {session_id}")];
-        if let Some(request_id) = error.request_id() {
-            qualifiers.push(format!("trace {request_id}"));
-        }
-        format!(
-            "{} ({}): {}",
-            error.safe_failure_class(),
-            qualifiers.join(", "),
-            error
-        )
-    } else {
-        error.to_string()
-    }
-}
-
-fn format_context_window_blocked_error(session_id: &str, error: &api::ApiError) -> String {
-    let mut lines = vec![
-        "Context window blocked".to_string(),
-        "  Failure class    context_window_blocked".to_string(),
-        format!("  Session          {session_id}"),
-    ];
-
-    if let Some(request_id) = error.request_id() {
-        lines.push(format!("  Trace            {request_id}"));
-    }
-
-    match error {
-        api::ApiError::ContextWindowExceeded {
-            model,
-            estimated_input_tokens,
-            requested_output_tokens,
-            estimated_total_tokens,
-            context_window_tokens,
-        } => {
-            lines.push(format!("  Model            {model}"));
-            lines.push(format!(
-                "  Input estimate   ~{estimated_input_tokens} tokens (heuristic)"
-            ));
-            lines.push(format!(
-                "  Requested output {requested_output_tokens} tokens"
-            ));
-            lines.push(format!(
-                "  Total estimate   ~{estimated_total_tokens} tokens (heuristic)"
-            ));
-            lines.push(format!("  Context window   {context_window_tokens} tokens"));
-        }
-        api::ApiError::Api { message, body, .. } => {
-            let detail = message.as_deref().unwrap_or(body).trim();
-            if !detail.is_empty() {
-                lines.push(format!(
-                    "  Detail           {}",
-                    truncate_for_summary(detail, 120)
-                ));
-            }
-        }
-        api::ApiError::RetriesExhausted { last_error, .. } => {
-            let detail = match last_error.as_ref() {
-                api::ApiError::Api { message, body, .. } => message.as_deref().unwrap_or(body),
-                other => return format_context_window_blocked_error(session_id, other),
-            }
-            .trim();
-            if !detail.is_empty() {
-                lines.push(format!(
-                    "  Detail           {}",
-                    truncate_for_summary(detail, 120)
-                ));
-            }
-        }
-        _ => {}
-    }
-
-    lines.push(String::new());
-    lines.push("Recovery".to_string());
-    lines.push("  Compact          /compact".to_string());
-    lines.push(format!(
-        "  Resume compact   clawcli --resume {session_id} /compact"
-    ));
-    lines.push("  Fresh session    /clear --confirm".to_string());
-    lines.push(
-        "  Reduce scope     remove large pasted context/files or ask for a smaller slice"
-            .to_string(),
-    );
-    lines.push("  Retry            rerun after compacting or reducing the request".to_string());
-
-    lines.join("\n")
-}
-
 fn final_assistant_text(summary: &runtime::TurnSummary) -> String {
     summary
         .assistant_messages
@@ -16313,80 +16214,6 @@ fn permission_policy(
             policy.with_tool_requirement(name, required_permission)
         },
     ))
-}
-
-fn convert_messages(messages: &[ConversationMessage]) -> Vec<InputMessage> {
-    convert_messages_with_mode(messages, runtime::caveman_enabled())
-}
-
-fn convert_messages_with_mode(
-    messages: &[ConversationMessage],
-    caveman: bool,
-) -> Vec<InputMessage> {
-    messages
-        .iter()
-        .filter_map(|message| {
-            let role = match message.role {
-                MessageRole::System | MessageRole::User | MessageRole::Tool => "user",
-                MessageRole::Assistant => "assistant",
-            };
-            let content = message
-                .blocks
-                .iter()
-                .filter_map(|block| match block {
-                    ContentBlock::Text { text } => Some(InputContentBlock::Text {
-                        text: if caveman {
-                            runtime::compress_caveman(text)
-                        } else {
-                            text.clone()
-                        },
-                    }),
-                    ContentBlock::Thinking {
-                        thinking,
-                        signature,
-                    } => {
-                        // Keep signed thinking exact: provider signatures can
-                        // cover the thinking text. Compress unsigned reasoning
-                        // before sending it back as reasoning_content.
-                        Some(InputContentBlock::Thinking {
-                            thinking: if caveman && signature.is_none() {
-                                runtime::compress_caveman(thinking)
-                            } else {
-                                thinking.clone()
-                            },
-                            signature: signature.clone(),
-                        })
-                    }
-                    ContentBlock::ToolUse { id, name, input } => Some(InputContentBlock::ToolUse {
-                        id: id.clone(),
-                        name: name.clone(),
-                        input: serde_json::from_str(input)
-                            .unwrap_or_else(|_| serde_json::json!({ "raw": input })),
-                    }),
-                    ContentBlock::ToolResult {
-                        tool_use_id,
-                        output,
-                        is_error,
-                        ..
-                    } => Some(InputContentBlock::ToolResult {
-                        tool_use_id: tool_use_id.clone(),
-                        content: vec![ToolResultContentBlock::Text {
-                            text: if caveman {
-                                runtime::compress_caveman(output)
-                            } else {
-                                output.clone()
-                            },
-                        }],
-                        is_error: *is_error,
-                    }),
-                })
-                .collect::<Vec<_>>();
-            (!content.is_empty()).then(|| InputMessage {
-                role: role.to_string(),
-                content,
-            })
-        })
-        .collect()
 }
 
 #[allow(clippy::too_many_lines)]
