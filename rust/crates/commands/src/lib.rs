@@ -3092,6 +3092,12 @@ pub fn handle_skills_slash_command(args: Option<&str>, cwd: &Path) -> std::io::R
                     "missing_argument: skills quarantine requires a skill name.\nUsage: claw skills quarantine <name>",
                 ));
             }
+            if !runtime::skill_weaver::is_valid_skill_name(name) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("invalid_argument: invalid skill name '{name}'.\nUsage: claw skills quarantine <name>"),
+                ));
+            }
             runtime::skill_weaver::quarantine_skill(cwd, name)
                 .map(|path| {
                     format!(
@@ -3111,6 +3117,12 @@ pub fn handle_skills_slash_command(args: Option<&str>, cwd: &Path) -> std::io::R
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
                     "missing_argument: skills restore requires a skill name.\nUsage: claw skills restore <name>",
+                ));
+            }
+            if !runtime::skill_weaver::is_valid_skill_name(name) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("invalid_argument: invalid skill name '{name}'.\nUsage: claw skills restore <name>"),
                 ));
             }
             runtime::skill_weaver::restore_skill(cwd, name)
@@ -3362,6 +3374,16 @@ pub fn handle_skills_slash_command_json(args: Option<&str>, cwd: &Path) -> std::
                     "Usage: claw skills quarantine <name>",
                 ));
             }
+            if !runtime::skill_weaver::is_valid_skill_name(name) {
+                return Ok(json!({
+                    "kind": "skills",
+                    "action": "quarantine",
+                    "status": "error",
+                    "error_kind": "invalid_argument",
+                    "skill": name,
+                    "message": format!("invalid_argument: invalid skill name '{name}'"),
+                }));
+            }
             match runtime::skill_weaver::quarantine_skill(cwd, name) {
                 Ok(path) => Ok(json!({
                     "kind": "skills",
@@ -3393,6 +3415,16 @@ pub fn handle_skills_slash_command_json(args: Option<&str>, cwd: &Path) -> std::
                     "skill_name",
                     "Usage: claw skills restore <name>",
                 ));
+            }
+            if !runtime::skill_weaver::is_valid_skill_name(name) {
+                return Ok(json!({
+                    "kind": "skills",
+                    "action": "restore",
+                    "status": "error",
+                    "error_kind": "invalid_argument",
+                    "skill": name,
+                    "message": format!("invalid_argument: invalid skill name '{name}'"),
+                }));
             }
             match runtime::skill_weaver::restore_skill(cwd, name) {
                 Ok(path) => Ok(json!({
@@ -3465,40 +3497,30 @@ pub fn handle_skills_slash_command_json(args: Option<&str>, cwd: &Path) -> std::
 
 #[must_use]
 pub fn classify_skills_slash_command(args: Option<&str>) -> SkillSlashDispatch {
-    match normalize_optional_args(args) {
-        None
-        | Some(
+    let args = match normalize_optional_args(args) {
+        None => return SkillSlashDispatch::Local,
+        Some(
             "list" | "help" | "-h" | "--help" | "show" | "info" | "describe" | "install"
             | "uninstall" | "remove" | "delete" | "stats" | "quarantine" | "restore" | "mark",
-        ) => SkillSlashDispatch::Local,
-        Some("weave") => SkillSlashDispatch::Weave,
-        Some(args)
-            if args
-                .split_whitespace()
-                .any(|part| matches!(part, "-h" | "--help")) =>
-        {
-            SkillSlashDispatch::Local
-        }
-        Some(args)
-            if args.starts_with("install ")
-                || args.starts_with("uninstall ")
-                || args.starts_with("remove ")
-                || args.starts_with("delete ")
-                || args.starts_with("quarantine ")
-                || args.starts_with("restore ")
-                || args.starts_with("mark ") =>
-        {
-            SkillSlashDispatch::Local
-        }
-        Some(args)
-            if args.starts_with("list ")
-                || args.starts_with("show ")
-                || args.starts_with("info ")
-                || args.starts_with("describe ") =>
-        {
-            SkillSlashDispatch::Local
-        }
-        Some(args) => SkillSlashDispatch::Invoke(format!("${}", args.trim_start_matches('/'))),
+        ) => return SkillSlashDispatch::Local,
+        Some("weave") => return SkillSlashDispatch::Weave,
+        Some(args) => args,
+    };
+    if args
+        .split_whitespace()
+        .any(|part| matches!(part, "-h" | "--help"))
+    {
+        return SkillSlashDispatch::Local;
+    }
+    // Known verbs followed by arguments match on the first whitespace-delimited
+    // token — ANY whitespace, including newlines from multiline composer input
+    // (Shift+Enter) — so `weave --force` or `stats\n...` renders local usage
+    // instead of being forwarded to the model as a `$skill` prompt. (`help`
+    // stays out of this list: `help overview` is an established Invoke form.)
+    match args.split_whitespace().next().unwrap_or_default() {
+        "install" | "uninstall" | "remove" | "delete" | "quarantine" | "restore" | "mark"
+        | "list" | "show" | "info" | "describe" | "stats" | "weave" => SkillSlashDispatch::Local,
+        _ => SkillSlashDispatch::Invoke(format!("${}", args.trim_start_matches('/'))),
     }
 }
 
@@ -6454,6 +6476,55 @@ mod tests {
         ));
         assert!(agents_error
             .contains("  Usage            /agents [list|show <name>|create <name>|help]"));
+    }
+
+    #[test]
+    fn skills_verbs_with_args_or_newlines_never_invoke_model() {
+        // Regression for: multiline composer input like `/skills weave\n/skills
+        // stats` (Shift+Enter) classified as Invoke and shipped `$weave\n...`
+        // to the model as a prompt, silently burning tokens. Known verbs must
+        // match on the first whitespace-delimited token — any whitespace,
+        // including newlines — and route Local (usage), never Invoke.
+        for arg in [
+            "weave\n/skills stats",
+            "weave --force",
+            "weave now",
+            "stats\nextra",
+            "stats verbose",
+        ] {
+            assert_eq!(
+                classify_skills_slash_command(Some(arg)),
+                SkillSlashDispatch::Local,
+                "`skills {arg:?}` must be Local, not Invoke"
+            );
+        }
+        // Bare `weave` still dispatches the weave pass.
+        assert_eq!(
+            classify_skills_slash_command(Some("weave")),
+            SkillSlashDispatch::Weave
+        );
+        // Newline-separated args behind other known verbs stay Local too.
+        assert_eq!(
+            classify_skills_slash_command(Some("quarantine\nname")),
+            SkillSlashDispatch::Local
+        );
+    }
+
+    #[test]
+    fn skills_quarantine_rejects_invalid_name_as_invalid_argument() {
+        // Regression for: `claw skills quarantine '../evil'` surfaced the
+        // runtime's "invalid weaver output" wording for a user-typed argument.
+        let dir = tempfile::tempdir().unwrap();
+        for verb in ["quarantine", "restore"] {
+            let error = handle_skills_slash_command(Some(&format!("{verb} ../evil")), dir.path())
+                .expect_err("traversal name must be rejected");
+            let message = error.to_string();
+            assert!(
+                message.starts_with("invalid_argument:"),
+                "`skills {verb} ../evil` should say invalid_argument, got: {message}"
+            );
+            assert!(!message.contains("weaver output"), "got: {message}");
+        }
     }
 
     #[test]

@@ -378,7 +378,15 @@ fn animate_spinner(
 /// layout. The activity line is immediately above the composer.
 fn activity_cursor_rows() -> Option<(u16, u16)> {
     let (_, rows) = terminal::size().ok()?;
-    (rows >= 4).then_some((rows - 3, rows - 2))
+    activity_rows_for(rows)
+}
+
+/// Pure row math for `activity_cursor_rows`. Uses `then` (lazy), not
+/// `then_some`: `then_some` evaluates its argument eagerly, so `rows - 3`
+/// would underflow-panic in debug builds whenever the terminal reports fewer
+/// than 3 rows (headless ptys report 0) despite the `rows >= 4` guard.
+fn activity_rows_for(rows: u16) -> Option<(u16, u16)> {
+    (rows >= 4).then(|| (rows - 3, rows - 2))
 }
 
 pub enum ActivityIndicator {
@@ -1244,8 +1252,20 @@ fn strip_ansi(input: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{strip_ansi, MarkdownStreamState, Spinner, TerminalRenderer};
+    use super::{activity_rows_for, strip_ansi, MarkdownStreamState, Spinner, TerminalRenderer};
     use std::io::{self, Write};
+
+    #[test]
+    fn activity_rows_survive_tiny_terminals_without_underflow() {
+        // Regression for a debug-build panic ("attempt to subtract with
+        // overflow", claw-live-spinner thread) when a headless pty reported
+        // 0 rows: `then_some` evaluated `rows - 3` eagerly despite the guard.
+        for rows in 0..4u16 {
+            assert_eq!(activity_rows_for(rows), None, "rows={rows}");
+        }
+        assert_eq!(activity_rows_for(4), Some((1, 2)));
+        assert_eq!(activity_rows_for(50), Some((47, 48)));
+    }
 
     #[derive(Default)]
     struct FlushTrackingWriter {
