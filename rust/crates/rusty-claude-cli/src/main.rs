@@ -9171,21 +9171,18 @@ impl LiveCli {
         Ok(())
     }
 
-    /// Skill Weaver max input bytes per pass. Hardcoded for now; Task 7 adds
-    /// this to config.
-    const WEAVE_MAX_INPUT_BYTES: usize = 64 * 1024;
-
     fn run_weave(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         let cwd = env::current_dir()?;
+        let max_input_bytes = ConfigLoader::default_for(&cwd)
+            .load()
+            .map(|config| config.weaver().max_input_bytes())
+            .unwrap_or_else(|_| runtime::WeaverConfig::default().max_input_bytes());
         // `prepare_dream_runtime` builds a throwaway runtime (no system prompt,
         // no history injection) purely to get a live `ApiClient` — the same
         // pattern `run_dream` uses for its provider pass.
         let mut runtime = self.prepare_dream_runtime()?;
-        let result = runtime::skill_weaver::run_weave_pass(
-            &cwd,
-            runtime.api_client_mut(),
-            Self::WEAVE_MAX_INPUT_BYTES,
-        );
+        let result =
+            runtime::skill_weaver::run_weave_pass(&cwd, runtime.api_client_mut(), max_input_bytes);
         runtime.shutdown_plugins()?;
 
         match result {
@@ -9193,7 +9190,13 @@ impl LiveCli {
                 let honed = {
                     let weaver = runtime::skill_weaver::weaver_dir(&cwd);
                     let ledger = runtime::skill_weaver::SkillLedger::load(&weaver);
-                    runtime::skill_weaver::hone(&cwd, &ledger).unwrap_or_default()
+                    match runtime::skill_weaver::hone(&cwd, &ledger) {
+                        Ok(honed) => honed,
+                        Err(error) => {
+                            eprintln!("weave: honing pass failed: {error}");
+                            Vec::new()
+                        }
+                    }
                 };
                 println!(
                     "wove {} skill(s) from {} session(s){}",
@@ -9302,6 +9305,54 @@ impl LiveCli {
         }
     }
 
+    fn maybe_auto_weave_after_success(&mut self) {
+        let Ok(cwd) = env::current_dir() else {
+            return;
+        };
+        let config = match ConfigLoader::default_for(&cwd).load() {
+            Ok(config) => config,
+            Err(error) => {
+                eprintln!("auto-weave skipped: {error}");
+                return;
+            }
+        };
+        if !config.weaver().auto_weave() {
+            return;
+        }
+        let mut runtime = match self.prepare_dream_runtime() {
+            Ok(runtime) => runtime,
+            Err(error) => {
+                eprintln!("auto-weave skipped: {error}");
+                return;
+            }
+        };
+        let result = runtime::skill_weaver::maybe_run_auto_weave(
+            &cwd,
+            config.weaver(),
+            runtime.api_client_mut(),
+        );
+        let shutdown_result = runtime.shutdown_plugins();
+        match (result, shutdown_result) {
+            (Ok(Some(run)), Ok(())) => {
+                eprintln!(
+                    "auto-weave complete: wove {} skill(s) from {} session(s)",
+                    run.files_written.len(),
+                    run.episode_count
+                );
+            }
+            (
+                Ok(None)
+                | Err(
+                    runtime::skill_weaver::WeaverError::NoEpisodes
+                    | runtime::skill_weaver::WeaverError::Locked,
+                ),
+                Ok(()),
+            ) => {}
+            (Err(error), Ok(())) => eprintln!("auto-weave skipped: {error}"),
+            (_, Err(error)) => eprintln!("auto-weave cleanup failed: {error}"),
+        }
+    }
+
     fn run_turn(&mut self, input: &str) -> Result<(), Box<dyn std::error::Error>> {
         self.run_turn_internal(input, true, None, None)
     }
@@ -9365,6 +9416,7 @@ impl LiveCli {
                 self.persist_session()?;
                 self.append_turn_log(input, &summary);
                 self.maybe_auto_dream_after_success();
+                self.maybe_auto_weave_after_success();
                 Ok(())
             }
             Err(error) => {
