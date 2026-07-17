@@ -14,6 +14,9 @@ cargo run -p rusty-claude-cli --bin clawcli -- --help
 # Build the workspace
 cargo build --workspace
 
+# Run the full-screen TUI demo
+cargo run -p claw-tui
+
 # Run the interactive REPL
 cargo run -p rusty-claude-cli --bin clawcli -- --model openai/gpt-oss-120b
 
@@ -218,6 +221,7 @@ rust/
 ├── Cargo.lock
 └── crates/
     ├── api/                # Provider clients + streaming + request preflight
+    ├── claw-tui/           # Full-screen ratatui TUI demo
     ├── commands/           # Shared slash-command registry + help rendering
     ├── compat-harness/     # Compatibility/parity harness utilities
     ├── mock-anthropic-service/ # Deterministic local Anthropic-compatible mock
@@ -243,8 +247,8 @@ rust/
 ## Stats
 
 - **~20K lines** of Rust
-- **9 crates** in workspace
-- **Binary names:** `clawcli`, `cliclaw`
+- **10 crates** in workspace
+- **Binary names:** `clawcli`, `cliclaw`, `claw-tui`
 - **Default model:** `openai/gpt-oss-120b`
 - **Default permissions:** `danger-full-access`
 
