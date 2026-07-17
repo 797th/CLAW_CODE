@@ -1650,6 +1650,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 None
             };
             let effective_prompt = merge_prompt_with_stdin(&prompt, stdin_context.as_deref());
+            // Probe env -> config -> default like the REPL does. Without this,
+            // one-shot prompts ignored the settings-resolved model and always
+            // sent the compiled-in default when no --model flag was passed.
+            let model = resolve_repl_model(model)?;
             let model = maybe_setup_provider(model)?;
             let mut cli = LiveCli::new(model, true, allowed_tools, permission_mode)?;
             cli.set_reasoning_effort(reasoning_effort);
@@ -3195,13 +3199,21 @@ fn try_resolve_bare_skill_prompt(cwd: &Path, trimmed: &str) -> Option<String> {
     }
 }
 
-fn repl_command_model_prompt(command: &SlashCommand) -> Option<String> {
+/// Resolve the model prompt for a slash command that forwards to the model
+/// (`/skills <name> [args]`). Skill invocations are validated against the
+/// skills on disk first: an unknown name returns `Err` with the local
+/// "Unknown skill" message instead of shipping a `$name` prompt to the model
+/// (which burned a full context of tokens per typo before this check).
+fn repl_command_model_prompt(command: &SlashCommand) -> Result<Option<String>, String> {
     match command {
-        SlashCommand::Skills { args } => match classify_skills_slash_command(args.as_deref()) {
-            SkillSlashDispatch::Invoke(prompt) => Some(prompt),
-            SkillSlashDispatch::Local | SkillSlashDispatch::Weave => None,
-        },
-        _ => None,
+        SlashCommand::Skills { args } => {
+            let cwd = env::current_dir().unwrap_or_default();
+            match resolve_skill_invocation(&cwd, args.as_deref())? {
+                SkillSlashDispatch::Invoke(prompt) => Ok(Some(prompt)),
+                SkillSlashDispatch::Local | SkillSlashDispatch::Weave => Ok(None),
+            }
+        }
+        _ => Ok(None),
     }
 }
 
@@ -8235,7 +8247,14 @@ fn run_repl(
                 };
                 match SlashCommand::parse_with_commands(&trimmed, &custom_commands) {
                     Ok(Some(command)) => {
-                        if let Some(prompt) = repl_command_model_prompt(&command) {
+                        let model_prompt = match repl_command_model_prompt(&command) {
+                            Ok(model_prompt) => model_prompt,
+                            Err(error) => {
+                                eprintln!("{error}");
+                                continue;
+                            }
+                        };
+                        if let Some(prompt) = model_prompt {
                             editor.push_history(input);
                             cli.record_prompt_history(&trimmed);
                             live_usage_reporter.begin_turn(
