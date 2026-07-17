@@ -4234,7 +4234,16 @@ fn skill_lookup_roots() -> Vec<SkillLookupRoot> {
     }
 
     if let Ok(claw_config_home) = std::env::var("CLAW_CONFIG_HOME") {
-        push_prefixed_skill_lookup_roots(&mut roots, std::path::Path::new(&claw_config_home));
+        let claw_config_home = std::path::Path::new(&claw_config_home);
+        push_prefixed_skill_lookup_roots(&mut roots, claw_config_home);
+        // Skill Weaver writes synthesized skills under `skills/learned/<name>/SKILL.md`;
+        // register that nested directory as its own lookup root (same pattern as
+        // `omc-learned` below) so weaved skills resolve by name.
+        push_skill_lookup_root(
+            &mut roots,
+            claw_config_home.join("skills").join("learned"),
+            SkillLookupOrigin::SkillsDir,
+        );
     }
     if let Ok(codex_home) = std::env::var("CODEX_HOME") {
         push_prefixed_skill_lookup_roots(&mut roots, std::path::Path::new(&codex_home));
@@ -4279,6 +4288,16 @@ fn push_project_skill_lookup_roots(roots: &mut Vec<SkillLookupRoot>, cwd: &std::
         push_prefixed_skill_lookup_roots(roots, &ancestor.join(".omc"));
         push_prefixed_skill_lookup_roots(roots, &ancestor.join(".agents"));
         push_prefixed_skill_lookup_roots(roots, &ancestor.join(".claw"));
+        // Skill Weaver writes synthesized skills under
+        // `.claw/skills/learned/<name>/SKILL.md`. Register that nested directory
+        // as its own root, pushed right after the top-level `.claw/skills` root
+        // (via `push_prefixed_skill_lookup_roots` above) so a top-level skill of
+        // the same name always shadows a learned one.
+        push_skill_lookup_root(
+            roots,
+            ancestor.join(".claw").join("skills").join("learned"),
+            SkillLookupOrigin::SkillsDir,
+        );
         push_prefixed_skill_lookup_roots(roots, &ancestor.join(".codex"));
         push_prefixed_skill_lookup_roots(roots, &ancestor.join(".claude"));
     }
@@ -4287,6 +4306,11 @@ fn push_project_skill_lookup_roots(roots: &mut Vec<SkillLookupRoot>, cwd: &std::
 fn push_home_skill_lookup_roots(roots: &mut Vec<SkillLookupRoot>, home: &std::path::Path) {
     push_prefixed_skill_lookup_roots(roots, &home.join(".omc"));
     push_prefixed_skill_lookup_roots(roots, &home.join(".claw"));
+    push_skill_lookup_root(
+        roots,
+        home.join(".claw").join("skills").join("learned"),
+        SkillLookupOrigin::SkillsDir,
+    );
     push_prefixed_skill_lookup_roots(roots, &home.join(".codex"));
     push_prefixed_skill_lookup_roots(roots, &home.join(".claude"));
     push_skill_lookup_root(
@@ -9011,15 +9035,13 @@ mod tests {
     fn skill_invocation_is_recorded_in_weaver_ledger() {
         let _guard = env_guard();
         let root = temp_path("skill-weaver-ledger");
-        // NOTE: skills written by the weave pass live under
+        // Skills written by the weave pass live under
         // `.claw/skills/learned/<name>/SKILL.md` (see
-        // `runtime::skill_weaver::LEARNED_DIR_NAME`), but
-        // `commands::discover_skill_roots` only scans `.claw/skills`
-        // one level deep, so a skill nested under `learned/` is not yet
-        // resolvable by name (pre-existing gap, out of scope for this
-        // task — it only touches `execute_skill`'s ledger recording).
-        // Use a directly-discoverable skill dir so this test exercises
-        // the ledger-recording behavior without depending on that gap.
+        // `runtime::skill_weaver::LEARNED_DIR_NAME`); resolution of that nested
+        // layout is covered separately by
+        // `skill_resolves_learned_skill_nested_under_dot_claw_skills` below.
+        // This test uses a directly-discoverable skill dir so it exercises
+        // just the ledger-recording behavior.
         let skill_dir = root.join(".claw").join("skills").join("demo-skill");
         fs::create_dir_all(&skill_dir).expect("skill dir should exist");
         fs::write(
@@ -9075,6 +9097,44 @@ mod tests {
         assert!(
             ledger.entry("$demo-skill").is_none(),
             "ledger must not fragment entries by raw, unnormalized skill name"
+        );
+
+        std::env::set_current_dir(&original_dir).expect("restore cwd");
+        fs::remove_dir_all(root).expect("temp project should clean up");
+    }
+
+    // Part B (task 6 review gap): the Skill tool must be able to invoke a
+    // skill that the weaver wrote to `.claw/skills/learned/<name>/SKILL.md`
+    // even though nothing exists directly under `.claw/skills/<name>/`.
+    #[test]
+    fn skill_resolves_learned_skill_nested_under_dot_claw_skills() {
+        let _guard = env_guard();
+        let root = temp_path("skill-learned-resolution");
+        let skill_dir = root
+            .join(".claw")
+            .join("skills")
+            .join("learned")
+            .join("woven-skill");
+        fs::create_dir_all(&skill_dir).expect("learned skill dir should exist");
+        fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: woven-skill\ndescription: Synthesized by the weaver\n---\nbody\n",
+        )
+        .expect("skill file should exist");
+
+        let original_dir = std::env::current_dir().expect("cwd");
+        std::env::set_current_dir(&root).expect("set cwd");
+
+        let output = execute_skill(SkillInput {
+            skill: "woven-skill".to_string(),
+            args: None,
+        })
+        .expect("execute_skill should resolve a skill nested under learned/");
+        assert_eq!(output.skill, "woven-skill");
+        assert!(output.path.ends_with("skills/learned/woven-skill/SKILL.md"));
+        assert_eq!(
+            output.description,
+            Some("Synthesized by the weaver".to_string())
         );
 
         std::env::set_current_dir(&original_dir).expect("restore cwd");
