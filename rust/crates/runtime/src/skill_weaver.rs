@@ -232,6 +232,7 @@ fn collect_text_from_events(events: &[AssistantEvent]) -> String {
 /// Parse `<skill name="...">...</skill>` blocks out of the raw provider text.
 fn parse_weaver_output(raw: &str) -> Result<Vec<WovenSkill>, WeaverError> {
     let mut skills = Vec::new();
+    let mut seen_names: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut rest = raw;
     while let Some(start) = rest.find("<skill name=\"") {
         let after = &rest[start + "<skill name=\"".len()..];
@@ -263,6 +264,11 @@ fn parse_weaver_output(raw: &str) -> Result<Vec<WovenSkill>, WeaverError> {
         if parse_frontmatter_value(&markdown, "description").is_none() {
             return Err(WeaverError::InvalidOutput(format!(
                 "skill '{name}': missing description"
+            )));
+        }
+        if !seen_names.insert(name.clone()) {
+            return Err(WeaverError::InvalidOutput(format!(
+                "duplicate skill name '{name}' in one response"
             )));
         }
         skills.push(WovenSkill { name, markdown });
@@ -314,23 +320,46 @@ pub fn write_learned_skills(
     skills: &[WovenSkill],
     skills_root: &Path,
 ) -> Result<Vec<PathBuf>, WeaverError> {
+    // Two-phase write: stage every skill's tmp file first; only rename any
+    // of them into place once every tmp write in the batch has succeeded.
+    // This keeps a failure partway through a multi-skill pass from leaving
+    // an earlier skill's SKILL.md live while the pass as a whole reports
+    // Err (mirrors dreamer.rs's atomic_write discipline, extended to a
+    // whole-batch guarantee).
+    let mut staged: Vec<(PathBuf, PathBuf)> = Vec::new(); // (tmp, dest)
+
+    let stage_result = (|| -> Result<(), WeaverError> {
+        for skill in skills {
+            if !valid_skill_name(&skill.name) {
+                return Err(WeaverError::InvalidOutput(format!(
+                    "invalid skill name '{}'",
+                    skill.name
+                )));
+            }
+            let dir = skills_root.join(LEARNED_DIR_NAME).join(&skill.name);
+            fs::create_dir_all(&dir)?;
+            let dest = dir.join("SKILL.md");
+            let tmp = dir.join("SKILL.md.tmp");
+            let mut body = skill.markdown.clone();
+            if !body.ends_with('\n') {
+                body.push('\n');
+            }
+            fs::write(&tmp, body)?;
+            staged.push((tmp, dest));
+        }
+        Ok(())
+    })();
+
+    if let Err(err) = stage_result {
+        // Clean up any tmp files already written before returning the error.
+        for (tmp, _dest) in &staged {
+            let _ = fs::remove_file(tmp);
+        }
+        return Err(err);
+    }
+
     let mut written = Vec::new();
-    for skill in skills {
-        if !valid_skill_name(&skill.name) {
-            return Err(WeaverError::InvalidOutput(format!(
-                "invalid skill name '{}'",
-                skill.name
-            )));
-        }
-        let dir = skills_root.join(LEARNED_DIR_NAME).join(&skill.name);
-        fs::create_dir_all(&dir)?;
-        let dest = dir.join("SKILL.md");
-        let tmp = dir.join("SKILL.md.tmp");
-        let mut body = skill.markdown.clone();
-        if !body.ends_with('\n') {
-            body.push('\n');
-        }
-        fs::write(&tmp, body)?;
+    for (tmp, dest) in staged {
         fs::rename(&tmp, &dest)?;
         written.push(dest);
     }
@@ -558,5 +587,57 @@ body
         let err = write_learned_skills(&skills, dir.path()).unwrap_err();
         assert!(matches!(err, WeaverError::InvalidOutput(_)));
         assert!(!dir.path().join("learned").exists());
+    }
+
+    #[test]
+    fn parse_weaver_output_rejects_duplicate_skill_names() {
+        let dup = r#"<skill name="foo-bar-baz">
+---
+name: foo-bar-baz
+description: first
+---
+body one
+</skill>
+<skill name="foo-bar-baz">
+---
+name: foo-bar-baz
+description: second
+---
+body two
+</skill>"#;
+        let err = parse_weaver_output(dup).unwrap_err();
+        match err {
+            WeaverError::InvalidOutput(msg) => assert!(msg.contains("foo-bar-baz")),
+            other => panic!("expected InvalidOutput, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn write_learned_skills_is_all_or_nothing_on_mid_write_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let skills_root = dir.path();
+        // Pre-create `learned/skill-two` as a plain FILE so create_dir_all/write
+        // for the second skill fails partway through the batch.
+        let learned = skills_root.join(LEARNED_DIR_NAME);
+        fs::create_dir_all(&learned).unwrap();
+        fs::write(learned.join("skill-two"), b"not a directory").unwrap();
+
+        let skills = vec![
+            WovenSkill {
+                name: "skill-one".to_string(),
+                markdown: "---\nname: skill-one\ndescription: first\n---\nbody\n".to_string(),
+            },
+            WovenSkill {
+                name: "skill-two".to_string(),
+                markdown: "---\nname: skill-two\ndescription: second\n---\nbody\n".to_string(),
+            },
+        ];
+
+        let err = write_learned_skills(&skills, skills_root).unwrap_err();
+        assert!(matches!(err, WeaverError::Io(_)));
+
+        // Skill one must NOT have been left live: no live SKILL.md, only
+        // (at most) a cleaned-up tmp state.
+        assert!(!learned.join("skill-one").join("SKILL.md").is_file());
     }
 }
