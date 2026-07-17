@@ -1,13 +1,24 @@
-//! Running a real turn for the full-screen frontend.
+//! Running turns for the full-screen frontend.
 //!
-//! `run_turn` is blocking and the draw loop must keep painting, so a turn runs
-//! on a worker thread and reports back over a channel. The engine renders
-//! through [`ChannelSink`], which translates its semantic events into the
-//! frontend's [`StreamEvent`]s instead of writing to a terminal.
+//! A turn blocks and executes tools, so it cannot share the draw thread. One
+//! long-lived *session worker* thread owns the [`ConversationRuntime`] and
+//! receives prompts over a channel; the draw loop keeps painting and reads the
+//! resulting [`StreamEvent`]s. The engine renders through [`ChannelSink`],
+//! which translates its semantic events into the frontend's `StreamEvent`s
+//! instead of writing to a terminal.
+//!
+//! The runtime is *session*-scoped, not turn-scoped: building it loads config,
+//! initializes plugins and starts every configured MCP server, which the REPL
+//! pays once per session. It is rebuilt only when [`RuntimeKey`] changes — see
+//! [`SessionRuntime::ensure_engine`].
+//!
+//! The runtime is pinned inside the worker thread and never moves; only the
+//! prompt in and the events out cross a thread boundary.
 
-use std::path::PathBuf;
-use std::sync::mpsc::Sender;
+use std::path::{Path, PathBuf};
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use claw_engine::{
     EngineClient, EngineToolExecutor, RuntimeMcpState, RuntimePluginState, SinkResult, TurnSink,
@@ -15,11 +26,19 @@ use claw_engine::{
 use plugins::PluginRegistry;
 use runtime::permission_enforcer::PermissionEnforcer;
 use runtime::{
-    ConversationRuntime, PermissionMode, PermissionPromptDecision, PermissionPrompter,
-    PermissionRequest, Session, TokenUsage,
+    pricing_for_model, ConversationRuntime, ModelPricing, PermissionMode, PermissionPromptDecision,
+    PermissionPrompter, PermissionRequest, Session, TokenUsage,
 };
 
 use crate::app::StreamEvent;
+
+/// How long a quitting frontend waits for the worker to stop before giving up.
+///
+/// The worker only notices a shutdown *between* turns, so a turn already in
+/// flight has to end first. Waiting forever would hang the exit behind a slow
+/// provider call, so the wait is bounded and the process leaves any remaining
+/// MCP children to the OS.
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 
 /// Forwards engine events to the draw loop.
 ///
@@ -31,14 +50,18 @@ pub struct ChannelSink {
     /// them, mirroring how the REPL announces a thinking block once.
     thinking_open: bool,
     assistant_open: bool,
+    /// Resolved once per sink: usage arrives priced, because the status bar has
+    /// no way to look a model up on its own.
+    pricing: ModelPricing,
 }
 
 impl ChannelSink {
-    pub fn new(tx: Sender<StreamEvent>) -> Self {
+    pub fn new(tx: Sender<StreamEvent>, model: &str) -> Self {
         Self {
             tx,
             thinking_open: false,
             assistant_open: false,
+            pricing: pricing_for_model_or_default(model),
         }
     }
 
@@ -51,6 +74,30 @@ impl ChannelSink {
             self.thinking_open = false;
             self.send(StreamEvent::ThinkingEnd);
         }
+    }
+}
+
+/// Pricing for `model`, falling back to the REPL's default tier.
+///
+/// An unknown or misspelled model must still cost *something* rather than
+/// silently reporting free, which is what a hardcoded zero did.
+fn pricing_for_model_or_default(model: &str) -> ModelPricing {
+    pricing_for_model(model).unwrap_or_else(ModelPricing::default_sonnet_tier)
+}
+
+/// Whole cents for `usage` at `pricing`, rounded to the nearest cent.
+///
+/// Saturating rather than panicking: a bad price must not take the status bar
+/// down with it.
+fn cost_cents(usage: TokenUsage, pricing: ModelPricing) -> u32 {
+    let cents = usage
+        .estimate_cost_usd_with_pricing(pricing)
+        .total_cost_usd()
+        * 100.0;
+    if cents.is_finite() && cents > 0.0 {
+        cents.round().min(f64::from(u32::MAX)) as u32
+    } else {
+        0
     }
 }
 
@@ -129,7 +176,7 @@ impl TurnSink for ChannelSink {
         self.send(StreamEvent::Usage {
             input_tokens: usage.input_tokens,
             output_tokens: usage.output_tokens,
-            cost_cents: 0,
+            cost_cents: cost_cents(usage, self.pricing),
         });
         Ok(())
     }
@@ -174,7 +221,7 @@ fn truncate(value: &str, limit: usize) -> String {
 
 /// A tool call waiting on the user's approval.
 ///
-/// The worker thread is blocked inside `run_turn` while this sits in the draw
+/// The session worker is blocked inside the turn while this sits in the draw
 /// loop's queue; answering it unblocks the turn.
 pub struct PermissionAsk {
     pub tool_name: String,
@@ -192,7 +239,7 @@ struct ChannelPrompter {
 
 impl PermissionPrompter for ChannelPrompter {
     fn decide(&mut self, request: &PermissionRequest) -> PermissionPromptDecision {
-        let (reply, answer) = std::sync::mpsc::channel();
+        let (reply, answer) = mpsc::channel();
         let ask = PermissionAsk {
             tool_name: request.tool_name.clone(),
             input: request.input.clone(),
@@ -207,7 +254,7 @@ impl PermissionPrompter for ChannelPrompter {
                 reason: "frontend closed before the approval was answered".to_string(),
             };
         }
-        // Blocks this worker thread only. The draw loop keeps painting and
+        // Blocks the session worker only. The draw loop keeps painting and
         // sends the decision back when the user answers.
         answer
             .recv()
@@ -217,30 +264,43 @@ impl PermissionPrompter for ChannelPrompter {
     }
 }
 
-/// Everything a turn needs that the frontend resolves once per send.
-pub struct TurnRequest {
-    pub prompt: String,
+/// The settings a built runtime is bound to.
+///
+/// Both can change between turns (`/model`, Shift+Tab mode cycling) and neither
+/// can be swapped inside a built runtime: the model is baked into the engine
+/// client and the mode into the permission policy *and* the enforcer attached
+/// to the tool registry. A change therefore forces a rebuild — the one case
+/// where the frontend pays plugin init and MCP startup again mid-session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeKey {
     pub model: String,
     pub permission_mode: PermissionMode,
-    pub session: Session,
-    pub cwd: PathBuf,
-    /// Where tool-approval requests go while the turn is blocked on them.
-    pub asks: Sender<PermissionAsk>,
 }
 
-/// What a finished turn hands back to the frontend.
-///
-/// The session comes back even when the turn fails: a provider error must not
-/// cost the user their conversation history.
-pub struct TurnOutcome {
-    pub session: Option<Session>,
-    pub error: Option<String>,
+/// One turn's worth of engine, for as long as its [`RuntimeKey`] holds.
+trait TurnEngine {
+    /// Run one turn to completion, returning what it consumed.
+    fn run_turn(&mut self, prompt: String) -> Result<TokenUsage, String>;
+
+    /// The conversation so far, for persistence between turns.
+    fn session(&self) -> &Session;
+
+    /// Give the conversation up, tearing the engine down around it.
+    fn into_session(self) -> Session;
+}
+
+/// Builds a [`TurnEngine`]. Injected so the rebuild policy can be proven
+/// without a provider, credentials or MCP servers.
+trait EngineFactory {
+    type Engine: TurnEngine;
+
+    fn build(&mut self, key: &RuntimeKey, session: Session) -> Result<Self::Engine, String>;
 }
 
 /// Owns the plugin and MCP lifecycle for one runtime.
 ///
-/// MCP servers are child processes. Dropping this shuts them down, so a turn
-/// that fails partway through cannot leak them, mirroring the REPL's
+/// MCP servers are child processes. Dropping this shuts them down, so a session
+/// that fails partway through building cannot leak them, mirroring the REPL's
 /// `BuiltRuntime::drop`.
 struct RuntimeLifecycle {
     plugin_registry: PluginRegistry,
@@ -298,117 +358,411 @@ impl Drop for RuntimeLifecycle {
     }
 }
 
-/// Build the engine runtime and run one turn to completion.
-///
-/// The runtime is rebuilt per turn, so everything it resolves from
-/// configuration — plugins, hooks, MCP servers — is resolved per turn too.
-pub fn run_turn(request: TurnRequest, tx: &Sender<StreamEvent>) -> TurnOutcome {
-    let TurnRequest {
-        prompt,
-        model,
-        permission_mode,
-        session,
-        cwd,
-        asks,
-    } = request;
+/// The real engine: a `ConversationRuntime` plus the MCP and plugin processes
+/// it was built against.
+struct EngineRuntime {
+    /// Declared before `lifecycle` so the runtime — and the tool registry
+    /// holding MCP handles — is dropped before the servers are stopped.
+    runtime: ConversationRuntime<EngineClient, EngineToolExecutor>,
+    asks: Sender<PermissionAsk>,
+    lifecycle: RuntimeLifecycle,
+}
 
-    let loader = runtime::ConfigLoader::default_for(&cwd);
-    let runtime_config = match loader.load() {
-        Ok(config) => config,
-        // Setup failed before the turn started: hand the session straight back.
-        Err(error) => return TurnOutcome::failed(session, error.to_string()),
-    };
-    let RuntimePluginState {
-        feature_config,
-        tool_registry,
-        plugin_registry,
-        mcp_state,
-    } = match claw_engine::build_runtime_plugin_state(&cwd, &loader, &runtime_config) {
-        Ok(state) => state,
-        Err(error) => return TurnOutcome::failed(session, error.to_string()),
-    };
-
-    // From here on MCP servers may be running: the guard must own them so every
-    // early return still shuts them down.
-    let mut lifecycle = RuntimeLifecycle::new(plugin_registry, mcp_state.clone());
-    if let Err(error) = lifecycle.initialize_plugins() {
-        return TurnOutcome::failed(session, error.to_string());
+impl TurnEngine for EngineRuntime {
+    fn run_turn(&mut self, prompt: String) -> Result<TokenUsage, String> {
+        let mut prompter = ChannelPrompter {
+            asks: self.asks.clone(),
+        };
+        self.runtime
+            .run_turn(prompt, Some(&mut prompter))
+            .map(|summary| summary.usage)
+            .map_err(|error| error.to_string())
     }
 
-    // Derived from the registry before the enforcer is attached: the policy must
-    // know every plugin and MCP tool's declared requirement, plus the user's
-    // configured permission rules.
-    let policy =
-        match claw_engine::permission_policy(permission_mode, &feature_config, &tool_registry) {
-            Ok(policy) => policy,
-            Err(error) => return TurnOutcome::failed(session, error),
-        };
-    let tool_registry = tool_registry.with_enforcer(PermissionEnforcer::new(policy.clone()));
+    fn session(&self) -> &Session {
+        self.runtime.session()
+    }
 
-    let system_prompt = match runtime::load_system_prompt(
-        cwd,
-        BUILD_DATE,
-        std::env::consts::OS,
-        "",
-        api::model_family_identity_for(&model),
-    ) {
-        Ok(sections) => sections,
-        Err(error) => return TurnOutcome::failed(session, error.to_string()),
-    };
-
-    let session_id = session.session_id.clone();
-    let client = match EngineClient::new(
-        &session_id,
-        model,
-        true,
-        None,
-        tool_registry.clone(),
-        Box::new(ChannelSink::new(tx.clone())),
-    ) {
-        Ok(client) => client,
-        Err(error) => return TurnOutcome::failed(session, error.to_string()),
-    };
-    let executor = EngineToolExecutor::new(
-        None,
-        tool_registry,
-        mcp_state,
-        // Must be a ChannelSink, not NullSink: tool results are drawn from
-        // TurnSink::tool_result, so a null sink silently swallows every tool's
-        // output and the transcript stalls after "running".
-        Box::new(ChannelSink::new(tx.clone())),
-    );
-
-    // `new_with_features`, not `new`: `new` uses RuntimeFeatureConfig::default(),
-    // which silently drops the user's configured hooks.
-    let mut runtime = ConversationRuntime::new_with_features(
-        session,
-        client,
-        executor,
-        policy,
-        system_prompt,
-        &feature_config,
-    )
-    .with_caveman_compression(runtime::caveman_enabled());
-    let mut prompter = ChannelPrompter { asks };
-    let error = runtime
-        .run_turn(prompt, Some(&mut prompter))
-        .err()
-        .map(|e| e.to_string());
-    let session = runtime.into_session();
-    drop(lifecycle);
-    TurnOutcome {
-        session: Some(session),
-        error,
+    fn into_session(self) -> Session {
+        let Self {
+            runtime, lifecycle, ..
+        } = self;
+        let session = runtime.into_session();
+        // Explicit, not incidental: the servers stop here, before the caller
+        // builds their replacements.
+        drop(lifecycle);
+        session
     }
 }
 
-impl TurnOutcome {
-    fn failed(session: Session, error: String) -> Self {
+/// Builds the engine the frontend actually runs, from the user's configuration.
+struct EngineRuntimeFactory {
+    cwd: PathBuf,
+    events: Sender<StreamEvent>,
+    asks: Sender<PermissionAsk>,
+}
+
+impl EngineFactory for EngineRuntimeFactory {
+    type Engine = EngineRuntime;
+
+    fn build(&mut self, key: &RuntimeKey, session: Session) -> Result<EngineRuntime, String> {
+        let loader = runtime::ConfigLoader::default_for(&self.cwd);
+        let runtime_config = loader.load().map_err(|error| error.to_string())?;
+        let RuntimePluginState {
+            feature_config,
+            tool_registry,
+            plugin_registry,
+            mcp_state,
+        } = claw_engine::build_runtime_plugin_state(&self.cwd, &loader, &runtime_config)
+            .map_err(|error| error.to_string())?;
+
+        // From here on MCP servers may be running: the guard must own them so
+        // every early return still shuts them down.
+        let mut lifecycle = RuntimeLifecycle::new(plugin_registry, mcp_state.clone());
+        lifecycle
+            .initialize_plugins()
+            .map_err(|error| error.to_string())?;
+
+        // Derived from the registry before the enforcer is attached: the policy
+        // must know every plugin and MCP tool's declared requirement, plus the
+        // user's configured permission rules.
+        let policy =
+            claw_engine::permission_policy(key.permission_mode, &feature_config, &tool_registry)?;
+        let tool_registry = tool_registry.with_enforcer(PermissionEnforcer::new(policy.clone()));
+
+        let system_prompt = runtime::load_system_prompt(
+            &self.cwd,
+            BUILD_DATE,
+            std::env::consts::OS,
+            "",
+            api::model_family_identity_for(&key.model),
+        )
+        .map_err(|error| error.to_string())?;
+
+        let client = EngineClient::new(
+            &session.session_id,
+            key.model.clone(),
+            true,
+            None,
+            tool_registry.clone(),
+            Box::new(ChannelSink::new(self.events.clone(), &key.model)),
+        )
+        .map_err(|error| error.to_string())?;
+        let executor = EngineToolExecutor::new(
+            None,
+            tool_registry,
+            mcp_state,
+            // Must be a ChannelSink, not NullSink: tool results are drawn from
+            // TurnSink::tool_result, so a null sink silently swallows every
+            // tool's output and the transcript stalls after "running".
+            Box::new(ChannelSink::new(self.events.clone(), &key.model)),
+        );
+
+        // `new_with_features`, not `new`: `new` uses RuntimeFeatureConfig::default(),
+        // which silently drops the user's configured hooks.
+        let runtime = ConversationRuntime::new_with_features(
+            session,
+            client,
+            executor,
+            policy,
+            system_prompt,
+            &feature_config,
+        )
+        .with_caveman_compression(runtime::caveman_enabled());
+
+        Ok(EngineRuntime {
+            runtime,
+            asks: self.asks.clone(),
+            lifecycle,
+        })
+    }
+}
+
+/// The engine currently built, and what it was built for.
+struct ActiveEngine<E> {
+    key: RuntimeKey,
+    engine: E,
+}
+
+/// A session's engine, rebuilt only when it has to be.
+///
+/// This is what makes the runtime session-scoped: `ensure_engine` is the only
+/// path to an engine, and it reuses the built one whenever the [`RuntimeKey`]
+/// still matches.
+struct SessionRuntime<F: EngineFactory> {
+    factory: F,
+    active: Option<ActiveEngine<F::Engine>>,
+    /// History while no engine holds it: before the first turn, and whenever a
+    /// build failed. Exactly one of `active`/`parked` carries it.
+    parked: Option<Session>,
+}
+
+impl<F: EngineFactory> SessionRuntime<F> {
+    fn new(factory: F, session: Session) -> Self {
         Self {
-            session: Some(session),
-            error: Some(error),
+            factory,
+            active: None,
+            parked: Some(session),
         }
     }
+
+    fn session(&self) -> Option<&Session> {
+        self.active
+            .as_ref()
+            .map(|active| active.engine.session())
+            .or(self.parked.as_ref())
+    }
+
+    /// The engine for `key`, building one only if the built one does not match.
+    ///
+    /// Reuse is the point: a build loads config, runs plugin `initialize` hooks
+    /// and starts every configured MCP server. Doing that per turn is the cost
+    /// this type exists to avoid.
+    fn ensure_engine(&mut self, key: &RuntimeKey) -> Result<&mut F::Engine, String> {
+        if self
+            .active
+            .as_ref()
+            .is_some_and(|active| active.key == *key)
+        {
+            return Ok(&mut self
+                .active
+                .as_mut()
+                .expect("the key check just proved an engine is built")
+                .engine);
+        }
+
+        // Either the first turn, or the model/permission mode changed. Take the
+        // history out of the old engine so a rebuild keeps the conversation,
+        // and let it go — stopping its MCP servers — before starting new ones.
+        let session = match self.active.take() {
+            Some(active) => active.engine.into_session(),
+            None => self.parked.take().unwrap_or_default(),
+        };
+        // Park a copy first: a failed build must not cost the user their
+        // history.
+        self.parked = Some(session.clone());
+        let engine = self.factory.build(key, session)?;
+        self.parked = None;
+        Ok(&mut self
+            .active
+            .insert(ActiveEngine {
+                key: key.clone(),
+                engine,
+            })
+            .engine)
+    }
+
+    fn run_turn(&mut self, key: &RuntimeKey, prompt: String) -> TurnOutcome {
+        match self.ensure_engine(key) {
+            Ok(engine) => match engine.run_turn(prompt) {
+                Ok(usage) => TurnOutcome {
+                    usage: Some(usage),
+                    error: None,
+                },
+                // A failed turn keeps the engine: the provider erred, the
+                // session did not, and rebuilding would restart MCP for nothing.
+                Err(error) => TurnOutcome {
+                    usage: None,
+                    error: Some(error),
+                },
+            },
+            Err(error) => TurnOutcome {
+                usage: None,
+                error: Some(error),
+            },
+        }
+    }
+
+    fn into_session(self) -> Session {
+        match self.active {
+            Some(active) => active.engine.into_session(),
+            None => self.parked.unwrap_or_default(),
+        }
+    }
+}
+
+/// What a finished turn reports back.
+struct TurnOutcome {
+    usage: Option<TokenUsage>,
+    error: Option<String>,
+}
+
+/// Writes the session where the REPL writes it, after every turn.
+///
+/// Same store and same format as `rusty-claude-cli`, so `clawcli --resume` sees
+/// frontend sessions and the frontend sees the REPL's.
+struct SessionPersistence {
+    /// `None` once saving has failed: the user has been told, and repeating the
+    /// warning every turn would bury the transcript.
+    path: Option<PathBuf>,
+}
+
+impl SessionPersistence {
+    /// Bind `session` to a file in the workspace's session store, and write it
+    /// once so `--resume` can see it before the first turn finishes.
+    fn attach(session: Session, cwd: &Path, events: &Sender<StreamEvent>) -> (Session, Self) {
+        match persistence_path_for(cwd, &session.session_id) {
+            Ok(path) => {
+                let session = session.with_persistence_path(path.clone());
+                let mut persistence = Self { path: Some(path) };
+                persistence.save(&session, events);
+                (session, persistence)
+            }
+            Err(error) => {
+                notice(events, &format!("session will not be saved: {error}"));
+                (session, Self { path: None })
+            }
+        }
+    }
+
+    fn save(&mut self, session: &Session, events: &Sender<StreamEvent>) {
+        let Some(path) = self.path.as_ref() else {
+            return;
+        };
+        if let Err(error) = session.save_to_path(path) {
+            notice(events, &format!("session was not saved: {error}"));
+            self.path = None;
+        }
+    }
+}
+
+fn persistence_path_for(cwd: &Path, session_id: &str) -> Result<PathBuf, String> {
+    let store = runtime::SessionStore::from_cwd(cwd).map_err(|error| error.to_string())?;
+    std::fs::create_dir_all(store.sessions_dir()).map_err(|error| error.to_string())?;
+    Ok(store.create_handle(session_id).path)
+}
+
+fn notice(events: &Sender<StreamEvent>, text: &str) {
+    let _ = events.send(StreamEvent::Notice(text.to_string()));
+}
+
+/// What the draw loop asks the session worker to do.
+enum SessionCommand {
+    RunTurn {
+        prompt: String,
+        model: String,
+        permission_mode: PermissionMode,
+    },
+    Shutdown,
+}
+
+/// The draw loop's end of a session worker.
+///
+/// Dropping it stops the worker, which is what shuts MCP servers and plugins
+/// down on exit.
+pub struct SessionHandle {
+    commands: Sender<SessionCommand>,
+    events: Receiver<StreamEvent>,
+    /// The worker's final session, handed back when it stops.
+    finished: Receiver<Session>,
+}
+
+impl SessionHandle {
+    pub fn events(&self) -> &Receiver<StreamEvent> {
+        &self.events
+    }
+
+    /// Ask for a turn. `false` means the worker is gone and no turn started.
+    pub fn run_turn(&self, prompt: String, model: String, permission_mode: PermissionMode) -> bool {
+        self.commands
+            .send(SessionCommand::RunTurn {
+                prompt,
+                model,
+                permission_mode,
+            })
+            .is_ok()
+    }
+
+    /// Stop the worker and take the conversation back.
+    ///
+    /// `None` if the worker did not stop within [`SHUTDOWN_GRACE`], or already
+    /// stopped.
+    pub fn shutdown(mut self) -> Option<Session> {
+        self.stop()
+    }
+
+    fn stop(&mut self) -> Option<Session> {
+        let _ = self.commands.send(SessionCommand::Shutdown);
+        self.finished.recv_timeout(SHUTDOWN_GRACE).ok()
+    }
+}
+
+impl Drop for SessionHandle {
+    fn drop(&mut self) {
+        let _ = self.stop();
+    }
+}
+
+/// Start a session: one thread, one runtime, many turns.
+///
+/// The runtime is built on the first turn rather than here, so a frontend that
+/// never sends a message never pays for plugins or MCP.
+pub fn spawn_session(cwd: PathBuf, asks: Sender<PermissionAsk>) -> SessionHandle {
+    let (commands, command_rx) = mpsc::channel();
+    let (event_tx, events) = mpsc::channel();
+    let (finished_tx, finished) = mpsc::channel();
+    std::thread::spawn(move || {
+        let session = run_session(cwd, asks, &command_rx, &event_tx);
+        // Best-effort: a frontend that gave up waiting is already gone.
+        let _ = finished_tx.send(session);
+    });
+    SessionHandle {
+        commands,
+        events,
+        finished,
+    }
+}
+
+/// The session worker: owns the runtime for the whole session.
+fn run_session(
+    cwd: PathBuf,
+    asks: Sender<PermissionAsk>,
+    commands: &Receiver<SessionCommand>,
+    events: &Sender<StreamEvent>,
+) -> Session {
+    let (session, mut persistence) =
+        SessionPersistence::attach(Session::new().with_workspace_root(&cwd), &cwd, events);
+    let factory = EngineRuntimeFactory {
+        cwd,
+        events: events.clone(),
+        asks,
+    };
+    let mut session_runtime = SessionRuntime::new(factory, session);
+
+    while let Ok(command) = commands.recv() {
+        let SessionCommand::RunTurn {
+            prompt,
+            model,
+            permission_mode,
+        } = command
+        else {
+            break;
+        };
+        let key = RuntimeKey {
+            model,
+            permission_mode,
+        };
+        let outcome = session_runtime.run_turn(&key, prompt);
+        // Persist whatever the turn left behind, including after a failure: the
+        // user's history is worth more than the error.
+        if let Some(session) = session_runtime.session() {
+            persistence.save(session, events);
+        }
+        let event = match outcome.error {
+            Some(error) => StreamEvent::Failed(error),
+            None => {
+                let usage = outcome.usage.unwrap_or_default();
+                StreamEvent::Done {
+                    input_tokens: usage.input_tokens,
+                    output_tokens: usage.output_tokens,
+                    cost_cents: cost_cents(usage, pricing_for_model_or_default(&key.model)),
+                }
+            }
+        };
+        let _ = events.send(event);
+    }
+
+    session_runtime.into_session()
 }
 
 /// Build-stamped date for the system prompt, matching the CLI's DEFAULT_DATE.
@@ -420,10 +774,301 @@ const BUILD_DATE: &str = match option_env!("BUILD_DATE") {
 
 #[cfg(test)]
 mod tests {
-    use super::{first_line, summarize_tool_input, ChannelSink};
+    use super::{
+        cost_cents, first_line, pricing_for_model_or_default, summarize_tool_input, ChannelSink,
+        EngineFactory, RuntimeKey, SessionRuntime, TurnEngine,
+    };
     use crate::app::StreamEvent;
     use claw_engine::TurnSink;
+    use runtime::{PermissionMode, Session, TokenUsage};
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::mpsc;
+    use std::sync::Arc;
+
+    const MODEL: &str = "claude-sonnet-4-5";
+
+    fn key(model: &str, permission_mode: PermissionMode) -> RuntimeKey {
+        RuntimeKey {
+            model: model.to_string(),
+            permission_mode,
+        }
+    }
+
+    /// The text of every message in `session`, in order.
+    fn transcript(session: &Session) -> Vec<String> {
+        session
+            .messages
+            .iter()
+            .flat_map(|message| &message.blocks)
+            .filter_map(|block| match block {
+                runtime::ContentBlock::Text { text } => Some(text.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A `TurnEngine` that records turns in the session instead of calling a
+    /// provider, so the rebuild policy can be tested without credentials.
+    struct FakeEngine {
+        session: Session,
+        /// Turns that must fail, as a provider error would.
+        fail: bool,
+    }
+
+    impl TurnEngine for FakeEngine {
+        fn run_turn(&mut self, prompt: String) -> Result<TokenUsage, String> {
+            if self.fail {
+                return Err(format!("provider refused '{prompt}'"));
+            }
+            self.session
+                .push_message(runtime::ConversationMessage::user_text(prompt))
+                .expect("a fixture message should append");
+            Ok(TokenUsage {
+                input_tokens: 10,
+                output_tokens: 20,
+                ..TokenUsage::default()
+            })
+        }
+
+        fn session(&self) -> &Session {
+            &self.session
+        }
+
+        fn into_session(self) -> Session {
+            self.session
+        }
+    }
+
+    /// Counts builds, which is the observable proof that the runtime is
+    /// session-scoped rather than per turn.
+    struct CountingFactory {
+        builds: Arc<AtomicUsize>,
+        keys: Arc<std::sync::Mutex<Vec<RuntimeKey>>>,
+        fail_turns: bool,
+        fail_build: bool,
+    }
+
+    impl CountingFactory {
+        fn new() -> Self {
+            Self {
+                builds: Arc::new(AtomicUsize::new(0)),
+                keys: Arc::new(std::sync::Mutex::new(Vec::new())),
+                fail_turns: false,
+                fail_build: false,
+            }
+        }
+    }
+
+    impl EngineFactory for CountingFactory {
+        type Engine = FakeEngine;
+
+        fn build(&mut self, key: &RuntimeKey, session: Session) -> Result<FakeEngine, String> {
+            self.builds.fetch_add(1, Ordering::SeqCst);
+            self.keys.lock().expect("keys").push(key.clone());
+            if self.fail_build {
+                return Err("runtime could not be built".to_string());
+            }
+            Ok(FakeEngine {
+                session,
+                fail: self.fail_turns,
+            })
+        }
+    }
+
+    #[test]
+    fn the_runtime_is_built_once_for_a_whole_session_not_once_per_turn() {
+        // Every build loads config, initializes plugins and starts every
+        // configured MCP server. The frontend used to pay that per message.
+        let factory = CountingFactory::new();
+        let builds = Arc::clone(&factory.builds);
+        let mut session = SessionRuntime::new(factory, Session::new());
+        let key = key(MODEL, PermissionMode::Prompt);
+
+        for turn in 0..5 {
+            let outcome = session.run_turn(&key, format!("turn {turn}"));
+            assert!(outcome.error.is_none(), "turn {turn}: {:?}", outcome.error);
+        }
+
+        assert_eq!(
+            builds.load(Ordering::SeqCst),
+            1,
+            "five turns with unchanged settings must share one runtime"
+        );
+    }
+
+    #[test]
+    fn changing_the_model_rebuilds_the_runtime_and_repeating_it_does_not() {
+        let factory = CountingFactory::new();
+        let builds = Arc::clone(&factory.builds);
+        let keys = Arc::clone(&factory.keys);
+        let mut session = SessionRuntime::new(factory, Session::new());
+
+        session.run_turn(&key(MODEL, PermissionMode::Prompt), "first".to_string());
+        session.run_turn(
+            &key("claude-opus-4-6", PermissionMode::Prompt),
+            "second".to_string(),
+        );
+        session.run_turn(
+            &key("claude-opus-4-6", PermissionMode::Prompt),
+            "third".to_string(),
+        );
+
+        assert_eq!(
+            builds.load(Ordering::SeqCst),
+            2,
+            "the model change rebuilds once; staying on it must not rebuild again"
+        );
+        let models: Vec<String> = keys
+            .lock()
+            .expect("keys")
+            .iter()
+            .map(|key| key.model.clone())
+            .collect();
+        assert_eq!(models, vec![MODEL, "claude-opus-4-6"]);
+    }
+
+    #[test]
+    fn changing_the_permission_mode_rebuilds_the_runtime_and_repeating_it_does_not() {
+        // The mode is baked into the policy and into the registry's enforcer,
+        // so it cannot be swapped inside a built runtime.
+        let factory = CountingFactory::new();
+        let builds = Arc::clone(&factory.builds);
+        let mut session = SessionRuntime::new(factory, Session::new());
+
+        session.run_turn(&key(MODEL, PermissionMode::Prompt), "first".to_string());
+        session.run_turn(
+            &key(MODEL, PermissionMode::DangerFullAccess),
+            "second".to_string(),
+        );
+        session.run_turn(
+            &key(MODEL, PermissionMode::DangerFullAccess),
+            "third".to_string(),
+        );
+
+        assert_eq!(builds.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn history_accumulates_across_turns_and_survives_a_rebuild() {
+        let factory = CountingFactory::new();
+        let mut session = SessionRuntime::new(factory, Session::new());
+
+        session.run_turn(&key(MODEL, PermissionMode::Prompt), "first".to_string());
+        // A model switch tears the engine down and builds a new one; the
+        // conversation must travel across.
+        session.run_turn(
+            &key("claude-opus-4-6", PermissionMode::Prompt),
+            "second".to_string(),
+        );
+
+        assert_eq!(
+            transcript(&session.into_session()),
+            vec!["first", "second"],
+            "a rebuild must carry the conversation across"
+        );
+    }
+
+    #[test]
+    fn a_failed_turn_keeps_the_session_and_its_history() {
+        // A provider error must not cost the user their conversation.
+        let mut factory = CountingFactory::new();
+        factory.fail_turns = true;
+        let builds = Arc::clone(&factory.builds);
+        let mut runtime = SessionRuntime::new(factory, Session::new());
+
+        let seeded = runtime
+            .ensure_engine(&key(MODEL, PermissionMode::Prompt))
+            .expect("engine should build");
+        seeded.fail = false;
+        seeded.run_turn("kept".to_string()).expect("first turn");
+        seeded.fail = true;
+
+        let outcome = runtime.run_turn(&key(MODEL, PermissionMode::Prompt), "doomed".to_string());
+
+        assert!(outcome.error.is_some(), "the turn must report its failure");
+        assert_eq!(
+            builds.load(Ordering::SeqCst),
+            1,
+            "a failed turn must not throw the runtime away"
+        );
+        assert_eq!(
+            transcript(&runtime.into_session()),
+            vec!["kept"],
+            "history from before the failure must survive"
+        );
+    }
+
+    #[test]
+    fn a_failed_build_reports_the_error_and_leaves_the_history_intact() {
+        let mut factory = CountingFactory::new();
+        factory.fail_build = true;
+        let mut runtime = SessionRuntime::new(factory, Session::new());
+
+        let outcome = runtime.run_turn(&key(MODEL, PermissionMode::Prompt), "hello".to_string());
+
+        assert_eq!(outcome.error.as_deref(), Some("runtime could not be built"));
+        // The session is still there to be handed back, not consumed by the
+        // build that failed.
+        assert!(runtime.session().is_some());
+        assert!(runtime.into_session().messages.is_empty());
+    }
+
+    #[test]
+    fn cost_is_priced_from_the_model_and_an_unknown_model_still_costs_something() {
+        let usage = TokenUsage {
+            input_tokens: 1_000_000,
+            output_tokens: 1_000_000,
+            ..TokenUsage::default()
+        };
+
+        // Opus: $15/M in + $75/M out = $90.00 = 9000 cents.
+        let opus = cost_cents(usage, pricing_for_model_or_default("claude-opus-4-6"));
+        assert_eq!(opus, 9000, "a priced model must not report zero cost");
+
+        // Haiku is cheaper than Opus, and both are real numbers.
+        let haiku = cost_cents(usage, pricing_for_model_or_default("claude-haiku-4-5"));
+        assert!(haiku > 0 && haiku < opus, "haiku={haiku} opus={opus}");
+
+        // Unknown models fall back to the REPL's default tier rather than
+        // panicking or reporting free.
+        let unknown = cost_cents(usage, pricing_for_model_or_default("totally-made-up-model"));
+        assert!(unknown > 0, "an unknown model must not report zero cost");
+    }
+
+    #[test]
+    fn zero_usage_costs_nothing_and_does_not_panic() {
+        assert_eq!(
+            cost_cents(TokenUsage::default(), pricing_for_model_or_default("")),
+            0
+        );
+    }
+
+    #[test]
+    fn usage_events_reach_the_status_bar_priced() {
+        let (tx, rx) = mpsc::channel();
+        let mut sink = ChannelSink::new(tx, "claude-opus-4-6");
+
+        sink.usage(TokenUsage {
+            input_tokens: 1_000_000,
+            output_tokens: 0,
+            ..TokenUsage::default()
+        })
+        .expect("send");
+        drop(sink);
+
+        let events: Vec<StreamEvent> = rx.iter().collect();
+        assert!(
+            matches!(
+                events.as_slice(),
+                [StreamEvent::Usage {
+                    input_tokens: 1_000_000,
+                    cost_cents: 1500,
+                    ..
+                }]
+            ),
+            "usage must arrive priced, got {events:?}"
+        );
+    }
 
     #[test]
     fn tool_input_summary_prefers_the_identifying_field_over_raw_json() {
@@ -452,7 +1097,7 @@ mod tests {
     #[test]
     fn text_after_thinking_closes_the_reasoning_block_exactly_once() {
         let (tx, rx) = mpsc::channel();
-        let mut sink = ChannelSink::new(tx);
+        let mut sink = ChannelSink::new(tx, MODEL);
 
         sink.thinking_delta("pondering").expect("send");
         sink.text_delta("answer").expect("send");
@@ -477,7 +1122,7 @@ mod tests {
     #[test]
     fn empty_thinking_block_does_not_duplicate_the_following_reasoning_delta() {
         let (tx, rx) = mpsc::channel();
-        let mut sink = ChannelSink::new(tx);
+        let mut sink = ChannelSink::new(tx, MODEL);
 
         sink.thinking_block("", None).expect("send");
         sink.thinking_delta("actual reasoning").expect("send");
@@ -508,7 +1153,7 @@ mod tests {
     #[test]
     fn complete_thinking_block_and_deltas_share_one_reasoning_entry() {
         let (tx, rx) = mpsc::channel();
-        let mut sink = ChannelSink::new(tx);
+        let mut sink = ChannelSink::new(tx, MODEL);
 
         sink.thinking_block("initial reasoning", None)
             .expect("send");
@@ -541,39 +1186,50 @@ mod tests {
         assert_eq!(deltas, vec!["initial reasoning", " and more"]);
     }
 
-    /// Drives a real turn against the configured provider. Opt-in because it
-    /// needs credentials and network:
-    ///   CLAW_TUI_LIVE_TEST=1 CLAW_TUI_LIVE_MODEL=<model> cargo test -p claw-tui -- --ignored
+    /// Drives a real turn against the configured provider through the same
+    /// session worker the frontend runs. Opt-in because it needs credentials
+    /// and network:
+    ///   CLAW_TUI_LIVE_MODEL=<model> cargo test -p claw-tui -- --ignored
     #[test]
     #[ignore = "requires a configured provider and network"]
     fn live_turn_streams_assistant_text_from_the_configured_endpoint() {
         let Ok(model) = std::env::var("CLAW_TUI_LIVE_MODEL") else {
             panic!("set CLAW_TUI_LIVE_MODEL to the model to exercise");
         };
-        let (tx, rx) = mpsc::channel();
+        let session =
+            super::spawn_session(std::env::current_dir().expect("cwd"), mpsc::channel().0);
 
-        let outcome = super::run_turn(
-            super::TurnRequest {
-                prompt: std::env::var("CLAW_TUI_LIVE_PROMPT")
+        assert!(
+            session.run_turn(
+                std::env::var("CLAW_TUI_LIVE_PROMPT")
                     .unwrap_or_else(|_| "reply with exactly: TUILIVE".to_string()),
                 model,
-                permission_mode: runtime::PermissionMode::Prompt,
-                session: runtime::Session::new(),
-                cwd: std::env::current_dir().expect("cwd"),
-                asks: mpsc::channel().0,
-            },
-            &tx,
+                runtime::PermissionMode::Prompt,
+            ),
+            "the session worker should accept the turn"
         );
-        drop(tx);
 
-        assert!(outcome.error.is_none(), "turn failed: {:?}", outcome.error);
-        let text: String = rx
-            .iter()
-            .filter_map(|event| match event {
-                StreamEvent::TextDelta(text) => Some(text),
-                _ => None,
-            })
-            .collect();
+        let mut text = String::new();
+        let mut failure = None;
+        // The worker holds its sender for the whole session, so read until the
+        // turn's own terminal event rather than until the channel closes.
+        loop {
+            match session
+                .events()
+                .recv_timeout(std::time::Duration::from_secs(120))
+                .expect("the turn should finish")
+            {
+                StreamEvent::TextDelta(delta) => text.push_str(&delta),
+                StreamEvent::Failed(error) => {
+                    failure = Some(error);
+                    break;
+                }
+                StreamEvent::Done { .. } => break,
+                _ => {}
+            }
+        }
+
+        assert!(failure.is_none(), "turn failed: {failure:?}");
         let expected =
             std::env::var("CLAW_TUI_LIVE_EXPECT").unwrap_or_else(|_| "TUILIVE".to_string());
         assert!(
@@ -581,16 +1237,16 @@ mod tests {
             "expected streamed assistant text, got {text:?}"
         );
         assert!(
-            outcome
-                .session
+            session
+                .shutdown()
                 .is_some_and(|session| !session.messages.is_empty()),
-            "the turn must come back with conversation history"
+            "the session must come back with conversation history"
         );
     }
 
     #[test]
     fn an_approved_tool_unblocks_the_waiting_turn() {
-        use runtime::{PermissionMode, PermissionPrompter, PermissionRequest};
+        use runtime::{PermissionPrompter, PermissionRequest};
 
         let (asks_tx, asks_rx) = mpsc::channel();
         let mut prompter = super::ChannelPrompter { asks: asks_tx };
@@ -618,7 +1274,7 @@ mod tests {
 
     #[test]
     fn a_frontend_that_quits_mid_prompt_denies_instead_of_hanging() {
-        use runtime::{PermissionMode, PermissionPrompter, PermissionRequest};
+        use runtime::{PermissionPrompter, PermissionRequest};
 
         // Receiver dropped: the draw loop is gone. The worker must not block
         // forever waiting for an answer that can never come.
@@ -642,7 +1298,7 @@ mod tests {
 
     #[test]
     fn a_dropped_reply_channel_denies_rather_than_blocking_forever() {
-        use runtime::{PermissionMode, PermissionPrompter, PermissionRequest};
+        use runtime::{PermissionPrompter, PermissionRequest};
 
         let (asks_tx, asks_rx) = mpsc::channel();
         let mut prompter = super::ChannelPrompter { asks: asks_tx };
@@ -673,7 +1329,7 @@ mod tests {
         // Regression: the executor was built with NullSink, so tools showed as
         // "running" and their output never arrived.
         let (tx, rx) = mpsc::channel();
-        let mut sink = ChannelSink::new(tx);
+        let mut sink = ChannelSink::new(tx, MODEL);
 
         sink.tool_call("read_file", r#"{"path":"src/lib.rs"}"#)
             .expect("send");
@@ -704,7 +1360,7 @@ mod tests {
     #[test]
     fn a_dead_receiver_does_not_fail_the_turn() {
         let (tx, rx) = mpsc::channel();
-        let mut sink = ChannelSink::new(tx);
+        let mut sink = ChannelSink::new(tx, MODEL);
         drop(rx);
 
         // The frontend quit mid-turn; the engine should not see an error.
@@ -715,10 +1371,10 @@ mod tests {
 
 /// What the frontend resolves from `settings.json` before a turn.
 ///
-/// `run_turn` reads the user's configuration, so these cover the difference
-/// between honouring it and ignoring it. They exercise the same
-/// `claw_engine::setup` entry points `run_turn` calls, without needing a
-/// provider or network.
+/// The session runtime reads the user's configuration, so these cover the
+/// difference between honouring it and ignoring it. They exercise the same
+/// `claw_engine::setup` entry points the runtime factory calls, without needing
+/// a provider or network.
 #[cfg(test)]
 mod config_tests {
     use std::fs;
@@ -728,10 +1384,10 @@ mod config_tests {
 
     /// A scratch directory that removes itself, so a failing assertion cannot
     /// leave fixtures behind.
-    struct TempDir(PathBuf);
+    pub(super) struct TempDir(PathBuf);
 
     impl TempDir {
-        fn new(label: &str) -> Self {
+        pub(super) fn new(label: &str) -> Self {
             use std::sync::atomic::{AtomicU64, Ordering};
             use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -746,7 +1402,7 @@ mod config_tests {
             Self(path)
         }
 
-        fn path(&self) -> &Path {
+        pub(super) fn path(&self) -> &Path {
             &self.0
         }
     }
@@ -757,8 +1413,8 @@ mod config_tests {
         }
     }
 
-    /// Resolve configuration exactly as `run_turn` does, for an isolated
-    /// workspace and config home.
+    /// Resolve configuration exactly as the runtime factory does, for an
+    /// isolated workspace and config home.
     fn plugin_state_for(
         workspace: &Path,
         config_home: &Path,
@@ -968,7 +1624,7 @@ mod config_tests {
     }
 
     #[test]
-    fn the_runtime_lifecycle_shuts_mcp_down_when_the_turn_ends() {
+    fn the_runtime_lifecycle_shuts_mcp_down_when_the_session_ends() {
         use super::RuntimeLifecycle;
 
         let workspace = TempDir::new("lifecycle-workspace");
@@ -980,7 +1636,8 @@ mod config_tests {
         );
         let mcp_state = state.mcp_state.clone().expect("mcp state");
 
-        // Dropping the guard is what a finished (or failed) turn does.
+        // Dropping the guard is what the end of a session — or a rebuild —
+        // does.
         let lifecycle = RuntimeLifecycle::new(state.plugin_registry, state.mcp_state);
         drop(lifecycle);
 
@@ -991,5 +1648,83 @@ mod config_tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .shutdown()
             .expect("a second shutdown must stay harmless");
+    }
+}
+
+/// Persisting the frontend's session where the REPL keeps its own.
+#[cfg(test)]
+mod persistence_tests {
+    use super::config_tests::TempDir;
+    use super::{persistence_path_for, SessionPersistence};
+    use runtime::{ConversationMessage, Session};
+    use std::sync::mpsc;
+
+    #[test]
+    fn a_frontend_session_round_trips_through_the_repls_session_store() {
+        let workspace = TempDir::new("persist-workspace");
+        let (events, _rx) = mpsc::channel();
+
+        let (mut session, mut persistence) = SessionPersistence::attach(
+            Session::new().with_workspace_root(workspace.path()),
+            workspace.path(),
+            &events,
+        );
+        session
+            .push_message(ConversationMessage::user_text("remember this"))
+            .expect("append");
+        persistence.save(&session, &events);
+
+        let path = persistence.path.clone().expect("a session path");
+        let loaded = Session::load_from_path(&path).expect("the session should load back");
+        let texts: Vec<&str> = loaded
+            .messages
+            .iter()
+            .flat_map(|message| &message.blocks)
+            .filter_map(|block| match block {
+                runtime::ContentBlock::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            texts,
+            vec!["remember this"],
+            "a session written by the frontend must load back with its messages"
+        );
+        assert_eq!(loaded.session_id, session.session_id);
+    }
+
+    #[test]
+    fn the_session_lands_where_the_repl_looks_for_it() {
+        // Same store and same extension as `rusty-claude-cli`, or `clawcli
+        // --resume` cannot see frontend sessions.
+        let workspace = TempDir::new("store-workspace");
+        let session = Session::new();
+
+        let path = persistence_path_for(workspace.path(), &session.session_id)
+            .expect("a session path should resolve");
+
+        let store = runtime::SessionStore::from_cwd(workspace.path()).expect("store");
+        assert_eq!(
+            path,
+            store.create_handle(&session.session_id).path,
+            "the frontend must write to the REPL's per-workspace session store"
+        );
+        assert_eq!(path.extension().and_then(|ext| ext.to_str()), Some("jsonl"));
+    }
+
+    #[test]
+    fn a_new_session_is_written_before_its_first_turn() {
+        // `--resume` should be able to see a session the user has not spoken
+        // in yet.
+        let workspace = TempDir::new("early-workspace");
+        let (events, _rx) = mpsc::channel();
+
+        let (_session, persistence) = SessionPersistence::attach(
+            Session::new().with_workspace_root(workspace.path()),
+            workspace.path(),
+            &events,
+        );
+
+        assert!(persistence.path.as_ref().is_some_and(|path| path.exists()));
     }
 }

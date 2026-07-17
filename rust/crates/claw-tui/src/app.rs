@@ -164,6 +164,9 @@ pub(crate) enum StreamEvent {
         cost_cents: u32,
     },
     Failed(String),
+    /// Something the session needs to say that is not part of a turn, such as
+    /// failing to save the conversation to disk.
+    Notice(String),
 }
 
 #[derive(Debug, Clone)]
@@ -386,7 +389,6 @@ pub struct App {
     scroll: u16,
     follow_output: bool,
     should_quit: bool,
-    stream_rx: Option<Receiver<StreamEvent>>,
     active_thinking: Option<usize>,
     active_assistant: Option<usize>,
     active_tool: Option<usize>,
@@ -397,15 +399,29 @@ pub struct App {
     status: Status,
     model_list_rx: Option<Receiver<Result<Vec<String>, String>>>,
     model_list_state: ModelListState,
-    /// Conversation history, parked here between turns and lent to the worker
-    /// while one runs.
-    session: Option<runtime::Session>,
-    session_rx_tx: Sender<Option<runtime::Session>>,
-    session_rx: Receiver<Option<runtime::Session>>,
+    /// The session worker: one thread owning one runtime for every turn of the
+    /// session. Started on the first message and stopped when the app quits.
+    session: Option<crate::turn::SessionHandle>,
     permission_tx: Sender<crate::turn::PermissionAsk>,
     permission_rx: Receiver<crate::turn::PermissionAsk>,
     /// The approval on screen; holds the channel the worker is blocked on.
     pending_permission: Option<crate::turn::PermissionAsk>,
+}
+
+impl Drop for App {
+    /// Order matters. A turn blocked on an approval can only end once its reply
+    /// channel is gone, and the session worker only notices the shutdown
+    /// between turns — so release the pending ask *before* waiting on the
+    /// worker, or the wait is spent on a turn that can never finish.
+    fn drop(&mut self) {
+        self.pending_permission = None;
+        // Stopping the worker is what shuts its MCP servers and plugins down.
+        // The session it hands back is already on disk, saved after its last
+        // turn, so there is nothing left to do with it here.
+        if let Some(session) = self.session.take() {
+            let _ = session.shutdown();
+        }
+    }
 }
 
 pub fn run() -> io::Result<()> {
@@ -419,7 +435,6 @@ pub fn run() -> io::Result<()> {
 fn run_loop(terminal: &mut crate::terminal::TuiTerminal, app: &mut App) -> io::Result<()> {
     loop {
         app.poll_stream();
-        app.poll_session();
         app.poll_permission();
         app.poll_model_list();
         terminal.hide_cursor()?;
@@ -436,7 +451,6 @@ fn run_loop(terminal: &mut crate::terminal::TuiTerminal, app: &mut App) -> io::R
 
 impl App {
     fn empty() -> Self {
-        let (session_rx_tx, session_rx) = mpsc::channel();
         let (permission_tx, permission_rx) = mpsc::channel();
         Self {
             theme: Theme::default(),
@@ -447,7 +461,6 @@ impl App {
             scroll: 0,
             follow_output: true,
             should_quit: false,
-            stream_rx: None,
             active_thinking: None,
             active_assistant: None,
             active_tool: None,
@@ -458,21 +471,44 @@ impl App {
             status: Status::default(),
             model_list_rx: None,
             model_list_state: ModelListState::Idle,
-            session: Some(runtime::Session::new()),
-            session_rx_tx,
-            session_rx,
+            session: None,
             permission_tx,
             permission_rx,
             pending_permission: None,
         }
     }
 
+    /// Send one prompt to the session worker.
+    ///
+    /// A turn blocks and executes tools, so it cannot share the draw thread.
+    /// The worker owns the runtime and the conversation for the whole session;
+    /// only the prompt crosses over, and history stays put.
     fn start_stream(&mut self, prompt: &str) {
         if !self.model_available() {
             return;
         }
-        let (tx, rx) = mpsc::channel();
-        self.stream_rx = Some(rx);
+        let model = self.status.model.clone();
+        let permission_mode = self.permission_mode();
+        let asks = self.permission_tx.clone();
+        let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+        // The first message is what starts the session: a frontend that never
+        // sends one never pays for plugins or MCP servers.
+        let session = self
+            .session
+            .get_or_insert_with(|| crate::turn::spawn_session(cwd, asks));
+
+        if !session.run_turn(prompt.to_string(), model, permission_mode) {
+            // The worker died between turns. Drop it so the next message starts
+            // a fresh session rather than silently doing nothing.
+            self.session = None;
+            self.messages.push(Message::new(
+                MessageKind::Assistant,
+                "Turn failed",
+                "the session stopped unexpectedly; the next message starts a new one",
+            ));
+            return;
+        }
+
         self.active_thinking = None;
         self.active_assistant = None;
         self.active_tool = None;
@@ -482,39 +518,6 @@ impl App {
         self.status.output_tokens = 0;
         self.status.cost_cents = 0;
         self.follow_output = true;
-        self.spawn_turn(prompt.to_string(), tx);
-    }
-
-    /// Run one real turn on a worker thread.
-    ///
-    /// `run_turn` blocks and executes tools, so it cannot share the draw
-    /// thread. The session travels to the worker and back so conversation
-    /// history survives across turns.
-    fn spawn_turn(&mut self, prompt: String, tx: Sender<StreamEvent>) {
-        let request = crate::turn::TurnRequest {
-            prompt,
-            model: self.status.model.clone(),
-            permission_mode: self.permission_mode(),
-            session: self.session.take().unwrap_or_default(),
-            cwd: std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
-            asks: self.permission_tx.clone(),
-        };
-        let session_tx = self.session_rx_tx.clone();
-        thread::spawn(move || {
-            let outcome = crate::turn::run_turn(request, &tx);
-            // Return the session before the terminal event so the draw loop has
-            // history back by the time it stops streaming.
-            let _ = session_tx.send(outcome.session);
-            let event = outcome.error.map_or(
-                StreamEvent::Done {
-                    input_tokens: 0,
-                    output_tokens: 0,
-                    cost_cents: 0,
-                },
-                StreamEvent::Failed,
-            );
-            let _ = tx.send(event);
-        });
     }
 
     /// Map the status bar's mode label onto the runtime's permission model.
@@ -528,20 +531,6 @@ impl App {
             "bypass" => runtime::PermissionMode::DangerFullAccess,
             // "ask" and anything unrecognised: prompt before acting.
             _ => runtime::PermissionMode::Prompt,
-        }
-    }
-
-    /// Take back conversation history from a finished turn. Without this the
-    /// next turn would start from an empty session.
-    fn poll_session(&mut self) {
-        while let Ok(session) = self.session_rx.try_recv() {
-            if let Some(session) = session {
-                self.session = Some(session);
-            }
-        }
-        // A worker that died without answering must not strand the session.
-        if self.session.is_none() && !self.status.streaming {
-            self.session = Some(runtime::Session::new());
         }
     }
 
@@ -581,14 +570,19 @@ impl App {
         self.overlay = None;
     }
 
+    /// Drain whatever the session worker has said since the last frame.
+    ///
+    /// The worker holds its sender for the whole session, so — unlike the old
+    /// per-turn channel — a disconnect means the worker itself is gone.
     fn poll_stream(&mut self) {
-        let Some(rx) = self.stream_rx.take() else {
+        let Some(session) = self.session.as_ref() else {
             return;
         };
+        let mut events = Vec::new();
         let mut connected = true;
         loop {
-            match rx.try_recv() {
-                Ok(event) => self.apply_stream_event(event),
+            match session.events().try_recv() {
+                Ok(event) => events.push(event),
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
                     connected = false;
@@ -596,8 +590,16 @@ impl App {
                 }
             }
         }
-        if connected {
-            self.stream_rx = Some(rx);
+        for event in events {
+            self.apply_stream_event(event);
+        }
+        if !connected {
+            self.session = None;
+            if self.status.streaming {
+                self.apply_stream_event(StreamEvent::Failed(
+                    "the session stopped unexpectedly".to_string(),
+                ));
+            }
         }
     }
 
@@ -658,6 +660,10 @@ impl App {
                 self.active_tool = None;
                 self.messages
                     .push(Message::new(MessageKind::Assistant, "Turn failed", error));
+            }
+            StreamEvent::Notice(text) => {
+                self.messages
+                    .push(Message::new(MessageKind::Command, "Session", text));
             }
             StreamEvent::Done {
                 input_tokens,
@@ -2749,7 +2755,9 @@ mod tests {
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
 
         assert!(!app.status.streaming);
-        assert!(app.stream_rx.is_none());
+        // No session worker: without a model there is nothing to start one for,
+        // so nothing loads config or starts MCP servers either.
+        assert!(app.session.is_none());
         assert!(app.messages.is_empty());
         assert!(app.input.is_empty());
 
