@@ -820,12 +820,14 @@ impl App {
         };
         message.tool_state = Some(state);
 
-        let detail = one_line(&message.body);
+        // Input and result stay on their own lines: collapsing them into
+        // "input · result" truncated both into uselessness.
+        let detail = one_line(message.body.lines().next().unwrap_or_default());
         let result = one_line(result);
         message.body = match (detail.is_empty(), result.is_empty()) {
             (true, false) => result,
             (false, true) => detail,
-            (false, false) => format!("{detail} · {result}"),
+            (false, false) => format!("{detail}\n{result}"),
             (true, true) => String::new(),
         };
     }
@@ -2020,30 +2022,48 @@ impl App {
             }
         }
 
-        let tool_width = width.saturating_sub(8) as usize;
+        let tool_width = width.saturating_sub(10) as usize;
         for message in messages
             .iter()
             .filter(|message| message.kind == MessageKind::Tool)
         {
-            let (icon, color) = match message.tool_state.unwrap_or(ToolState::Running) {
+            let state = message.tool_state.unwrap_or(ToolState::Running);
+            let (icon, color) = match state {
                 ToolState::Running => ('⚙', self.theme.accent),
                 ToolState::Succeeded => ('✓', self.theme.success),
                 ToolState::Failed => ('✗', self.theme.error),
             };
-            let title = truncate_display(&one_line(&message.title), 24);
-            let detail = truncate_display(&one_line(&message.body), tool_width.saturating_sub(28));
-            let mut spans = vec![
+            // Header: the tool and what it is doing.
+            let mut header = vec![
                 Span::styled("   └─ ", self.theme.muted()),
                 Span::styled(format!("{icon} "), Style::default().fg(color)),
                 Span::styled(
-                    title,
+                    truncate_display(&one_line(&message.title), 32),
                     Style::default().fg(color).add_modifier(Modifier::BOLD),
                 ),
             ];
-            if !detail.is_empty() {
-                spans.push(Span::styled(format!("  {detail}"), self.theme.muted()));
+            if state == ToolState::Running {
+                header.push(Span::styled("  ·  running", self.theme.muted()));
             }
-            lines.push(Line::from(spans));
+            lines.push(Line::from(header));
+
+            // Then its input, then its result — each on its own line, as the
+            // original layout had them.
+            for (index, body_line) in message.body.lines().enumerate() {
+                let body_line = body_line.trim();
+                if body_line.is_empty() {
+                    continue;
+                }
+                let style = if index == 0 {
+                    self.theme.muted()
+                } else {
+                    Style::default().fg(color)
+                };
+                lines.push(Line::from(vec![
+                    Span::raw("      "),
+                    Span::styled(truncate_display(body_line, tool_width), style),
+                ]));
+            }
         }
     }
 
@@ -3035,7 +3055,7 @@ mod tests {
     }
 
     #[test]
-    fn tool_output_is_kept_on_one_normalized_line() {
+    fn a_tool_keeps_its_input_and_result_on_separate_normalized_lines() {
         let mut app = App::empty();
         app.apply_stream_event(StreamEvent::ToolStart {
             name: "shell".to_string(),
@@ -3045,11 +3065,69 @@ mod tests {
             "✓ first line\nsecond line\nthird line".to_string(),
         ));
 
+        // Input on line one, result on line two: the transcript shows what the
+        // tool was asked to do and what came back, without either truncating
+        // the other.
+        let lines: Vec<&str> = app.messages[0].body.lines().collect();
         assert_eq!(
-            app.messages[0].body,
-            "cargo test · first line second line third line"
+            lines,
+            vec!["cargo test", "first line second line third line"]
         );
+        // A tool's own newlines are still collapsed, so a chatty tool cannot
+        // flood the transcript.
+        assert_eq!(lines.len(), 2);
         assert_eq!(app.messages[0].tool_state, Some(ToolState::Succeeded));
+    }
+
+    #[test]
+    fn a_running_tool_is_labelled_running_and_a_finished_one_is_not() {
+        let mut app = App::empty();
+        app.status.streaming = true;
+        app.apply_stream_event(StreamEvent::ToolStart {
+            name: "read_file".to_string(),
+            detail: "src/auth/token.rs".to_string(),
+        });
+
+        let backend = TestBackend::new(100, 20);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal.draw(|frame| app.draw(frame)).expect("draw");
+        let running: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(running.contains("read_file"), "the tool must be named");
+        assert!(
+            running.contains("running"),
+            "a live tool says so: {running:?}"
+        );
+        assert!(
+            running.contains("src/auth/token.rs"),
+            "its input must be visible on its own line"
+        );
+
+        app.apply_stream_event(StreamEvent::ToolOutput("✓ 48 lines read".to_string()));
+        let mut terminal = Terminal::new(TestBackend::new(100, 20)).expect("test terminal");
+        terminal.draw(|frame| app.draw(frame)).expect("draw");
+        let done: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(
+            done.contains("48 lines read"),
+            "the result must show: {done:?}"
+        );
+        // The group header legitimately says "running tool"; it is the tool's
+        // own row that must drop the label once it has finished.
+        assert!(
+            !done.contains("read_file  ·  running"),
+            "a finished tool must not still claim to be running: {done:?}"
+        );
     }
 
     #[test]
