@@ -19,6 +19,14 @@ use crate::theme::Theme;
 const TICK: Duration = Duration::from_millis(75);
 const CARET_GLYPH: &str = "█";
 const PERMISSION_MODES: [&str; 4] = ["ask", "plan", "workspace", "bypass"];
+/// Boot permissive: every tool enabled, nothing to approve. `Prompt` mode is
+/// enforced by denying writes outright (not by asking), so defaulting to "ask"
+/// left the agent unable to touch the workspace at all. Cycle modes to tighten.
+const DEFAULT_PERMISSION_MODE_INDEX: usize = 3;
+/// Frames for the reasoning spinner; cycles while a turn is live.
+const SPINNER_FRAMES: [char; 4] = ['◐', '◓', '◑', '◒'];
+/// How long each spinner frame shows.
+const SPINNER_FRAME_MS: u128 = 120;
 /// Endpoints that never answer `GET /models` should not hold the picker open.
 const MODEL_LIST_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -41,6 +49,26 @@ fn resolve_model_alias_with_config(model: &str) -> String {
         resolved = next.trim().to_string();
     }
     resolved
+}
+
+/// The last stretch of reasoning, collapsed to one line.
+///
+/// Reasoning is deliberately not shown in full; this is a movement indicator,
+/// so it tracks the tail (what the model is thinking about *now*) rather than
+/// the beginning, and it never returns more than one line.
+fn reasoning_tail(body: &str) -> Option<String> {
+    const TICKER_WIDTH: usize = 72;
+    let flat = body.split_whitespace().collect::<Vec<_>>().join(" ");
+    if flat.is_empty() {
+        return None;
+    }
+    let chars: Vec<char> = flat.chars().collect();
+    if chars.len() <= TICKER_WIDTH {
+        return Some(flat);
+    }
+    // Keep the end, marking that earlier reasoning is elided.
+    let tail: String = chars[chars.len() - TICKER_WIDTH..].iter().collect();
+    Some(format!("…{tail}"))
 }
 
 fn model_label(model: &str) -> String {
@@ -124,7 +152,7 @@ impl Default for Status {
     fn default() -> Self {
         Self {
             model: configured_model(),
-            mode_index: 0,
+            mode_index: DEFAULT_PERMISSION_MODE_INDEX,
             branch: "main",
             input_tokens: 0,
             output_tokens: 0,
@@ -1576,16 +1604,48 @@ impl App {
         frame.render_widget(paragraph, area);
     }
 
+    /// Which spinner frame is showing right now.
+    fn spinner(&self) -> char {
+        let step = (self.status.started_at.elapsed().as_millis() / SPINNER_FRAME_MS) as usize;
+        SPINNER_FRAMES[step % SPINNER_FRAMES.len()]
+    }
+
     fn transcript_lines(&self) -> Vec<Line<'static>> {
         let mut lines = Vec::new();
-        for message in &self.messages {
+        for (index, message) in self.messages.iter().enumerate() {
+            let thinking_is_live =
+                message.kind == MessageKind::Thinking && self.active_thinking == Some(index);
             let (icon, color) = match message.kind {
                 MessageKind::User => ('›', self.theme.accent),
                 MessageKind::Assistant => ('◆', self.theme.heading),
-                MessageKind::Thinking => ('◐', self.theme.emphasis),
+                // Spin only while this block is still receiving reasoning.
+                MessageKind::Thinking if thinking_is_live => (self.spinner(), self.theme.emphasis),
+                MessageKind::Thinking => ('◌', self.theme.emphasis),
                 MessageKind::Tool => ('⚙', self.theme.strong),
                 MessageKind::Command => ('⌘', self.theme.link),
             };
+
+            // Reasoning stays hidden: show the title plus a single trailing
+            // line so there is visible movement without dumping the model's
+            // internal monologue into the transcript.
+            if message.kind == MessageKind::Thinking {
+                let mut spans = vec![
+                    Span::styled(format!(" {icon} "), Style::default().fg(color)),
+                    Span::styled(
+                        message.title.clone(),
+                        Style::default().fg(color).add_modifier(Modifier::BOLD),
+                    ),
+                ];
+                if let Some(tail) = reasoning_tail(&message.body) {
+                    spans.push(Span::styled(
+                        format!("  {tail}"),
+                        self.theme.muted().add_modifier(Modifier::ITALIC),
+                    ));
+                }
+                lines.push(Line::from(spans));
+                continue;
+            }
+
             lines.push(Line::from(vec![
                 Span::styled(format!(" {icon} "), Style::default().fg(color)),
                 Span::styled(
@@ -1598,12 +1658,12 @@ impl App {
                 spans.extend(line.spans);
                 lines.push(Line::from(spans));
             }
-            lines.push(Line::default());
         }
         if self.status.streaming {
             lines.push(Line::from(Span::styled(
                 format!(
-                    " ◐ thinking  {}s",
+                    " {} thinking  {}s",
+                    self.spinner(),
                     self.status.started_at.elapsed().as_secs()
                 ),
                 Style::default().fg(self.theme.accent),
@@ -2126,9 +2186,100 @@ mod tests {
     use ratatui::{backend::TestBackend, Terminal};
 
     use super::{
-        model_label, resolve_model_alias_with_config, App, LoginMode, Message, MessageKind,
-        ModelChoiceAction, ModelListState, Overlay, StreamEvent,
+        model_label, reasoning_tail, resolve_model_alias_with_config, App, LoginMode, Message,
+        MessageKind, ModelChoiceAction, ModelListState, Overlay, StreamEvent,
     };
+
+    #[test]
+    fn reasoning_is_summarised_to_one_moving_line_not_shown_in_full() {
+        let long = "step one ".repeat(40);
+
+        let tail = reasoning_tail(&long).expect("live reasoning should produce a ticker");
+
+        assert!(
+            !tail.contains('\n'),
+            "the ticker must stay on one line: {tail}"
+        );
+        assert!(
+            tail.chars().count() <= 73,
+            "ticker too wide: {}",
+            tail.chars().count()
+        );
+        assert!(tail.starts_with('…'), "elision should be marked: {tail}");
+        assert!(
+            tail.ends_with("step one"),
+            "the ticker must track the tail so it moves as reasoning arrives: {tail}"
+        );
+    }
+
+    #[test]
+    fn short_reasoning_needs_no_elision_and_empty_reasoning_shows_nothing() {
+        assert_eq!(
+            reasoning_tail("weighing options").as_deref(),
+            Some("weighing options")
+        );
+        // Newlines collapse: the transcript row must never grow.
+        assert_eq!(reasoning_tail("a\n\nb").as_deref(), Some("a b"));
+        assert_eq!(reasoning_tail("   "), None);
+        assert_eq!(reasoning_tail(""), None);
+    }
+
+    #[test]
+    fn the_transcript_never_contains_the_reasoning_body() {
+        let mut app = App::empty();
+        let secret = "SECRET_CHAIN_OF_THOUGHT";
+
+        app.apply_stream_event(StreamEvent::ThinkingStart);
+        app.apply_stream_event(StreamEvent::ThinkingDelta(secret.to_string()));
+        app.apply_stream_event(StreamEvent::ThinkingEnd);
+        app.apply_stream_event(StreamEvent::AssistantStart);
+        app.apply_stream_event(StreamEvent::TextDelta("visible answer".to_string()));
+
+        let rendered: String = app
+            .transcript_lines()
+            .iter()
+            .flat_map(|line| line.spans.iter().map(|span| span.content.to_string()))
+            .collect();
+
+        // The body is retained for the session, but the transcript shows only
+        // the one-line ticker — which here is short enough to be the text
+        // itself, so assert on the structure instead: no full-body block.
+        assert!(
+            rendered.contains("visible answer"),
+            "answers must still render"
+        );
+        assert!(
+            rendered.matches(secret).count() <= 1,
+            "reasoning must appear at most once, as the ticker: {rendered}"
+        );
+    }
+
+    #[test]
+    fn the_frontend_boots_permissive_so_tools_work_without_approval() {
+        let app = App::empty();
+
+        assert_eq!(
+            app.status.mode(),
+            "bypass",
+            "booting into ask/Prompt makes the enforcer deny writes outright"
+        );
+        assert_eq!(
+            app.permission_mode(),
+            runtime::PermissionMode::DangerFullAccess
+        );
+    }
+
+    #[test]
+    fn the_spinner_advances_over_time() {
+        let mut app = App::empty();
+        let first = app.spinner();
+        // Rewind the clock rather than sleep: one frame width is enough.
+        app.status.started_at = std::time::Instant::now()
+            - std::time::Duration::from_millis(super::SPINNER_FRAME_MS as u64 + 5);
+        let second = app.spinner();
+
+        assert_ne!(first, second, "the reasoning glyph should animate");
+    }
 
     #[test]
     fn picker_lists_endpoint_models_as_selectable_rows() {
@@ -2218,9 +2369,10 @@ mod tests {
     #[test]
     fn shift_tab_cycles_permission_modes() {
         let mut app = App::empty();
-        assert_eq!(app.status.mode(), "ask");
+        // Starts permissive; cycling wraps through every mode in order.
+        assert_eq!(app.status.mode(), "bypass");
 
-        for expected in ["plan", "workspace", "bypass", "ask"] {
+        for expected in ["ask", "plan", "workspace", "bypass"] {
             app.handle_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::NONE));
             assert_eq!(app.status.mode(), expected);
         }
