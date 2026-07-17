@@ -13855,7 +13855,8 @@ fn build_runtime_with_plugin_state(
         policy,
         system_prompt,
         &feature_config,
-    );
+    )
+    .with_caveman_compression(runtime::caveman_enabled());
     if emit_output {
         runtime = runtime.with_hook_progress_reporter(Box::new(CliHookProgressReporter));
     }
@@ -14175,6 +14176,8 @@ impl AnthropicRuntimeClient {
         };
         let renderer = TerminalRenderer::new();
         let mut markdown_stream = MarkdownStreamState::default();
+        let caveman_output = runtime::caveman_enabled();
+        let mut pending_output_text = String::new();
         let mut events = Vec::new();
         let mut pending_tool: Option<(String, String, String)> = None;
         // 累积 reasoning_content 到 Thinking 块（修复 DeepSeek V4 reasoning_content 协议 bug）
@@ -14216,6 +14219,8 @@ impl AnthropicRuntimeClient {
                             &mut pending_tool,
                             true,
                             &mut block_has_thinking_summary,
+                            caveman_output,
+                            &mut pending_output_text,
                         )?;
                     }
                 }
@@ -14235,6 +14240,8 @@ impl AnthropicRuntimeClient {
                         &mut pending_tool,
                         true,
                         &mut block_has_thinking_summary,
+                        caveman_output,
+                        &mut pending_output_text,
                     )?;
                 }
                 ApiStreamEvent::ContentBlockDelta(delta) => match delta.delta {
@@ -14243,7 +14250,9 @@ impl AnthropicRuntimeClient {
                             if let Some(progress_reporter) = &self.progress_reporter {
                                 progress_reporter.mark_text_phase(&text);
                             }
-                            if let Some(rendered) = markdown_stream.push(&renderer, &text) {
+                            if caveman_output {
+                                pending_output_text.push_str(&text);
+                            } else if let Some(rendered) = markdown_stream.push(&renderer, &text) {
                                 write!(out, "{rendered}")
                                     .and_then(|()| out.flush())
                                     .map_err(|error| RuntimeError::new(error.to_string()))?;
@@ -14275,7 +14284,9 @@ impl AnthropicRuntimeClient {
                 },
                 ApiStreamEvent::ContentBlockStop(_) => {
                     block_has_thinking_summary = false;
-                    if let Some(rendered) = markdown_stream.flush(&renderer) {
+                    if caveman_output {
+                        flush_caveman_output(&mut pending_output_text, out)?;
+                    } else if let Some(rendered) = markdown_stream.flush(&renderer) {
                         write!(out, "{rendered}")
                             .and_then(|()| out.flush())
                             .map_err(|error| RuntimeError::new(error.to_string()))?;
@@ -14303,7 +14314,9 @@ impl AnthropicRuntimeClient {
                 }
                 ApiStreamEvent::MessageStop(_) => {
                     saw_stop = true;
-                    if let Some(rendered) = markdown_stream.flush(&renderer) {
+                    if caveman_output {
+                        flush_caveman_output(&mut pending_output_text, out)?;
+                    } else if let Some(rendered) = markdown_stream.flush(&renderer) {
                         write!(out, "{rendered}")
                             .and_then(|()| out.flush())
                             .map_err(|error| RuntimeError::new(error.to_string()))?;
@@ -14313,6 +14326,9 @@ impl AnthropicRuntimeClient {
             }
         }
 
+        if caveman_output {
+            flush_caveman_output(&mut pending_output_text, out)?;
+        }
         push_prompt_cache_record(&self.client, &mut events);
 
         if !saw_stop
@@ -14341,7 +14357,7 @@ impl AnthropicRuntimeClient {
             .map_err(|error| {
                 RuntimeError::new(format_user_visible_api_error(&self.session_id, &error))
             })?;
-        let mut events = response_to_events(response, out)?;
+        let mut events = response_to_events(response, out, caveman_output)?;
         push_prompt_cache_record(&self.client, &mut events);
         Ok(events)
     }
@@ -15320,14 +15336,20 @@ fn push_output_block(
     pending_tool: &mut Option<(String, String, String)>,
     streaming_tool_input: bool,
     block_has_thinking_summary: &mut bool,
+    caveman_output: bool,
+    pending_output_text: &mut String,
 ) -> Result<(), RuntimeError> {
     match block {
         OutputContentBlock::Text { text } => {
             if !text.is_empty() {
-                let rendered = TerminalRenderer::new().markdown_to_ansi(&text);
-                write!(out, "{rendered}")
-                    .and_then(|()| out.flush())
-                    .map_err(|error| RuntimeError::new(error.to_string()))?;
+                if caveman_output {
+                    pending_output_text.push_str(&text);
+                } else {
+                    let rendered = TerminalRenderer::new().markdown_to_ansi(&text);
+                    write!(out, "{rendered}")
+                        .and_then(|()| out.flush())
+                        .map_err(|error| RuntimeError::new(error.to_string()))?;
+                }
                 events.push(AssistantEvent::TextDelta(text));
             }
         }
@@ -15364,12 +15386,32 @@ fn push_output_block(
     Ok(())
 }
 
+fn flush_caveman_output(
+    pending_output_text: &mut String,
+    out: &mut (impl Write + ?Sized),
+) -> Result<(), RuntimeError> {
+    if pending_output_text.is_empty() {
+        return Ok(());
+    }
+    let compressed = runtime::compress_caveman(pending_output_text);
+    pending_output_text.clear();
+    if compressed.is_empty() {
+        return Ok(());
+    }
+    let rendered = TerminalRenderer::new().markdown_to_ansi(&compressed);
+    write!(out, "{rendered}")
+        .and_then(|()| out.flush())
+        .map_err(|error| RuntimeError::new(error.to_string()))
+}
+
 fn response_to_events(
     response: MessageResponse,
     out: &mut (impl Write + ?Sized),
+    caveman_output: bool,
 ) -> Result<Vec<AssistantEvent>, RuntimeError> {
     let mut events = Vec::new();
     let mut pending_tool = None;
+    let mut pending_output_text = String::new();
 
     for block in response.content {
         let mut block_has_thinking_summary = false;
@@ -15380,7 +15422,10 @@ fn response_to_events(
             &mut pending_tool,
             false,
             &mut block_has_thinking_summary,
+            caveman_output,
+            &mut pending_output_text,
         )?;
+        flush_caveman_output(&mut pending_output_text, out)?;
         if let Some((id, name, input)) = pending_tool.take() {
             events.push(AssistantEvent::ToolUse { id, name, input });
         }
@@ -15561,6 +15606,13 @@ fn permission_policy(
 }
 
 fn convert_messages(messages: &[ConversationMessage]) -> Vec<InputMessage> {
+    convert_messages_with_mode(messages, runtime::caveman_enabled())
+}
+
+fn convert_messages_with_mode(
+    messages: &[ConversationMessage],
+    caveman: bool,
+) -> Vec<InputMessage> {
     messages
         .iter()
         .filter_map(|message| {
@@ -15572,17 +15624,26 @@ fn convert_messages(messages: &[ConversationMessage]) -> Vec<InputMessage> {
                 .blocks
                 .iter()
                 .filter_map(|block| match block {
-                    ContentBlock::Text { text } => {
-                        Some(InputContentBlock::Text { text: text.clone() })
-                    }
+                    ContentBlock::Text { text } => Some(InputContentBlock::Text {
+                        text: if caveman {
+                            runtime::compress_caveman(text)
+                        } else {
+                            text.clone()
+                        },
+                    }),
                     ContentBlock::Thinking {
                         thinking,
                         signature,
                     } => {
-                        // 保留 Thinking 块：OpenAI 兼容协议会把它转成 reasoning_content 字段
-                        // 回传给 DeepSeek V4（避免 400 "reasoning_content must be passed back" 错误）
+                        // Keep signed thinking exact: provider signatures can
+                        // cover the thinking text. Compress unsigned reasoning
+                        // before sending it back as reasoning_content.
                         Some(InputContentBlock::Thinking {
-                            thinking: thinking.clone(),
+                            thinking: if caveman && signature.is_none() {
+                                runtime::compress_caveman(thinking)
+                            } else {
+                                thinking.clone()
+                            },
                             signature: signature.clone(),
                         })
                     }
@@ -15600,7 +15661,11 @@ fn convert_messages(messages: &[ConversationMessage]) -> Vec<InputMessage> {
                     } => Some(InputContentBlock::ToolResult {
                         tool_use_id: tool_use_id.clone(),
                         content: vec![ToolResultContentBlock::Text {
-                            text: output.clone(),
+                            text: if caveman {
+                                runtime::compress_caveman(output)
+                            } else {
+                                output.clone()
+                            },
                         }],
                         is_error: *is_error,
                     }),
@@ -15865,7 +15930,10 @@ mod tests {
         DEFAULT_ANTHROPIC_COMPAT_MODEL, DEFAULT_MODEL, DEFAULT_OPENAI_COMPAT_BASE_URL,
         DEFAULT_OPENAI_COMPAT_MODEL, LATEST_SESSION_REFERENCE, STUB_COMMANDS,
     };
-    use api::{ApiError, MessageResponse, OutputContentBlock, Usage};
+    use api::{
+        ApiError, InputContentBlock, MessageResponse, OutputContentBlock, ToolResultContentBlock,
+        Usage,
+    };
     use plugins::{
         PluginManager, PluginManagerConfig, PluginTool, PluginToolDefinition, PluginToolPermission,
     };
@@ -20727,6 +20795,81 @@ UU conflicted.rs",
         assert_eq!(converted[1].role, "assistant");
         assert_eq!(converted[2].role, "user");
     }
+
+    #[test]
+    fn caveman_conversion_compresses_prose_but_preserves_tool_payloads() {
+        let messages = vec![
+            ConversationMessage::user_text(
+                "Please review the auth middleware in src/auth/token.rs and do not change the public API.",
+            ),
+            ConversationMessage::assistant(vec![
+                ContentBlock::Thinking {
+                    thinking: "Please inspect the exact 401 error before responding.".to_string(),
+                    signature: None,
+                },
+                ContentBlock::ToolUse {
+                    id: "tool-1".to_string(),
+                    name: "bash".to_string(),
+                    input: r#"{"command":"printf 'the exact value'"}"#.to_string(),
+                },
+            ]),
+            ConversationMessage {
+                role: MessageRole::Tool,
+                blocks: vec![ContentBlock::ToolResult {
+                    tool_use_id: "tool-1".to_string(),
+                    tool_name: "bash".to_string(),
+                    output: "Please preserve the exact 401 error and file path.".to_string(),
+                    is_error: false,
+                }],
+                usage: None,
+            },
+        ];
+
+        let converted = super::convert_messages_with_mode(&messages, true);
+        let user_text = match &converted[0].content[0] {
+            InputContentBlock::Text { text } => text,
+            other => panic!("expected user text, got {other:?}"),
+        };
+        assert!(!user_text.contains("Please"));
+        assert!(user_text.contains("src/auth/token.rs"));
+        assert!(user_text.contains("do not"));
+
+        let thinking = match &converted[1].content[0] {
+            InputContentBlock::Thinking { thinking, .. } => thinking,
+            other => panic!("expected thinking block, got {other:?}"),
+        };
+        assert!(!thinking.contains("Please"));
+        assert!(thinking.contains("401"));
+
+        assert!(matches!(
+            &converted[1].content[1],
+            InputContentBlock::ToolUse { input, .. } if input["command"] == "printf 'the exact value'"
+        ));
+        let tool_result = match &converted[2].content[0] {
+            InputContentBlock::ToolResult { content, .. } => content,
+            other => panic!("expected tool result, got {other:?}"),
+        };
+        assert!(matches!(
+            &tool_result[0],
+            ToolResultContentBlock::Text { text } if !text.contains("Please") && text.contains("401")
+        ));
+    }
+
+    #[test]
+    fn caveman_conversion_keeps_signed_thinking_verbatim() {
+        let messages = vec![ConversationMessage::assistant(vec![ContentBlock::Thinking {
+            thinking: "Please preserve this signed provider trace exactly.".to_string(),
+            signature: Some("sig".to_string()),
+        }])];
+
+        let converted = super::convert_messages_with_mode(&messages, true);
+        let thinking = match &converted[0].content[0] {
+            InputContentBlock::Thinking { thinking, .. } => thinking,
+            other => panic!("expected thinking block, got {other:?}"),
+        };
+        assert_eq!(thinking, "Please preserve this signed provider trace exactly.");
+    }
+
     #[test]
     fn repl_help_mentions_history_completion_and_multiline() {
         let help = render_repl_help(&[]);
@@ -21080,6 +21223,8 @@ UU conflicted.rs",
             &mut pending_tool,
             false,
             &mut block_has_thinking_summary,
+            false,
+            &mut String::new(),
         )
         .expect("text block should render");
 
@@ -21106,6 +21251,8 @@ UU conflicted.rs",
             &mut pending_tool,
             true,
             &mut block_has_thinking_summary,
+            false,
+            &mut String::new(),
         )
         .expect("tool block should accumulate");
 
@@ -21141,6 +21288,7 @@ UU conflicted.rs",
                 request_id: None,
             },
             &mut out,
+            false,
         )
         .expect("response conversion should succeed");
 
@@ -21176,6 +21324,7 @@ UU conflicted.rs",
                 request_id: None,
             },
             &mut out,
+            false,
         )
         .expect("response conversion should succeed");
 
@@ -21215,6 +21364,7 @@ UU conflicted.rs",
                 request_id: None,
             },
             &mut out,
+            false,
         )
         .expect("response conversion should succeed");
 
@@ -21232,6 +21382,41 @@ UU conflicted.rs",
         let rendered = String::from_utf8(out).expect("utf8");
         assert!(rendered.contains("▶ Thinking (6 chars hidden)"));
         assert!(!rendered.contains("step 1"));
+    }
+
+    #[test]
+    fn response_to_events_renders_caveman_output_but_keeps_event_text() {
+        let mut out = Vec::new();
+        let source = "Please review the auth middleware in src/auth/token.rs and do not change the public API.";
+        let events = response_to_events(
+            MessageResponse {
+                id: "msg-4".to_string(),
+                kind: "message".to_string(),
+                model: "anthropic/claude-opus-4-6".to_string(),
+                role: "assistant".to_string(),
+                content: vec![OutputContentBlock::Text {
+                    text: source.to_string(),
+                }],
+                stop_reason: Some("end_turn".to_string()),
+                stop_sequence: None,
+                usage: Usage {
+                    input_tokens: 1,
+                    output_tokens: 1,
+                    cache_creation_input_tokens: 0,
+                    cache_read_input_tokens: 0,
+                },
+                request_id: None,
+            },
+            &mut out,
+            true,
+        )
+        .expect("response conversion should succeed");
+
+        assert!(matches!(&events[0], AssistantEvent::TextDelta(text) if text == source));
+        let rendered = String::from_utf8(out).expect("utf8");
+        assert!(!rendered.contains("Please"));
+        assert!(rendered.contains("src/auth/token.rs"));
+        assert!(rendered.contains("do not change public API"));
     }
 
     #[test]

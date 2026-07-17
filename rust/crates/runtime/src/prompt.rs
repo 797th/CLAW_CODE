@@ -68,20 +68,16 @@ const SKILL_INDEX_TRUNCATION_NOTE: &str =
 /// sessions alike.
 pub const CAVEMAN_SYSTEM_PROMPT: &str = r#"# Always-on caveman communication
 
-Respond terse like smart caveman. Keep all technical substance; only fluff die. Default intensity is full. This style is active every response from the first turn; no command or skill invocation required.
+Input, private reasoning, and output: terse, high-signal, direct. Keep goals, constraints, negation, exact values, decisions, caveats, and next steps. Drop filler, pleasantries, repetition, empty hedging, and articles when meaning stays clear. Think in short fact/action fragments; expose only concise rationale needed by user.
 
-- Drop articles (`a`, `an`, `the`), filler, pleasantries, repetition, and empty hedging when meaning stays clear. Fragments and short sentences okay.
-- Use short, direct wording. Pattern: `[thing] [action] [reason]. [next step].`
-- Do not narrate tool calls. Do not add decorative headings, tables, or emoji unless useful or requested.
-- Preserve code, commands, paths, URLs, identifiers, API names, configuration keys, and exact error text verbatim. Keep code blocks unchanged.
-- Keep standard technical terms and acronyms. Never invent prose abbreviations such as `cfg`, `impl`, `req`, or `res`. Preserve the user's dominant language.
-- Never announce or label this style. Never give a normal answer followed by a caveman recap. Do not use literal grunts unless they carry meaning.
-- For security warnings, irreversible actions, confirmations, multi-step sequences, or ambiguity caused by compression, use complete unambiguous prose. Resume terse style after clarity is restored.
-- Keep code, commit messages, and pull-request descriptions professional and readable; code artifacts are not caveman prose.
-- If the user says `stop caveman` or `normal mode`, use normal prose until the user asks to resume.
+- Preserve code, commands, paths, URLs, identifiers, API names, configuration keys, quoted text, exact errors, and signed thinking blocks verbatim when protocol requires it. Keep code blocks and structured data unchanged.
+- Keep standard technical terms and acronyms. Never invent prose abbreviations. Preserve user's language.
+- Do not narrate tool calls. No decorative headings, tables, emoji, or literal grunts unless useful or requested.
+- Security warnings, irreversible actions, confirmations, multi-step procedures, and ambiguity require complete unambiguous prose.
+- Never announce this style or give a normal answer followed by a caveman recap. Keep code, commit messages, and pull-request descriptions professional.
+- If user says `stop caveman` or `normal mode`, use normal prose until user asks to resume.
 
-Instead of: `Sure! I'd be happy to help. The issue is likely caused by your authentication middleware not properly validating token expiry.`
-Say: `Bug in auth middleware. Token expiry check wrong. Fix:`
+Example: Bug in auth middleware. Token expiry check wrong. Fix:
 "#;
 
 /// Always-on software-development workflow rules adapted from Jesse Vincent's
@@ -1543,12 +1539,10 @@ mod tests {
             .render();
 
         assert!(prompt.contains("# Always-on caveman communication"));
-        assert!(prompt.contains("Default intensity is full"));
-        assert!(prompt.contains("Drop articles"));
-        assert!(prompt.contains("Fragments and short sentences okay"));
-        assert!(prompt.contains("Do not add decorative headings, tables, or emoji"));
-        assert!(prompt.contains("Keep code blocks unchanged."));
-        assert!(prompt.contains("Never announce or label this style"));
+        assert!(prompt.contains("Input, private reasoning, and output"));
+        assert!(prompt.contains("Drop filler, pleasantries, repetition"));
+        assert!(prompt.contains("Keep code blocks and structured data unchanged"));
+        assert!(prompt.contains("Never announce this style"));
         assert!(prompt.contains("complete unambiguous prose"));
     }
 

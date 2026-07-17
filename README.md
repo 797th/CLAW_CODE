@@ -134,6 +134,16 @@ articles, and verbosity across interactive, one-shot, resumed, and
 model-switched sessions, so no `/caveman` command or skill installation is
 needed. Say `normal mode` or `stop caveman` to use normal prose.
 
+Provider-bound user text, prior assistant text, thinking blocks, and plain tool
+results receive the same loss-aware compression before each request. Original
+session content stays intact. Code, commands, paths, URLs, identifiers, quoted
+text, structured payloads, tool arguments, signatures, and exact technical
+values stay unchanged. Signed provider thinking blocks also stay exact when
+their signature covers the text. Set `CLAW_CAVEMAN=0` for an uncompressed compatibility
+run. Compare the three sample probes with `./scripts/caveman-fidelity.sh`.
+The script reports a repeatable `chars/4` token estimate and required-term
+answer fidelity; provider billing tokenizers may report different totals.
+
 `clawcli` also includes an always-on Superpowers-style development workflow.
 For non-trivial changes it automatically applies focused discovery,
 brainstorming, planning, TDD, systematic debugging, review, and verification.

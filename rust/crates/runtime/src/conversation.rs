@@ -4,6 +4,7 @@ use std::fmt::{Display, Formatter};
 use serde_json::{Map, Value};
 use telemetry::SessionTracer;
 
+use crate::caveman::compress_caveman;
 use crate::compact::{
     compact_session, compact_session_to_target, estimate_session_tokens, CompactionConfig,
     CompactionResult,
@@ -158,6 +159,7 @@ pub struct ConversationRuntime<C, T> {
     hook_progress_reporter: Option<Box<dyn HookProgressReporter>>,
     session_tracer: Option<SessionTracer>,
     workflow_gate_mode: WorkflowGateMode,
+    caveman_compression: bool,
 }
 
 impl<C, T> ConversationRuntime<C, T>
@@ -208,7 +210,17 @@ where
             hook_progress_reporter: None,
             session_tracer: None,
             workflow_gate_mode: feature_config.workflow_gates(),
+            caveman_compression: false,
         }
+    }
+
+    /// Enable loss-aware Caveman compression for stored assistant text and
+    /// thinking blocks. Provider-bound user/history text is compressed by the
+    /// CLI adapter; this setting keeps the canonical turn output compact too.
+    #[must_use]
+    pub fn with_caveman_compression(mut self, enabled: bool) -> Self {
+        self.caveman_compression = enabled;
+        self
     }
 
     #[must_use]
@@ -467,7 +479,7 @@ where
                 }
             };
             let (assistant_message, usage, turn_prompt_cache_events) =
-                match build_assistant_message(events) {
+                match build_assistant_message_with_mode(events, self.caveman_compression) {
                     Ok(result) => result,
                     Err(error) => {
                         self.record_turn_failed(iterations, &error);
@@ -924,8 +936,9 @@ fn parse_auto_compaction_threshold(value: Option<&str>) -> u32 {
     }
 }
 
-fn build_assistant_message(
+fn build_assistant_message_with_mode(
     events: Vec<AssistantEvent>,
+    caveman_compression: bool,
 ) -> Result<
     (
         ConversationMessage,
@@ -946,15 +959,21 @@ fn build_assistant_message(
                 thinking,
                 signature,
             } => {
-                flush_text_block(&mut text, &mut blocks);
+                flush_text_block(&mut text, &mut blocks, caveman_compression);
                 blocks.push(ContentBlock::Thinking {
-                    thinking,
+                    // Provider signatures can cover the thinking text. Keep
+                    // signed blocks exact; compress unsigned reasoning only.
+                    thinking: if caveman_compression && signature.is_none() {
+                        compress_caveman(&thinking)
+                    } else {
+                        thinking
+                    },
                     signature,
                 });
             }
             AssistantEvent::TextDelta(delta) => text.push_str(&delta),
             AssistantEvent::ToolUse { id, name, input } => {
-                flush_text_block(&mut text, &mut blocks);
+                flush_text_block(&mut text, &mut blocks, caveman_compression);
                 blocks.push(ContentBlock::ToolUse { id, name, input });
             }
             AssistantEvent::Usage(value) => usage = Some(value),
@@ -965,7 +984,7 @@ fn build_assistant_message(
         }
     }
 
-    flush_text_block(&mut text, &mut blocks);
+    flush_text_block(&mut text, &mut blocks, caveman_compression);
 
     if !finished {
         return Err(RuntimeError::new(
@@ -983,11 +1002,22 @@ fn build_assistant_message(
     ))
 }
 
-fn flush_text_block(text: &mut String, blocks: &mut Vec<ContentBlock>) {
+fn flush_text_block(
+    text: &mut String,
+    blocks: &mut Vec<ContentBlock>,
+    caveman_compression: bool,
+) {
     if !text.is_empty() {
         blocks.push(ContentBlock::Text {
-            text: std::mem::take(text),
+            text: if caveman_compression {
+                compress_caveman(text)
+            } else {
+                std::mem::take(text)
+            },
         });
+        if caveman_compression {
+            text.clear();
+        }
     }
 }
 
@@ -1053,7 +1083,8 @@ impl ToolExecutor for StaticToolExecutor {
 #[cfg(test)]
 mod tests {
     use super::{
-        auto_compaction_target_estimate, build_assistant_message, parse_auto_compaction_threshold,
+        auto_compaction_target_estimate, build_assistant_message_with_mode,
+        parse_auto_compaction_threshold,
         ApiClient, ApiRequest, AssistantEvent, AutoCompactionEvent, ConversationRuntime,
         PromptCacheEvent, RuntimeError, StaticToolExecutor, ToolExecutor,
         DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD,
@@ -1939,7 +1970,7 @@ mod tests {
         let events = vec![AssistantEvent::TextDelta("hello".to_string())];
 
         // when
-        let error = build_assistant_message(events)
+        let error = build_assistant_message_with_mode(events, false)
             .expect_err("assistant messages should require a stop event");
 
         // then
@@ -1955,7 +1986,8 @@ mod tests {
 
         // when
         let error =
-            build_assistant_message(events).expect_err("assistant messages should require content");
+            build_assistant_message_with_mode(events, false)
+                .expect_err("assistant messages should require content");
 
         // then
         assert!(error
@@ -1981,7 +2013,7 @@ mod tests {
         ];
 
         // when
-        let (message, _, _) = build_assistant_message(events)
+        let (message, _, _) = build_assistant_message_with_mode(events, false)
             .expect("assistant message should preserve thinking, text, and tool blocks");
 
         // then
@@ -2001,6 +2033,62 @@ mod tests {
                     input: "payload".to_string(),
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn caveman_mode_compresses_thinking_and_answer_but_keeps_code() {
+        let events = vec![
+            AssistantEvent::Thinking {
+                thinking: "Please inspect the auth middleware before answering.".to_string(),
+                signature: None,
+            },
+            AssistantEvent::TextDelta(
+                "Please update src/auth/token.rs. ```rust\nlet value = \"the exact text\";\n```"
+                    .to_string(),
+            ),
+            AssistantEvent::MessageStop,
+        ];
+
+        let (message, _, _) = build_assistant_message_with_mode(events, true)
+            .expect("compressed assistant message should build");
+
+        assert_eq!(
+            message.blocks[0],
+            ContentBlock::Thinking {
+                thinking: "inspect auth middleware before answering.".to_string(),
+                signature: None,
+            }
+        );
+        assert!(matches!(
+            &message.blocks[1],
+            ContentBlock::Text { text }
+                if text.starts_with("update src/auth/token.rs.")
+                    && text.contains("let value = \"the exact text\";")
+                    && !text.contains("Please")
+        ));
+    }
+
+    #[test]
+    fn caveman_mode_keeps_signed_thinking_exact() {
+        let events = vec![
+            AssistantEvent::Thinking {
+                thinking: "Please preserve this signed provider trace exactly.".to_string(),
+                signature: Some("sig".to_string()),
+            },
+            AssistantEvent::TextDelta("Answer".to_string()),
+            AssistantEvent::MessageStop,
+        ];
+
+        let (message, _, _) = build_assistant_message_with_mode(events, true)
+            .expect("signed thinking message should build");
+
+        assert_eq!(
+            message.blocks[0],
+            ContentBlock::Thinking {
+                thinking: "Please preserve this signed provider trace exactly.".to_string(),
+                signature: Some("sig".to_string()),
+            }
         );
     }
 
