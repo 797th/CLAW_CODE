@@ -1247,11 +1247,9 @@ fn read_line_with_escape() -> io::Result<String> {
                     print!("{character}");
                     io::stdout().flush()?;
                 }
-                KeyCode::Backspace => {
-                    if value.pop().is_some() {
-                        print!("\x08 \x08");
-                        io::stdout().flush()?;
-                    }
+                KeyCode::Backspace if value.pop().is_some() => {
+                    print!("\x08 \x08");
+                    io::stdout().flush()?;
                 }
                 _ => {}
             }
@@ -2563,9 +2561,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
         // Only reject for known top-level subcommands that don't use compact.
         let first = rest[0].as_str();
         if is_known_top_level_subcommand(first) && first != "prompt" {
-            return Err(format!(
-                "invalid_flag_value: --compact is only supported with prompt mode.\nUsage: claw --compact \"<prompt>\" or echo \"<prompt>\" | claw --compact"
-            ));
+            return Err("invalid_flag_value: --compact is only supported with prompt mode.\nUsage: claw --compact \"<prompt>\" or echo \"<prompt>\" | claw --compact".to_string());
         }
     }
 
@@ -4147,9 +4143,7 @@ fn parse_system_prompt_args(
                 })?;
                 // #99: validate --date is a plausible date string (no newlines, reasonable length)
                 if value.contains('\n') || value.contains('\r') {
-                    return Err(format!(
-                        "invalid_flag_value: --date value contains invalid characters.\nUsage: --date <YYYY-MM-DD>"
-                    ));
+                    return Err("invalid_flag_value: --date value contains invalid characters.\nUsage: --date <YYYY-MM-DD>".to_string());
                 }
                 if value.len() > 20 {
                     return Err(format!(
@@ -4386,11 +4380,7 @@ impl DiagnosticCheck {
 
     fn json_value(&self) -> Value {
         // Derive a stable snake_case id from the check name for machine-readable keying (#704).
-        let id = self
-            .name
-            .to_ascii_lowercase()
-            .replace(' ', "_")
-            .replace('-', "_");
+        let id = self.name.to_ascii_lowercase().replace([' ', '-'], "_");
         let mut value = Map::from_iter([
             ("id".to_string(), Value::String(id.clone())),
             (
@@ -8717,7 +8707,7 @@ impl LiveCli {
         self.runtime
             .runtime
             .as_ref()
-            .map_or(true, |rt| !rt.api_client().needs_credentials())
+            .is_none_or(|rt| !rt.api_client().needs_credentials())
     }
 
     /// Run the interactive provider setup wizard (`/login`), persist the
@@ -8879,7 +8869,7 @@ impl LiveCli {
         if let Some(banner) = self.workflow_status_banner() {
             system_prompt.push(banner);
         }
-        let mut runtime = build_runtime(
+        let runtime = build_runtime(
             self.runtime.session().clone(),
             &self.session.id,
             self.model.clone(),
@@ -9296,11 +9286,9 @@ impl LiveCli {
                     let preferred_preserve_recent_messages =
                         CompactionConfig::default().preserve_recent_messages;
 
-                    for round in 0..max_compact_rounds {
-                        let target_estimated_tokens = overflow_compaction_target(
-                            runtime.estimated_tokens(),
-                            target_schedule[round],
-                        );
+                    for (round, &target_percent) in target_schedule.iter().enumerate() {
+                        let target_estimated_tokens =
+                            overflow_compaction_target(runtime.estimated_tokens(), target_percent);
                         if !clean_interactive_output {
                             println!(
                                 "  Auto-compacting session (round {}/{}, target ~{} estimated tokens)...",
@@ -9329,17 +9317,15 @@ impl LiveCli {
                             break;
                         }
 
-                        if removed > 0 {
-                            if !clean_interactive_output {
-                                println!(
-                                    "{}",
-                                    format_compact_report(
-                                        removed,
-                                        result.compacted_session.messages.len(),
-                                        false
-                                    )
-                                );
-                            }
+                        if removed > 0 && !clean_interactive_output {
+                            println!(
+                                "{}",
+                                format_compact_report(
+                                    removed,
+                                    result.compacted_session.messages.len(),
+                                    false
+                                )
+                            );
                         }
 
                         // Without this, prepare_turn_runtime() reads from self.runtime.session()
@@ -10233,8 +10219,8 @@ impl LiveCli {
         let cwd = env::current_dir()?;
         // #803: reject flag-shaped tokens in list filter for BOTH text and JSON modes.
         // Previously the guard was JSON-only (#793); text mode silently returned empty success.
-        if action.as_deref() == Some("list") {
-            if let Some(filter) = target.as_deref() {
+        if action == Some("list") {
+            if let Some(filter) = target {
                 if filter.starts_with('-') {
                     if matches!(output_format, CliOutputFormat::Json) {
                         // ROADMAP #817: this is a handled local inventory parse error.
@@ -11385,6 +11371,10 @@ fn print_status_snapshot(
     Ok(())
 }
 
+// Each argument is a distinct field of the status contract; bundling them
+// into a struct would only move the width, and 110 contract tests pin the
+// resulting JSON shape.
+#[allow(clippy::too_many_arguments)]
 fn status_json_value(
     model: Option<&str>,
     usage: StatusUsage,
@@ -11686,7 +11676,7 @@ fn format_status_report(
                     .map_or(String::new(), |name| format!(" via {name}"));
                 format!("\n  Model source     {}{env_suffix}", p.source.as_str())
             }
-            Some(_) | None => format!("\n  Model source     {}", p.source.as_str()),
+            None => format!("\n  Model source     {}", p.source.as_str()),
         })
         .unwrap_or_default();
     let permission_source_line = permission_provenance
@@ -11881,9 +11871,8 @@ fn sandbox_json_value(status: &runtime::SandboxStatus) -> serde_json::Value {
     //        (#731: "not supported on macOS" is a degraded state, not a hard error;
     //         filesystem_active:true means partial containment is working)
     // error = enabled but unsupported AND no filesystem sandbox either (nothing active)
-    let top_status = if !status.enabled {
-        "ok"
-    } else if status.active {
+    let top_status = if !status.enabled || status.active {
+        // Disabled means nothing to report; active means containment is working.
         "ok"
     } else if status.supported {
         "warn"
@@ -12258,10 +12247,8 @@ fn render_doctor_help_json() -> serde_json::Value {
     })
 }
 
-/// #683-#692: extract structured metadata from help prose
-fn extract_help_metadata(
-    topic: LocalHelpTopic,
-) -> (
+/// Structured metadata parsed out of a help topic's prose.
+type HelpMetadata = (
     Option<String>,      // usage
     Option<String>,      // purpose
     Option<String>,      // output description
@@ -12270,7 +12257,10 @@ fn extract_help_metadata(
     Option<Vec<String>>, // aliases
     bool,                // local_only
     bool,                // requires_credentials
-) {
+);
+
+/// #683-#692: extract structured metadata from help prose
+fn extract_help_metadata(topic: LocalHelpTopic) -> HelpMetadata {
     let text = render_help_topic(topic);
     let mut usage = None;
     let mut purpose = None;
@@ -14402,17 +14392,6 @@ fn resolve_cli_auth_source() -> Result<AuthSource, Box<dyn std::error::Error>> {
 fn resolve_cli_auth_source_for_cwd() -> Result<AuthSource, api::ApiError> {
     resolve_startup_auth_source(|| Ok(None))
 }
-
-/// Whether real credentials exist for a provider *kind* (independent of any
-/// model name). The REPL boots credential-free and prompts for `/login`, so
-/// `AnthropicRuntimeClient::new` uses this to decide between a real client
-/// and a placeholder that surfaces a "run /login" error at request time.
-
-/// Build a placeholder OpenAI-compatible client for the credential-free boot
-/// path. It carries an empty key; the first request returns a clear
-/// "run /login" error before any network call. The chosen config is the
-/// generic OpenAI one — `/login` re-runs provider detection after the user
-/// supplies real credentials, so this never actually sends a request.
 
 /// Returns `true` when the conversation ends with a tool-result message,
 /// meaning the model is expected to continue after tool execution.
@@ -18638,7 +18617,7 @@ mod tests {
         for action in ["remove", "uninstall", "delete"] {
             assert_eq!(
                 parse_args(&["skills".to_string(), action.to_string()])
-                    .expect(&format!("skills {action} should parse")),
+                    .unwrap_or_else(|_| panic!("skills {action} should parse")),
                 CliAction::Skills {
                     args: Some(action.to_string()),
                     output_format: CliOutputFormat::Text,

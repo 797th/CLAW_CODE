@@ -24,3 +24,8 @@ pedantic = { level = "allow", priority = -1 }
 module_name_repetitions = "allow"
 missing_panics_doc = "allow"
 missing_errors_doc = "allow"
+# ApiError deliberately carries diagnostic context (status, request id, body
+# snippet) rather than collapsing to a code, which makes it a large enum.
+# Boxing it would touch every `?` on every provider call for no runtime win,
+# so the size is accepted rather than paid for at each call site.
+result_large_err = "allow"

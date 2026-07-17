@@ -1048,6 +1048,9 @@ mod tests {
 
     #[test]
     fn detects_provider_from_model_name_first() {
+        // `detect_provider_kind` consults CLAW_ENDPOINT_TYPE, so this must
+        // not run while another test is mutating the process environment.
+        let _lock = env_lock();
         assert_eq!(detect_provider_kind("grok"), ProviderKind::Xai);
         assert_eq!(
             detect_provider_kind("claude-sonnet-4-6"),
@@ -1192,6 +1195,9 @@ mod tests {
 
     #[test]
     fn openai_namespaced_model_routes_to_openai_not_anthropic() {
+        // `detect_provider_kind` consults CLAW_ENDPOINT_TYPE, so this must
+        // not run while another test is mutating the process environment.
+        let _lock = env_lock();
         // Regression: "openai/gpt-4.1-mini" was misrouted to Anthropic when
         // ANTHROPIC_API_KEY was set because metadata_for_model returned None
         // and detect_provider_kind fell through to auth-sniffer order.
@@ -1219,6 +1225,9 @@ mod tests {
 
     #[test]
     fn local_prefix_routes_to_openai_not_anthropic() {
+        // `detect_provider_kind` consults CLAW_ENDPOINT_TYPE, so this must
+        // not run while another test is mutating the process environment.
+        let _lock = env_lock();
         let meta = super::metadata_for_model("local/Qwen/Qwen3.6-27B-FP8")
             .expect("local/ prefix must resolve to OpenAI-compatible metadata");
         assert_eq!(meta.provider, ProviderKind::OpenAi);
@@ -1231,6 +1240,9 @@ mod tests {
 
     #[test]
     fn qwen_prefix_routes_to_dashscope_not_anthropic() {
+        // `detect_provider_kind` consults CLAW_ENDPOINT_TYPE, so this must
+        // not run while another test is mutating the process environment.
+        let _lock = env_lock();
         // User request from Discord #clawcode-get-help: web3g wants to use
         // Qwen 3.6 Plus via native Alibaba DashScope API (not OpenRouter,
         // which has lower rate limits). metadata_for_model must route
@@ -1261,6 +1273,9 @@ mod tests {
 
     #[test]
     fn kimi_prefix_routes_to_dashscope() {
+        // `detect_provider_kind` consults CLAW_ENDPOINT_TYPE, so this must
+        // not run while another test is mutating the process environment.
+        let _lock = env_lock();
         // Kimi models via DashScope (kimi-k2.5, kimi-k1.5, etc.)
         let meta = super::metadata_for_model("kimi-k2.5")
             .expect("kimi-k2.5 must resolve to DashScope metadata");

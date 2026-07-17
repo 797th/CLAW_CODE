@@ -10,7 +10,10 @@ use std::sync::mpsc::Sender;
 
 use claw_engine::{EngineClient, EngineToolExecutor, SinkResult, TurnSink};
 use runtime::permission_enforcer::PermissionEnforcer;
-use runtime::{ConversationRuntime, PermissionMode, PermissionPolicy, Session, TokenUsage};
+use runtime::{
+    ConversationRuntime, PermissionMode, PermissionPolicy, PermissionPromptDecision,
+    PermissionPrompter, PermissionRequest, Session, TokenUsage,
+};
 use tools::GlobalToolRegistry;
 
 use crate::app::StreamEvent;
@@ -128,7 +131,7 @@ impl TurnSink for ChannelSink {
 }
 
 /// One-line preview of a tool's JSON input for the activity row.
-fn summarize_tool_input(input: &str) -> String {
+pub(crate) fn summarize_tool_input(input: &str) -> String {
     let trimmed = input.trim();
     if trimmed.is_empty() {
         return String::new();
@@ -159,6 +162,51 @@ fn truncate(value: &str, limit: usize) -> String {
     }
 }
 
+/// A tool call waiting on the user's approval.
+///
+/// The worker thread is blocked inside `run_turn` while this sits in the draw
+/// loop's queue; answering it unblocks the turn.
+pub struct PermissionAsk {
+    pub tool_name: String,
+    pub input: String,
+    pub current_mode: PermissionMode,
+    pub required_mode: PermissionMode,
+    pub reason: Option<String>,
+    pub reply: Sender<PermissionPromptDecision>,
+}
+
+/// Routes approval requests to the draw loop and waits for the answer.
+struct ChannelPrompter {
+    asks: Sender<PermissionAsk>,
+}
+
+impl PermissionPrompter for ChannelPrompter {
+    fn decide(&mut self, request: &PermissionRequest) -> PermissionPromptDecision {
+        let (reply, answer) = std::sync::mpsc::channel();
+        let ask = PermissionAsk {
+            tool_name: request.tool_name.clone(),
+            input: request.input.clone(),
+            current_mode: request.current_mode,
+            required_mode: request.required_mode,
+            reason: request.reason.clone(),
+            reply,
+        };
+        if self.asks.send(ask).is_err() {
+            // The frontend is gone; denying is the safe way to end the turn.
+            return PermissionPromptDecision::Deny {
+                reason: "frontend closed before the approval was answered".to_string(),
+            };
+        }
+        // Blocks this worker thread only. The draw loop keeps painting and
+        // sends the decision back when the user answers.
+        answer
+            .recv()
+            .unwrap_or_else(|_| PermissionPromptDecision::Deny {
+                reason: format!("approval for '{}' was never answered", request.tool_name),
+            })
+    }
+}
+
 /// Everything a turn needs that the frontend resolves once per send.
 pub struct TurnRequest {
     pub prompt: String,
@@ -166,6 +214,8 @@ pub struct TurnRequest {
     pub permission_mode: PermissionMode,
     pub session: Session,
     pub cwd: PathBuf,
+    /// Where tool-approval requests go while the turn is blocked on them.
+    pub asks: Sender<PermissionAsk>,
 }
 
 /// What a finished turn hands back to the frontend.
@@ -185,6 +235,7 @@ pub fn run_turn(request: TurnRequest, tx: &Sender<StreamEvent>) -> TurnOutcome {
         permission_mode,
         session,
         cwd,
+        asks,
     } = request;
 
     let policy = PermissionPolicy::new(permission_mode);
@@ -219,7 +270,11 @@ pub fn run_turn(request: TurnRequest, tx: &Sender<StreamEvent>) -> TurnOutcome {
         EngineToolExecutor::new(None, tool_registry, None, Box::new(claw_engine::NullSink));
 
     let mut runtime = ConversationRuntime::new(session, client, executor, policy, system_prompt);
-    let error = runtime.run_turn(prompt, None).err().map(|e| e.to_string());
+    let mut prompter = ChannelPrompter { asks };
+    let error = runtime
+        .run_turn(prompt, Some(&mut prompter))
+        .err()
+        .map(|e| e.to_string());
     TurnOutcome {
         session: Some(runtime.into_session()),
         error,
@@ -315,6 +370,7 @@ mod tests {
                 permission_mode: runtime::PermissionMode::Prompt,
                 session: runtime::Session::new(),
                 cwd: std::env::current_dir().expect("cwd"),
+                asks: mpsc::channel().0,
             },
             &tx,
         );
@@ -338,6 +394,86 @@ mod tests {
                 .is_some_and(|session| !session.messages.is_empty()),
             "the turn must come back with conversation history"
         );
+    }
+
+    #[test]
+    fn an_approved_tool_unblocks_the_waiting_turn() {
+        use runtime::{PermissionMode, PermissionPrompter, PermissionRequest};
+
+        let (asks_tx, asks_rx) = mpsc::channel();
+        let mut prompter = super::ChannelPrompter { asks: asks_tx };
+
+        // The prompter blocks, so the "frontend" answers from another thread.
+        let responder = std::thread::spawn(move || {
+            let ask = asks_rx.recv().expect("an ask should arrive");
+            assert_eq!(ask.tool_name, "Bash");
+            ask.reply
+                .send(runtime::PermissionPromptDecision::Allow)
+                .expect("reply should reach the blocked turn");
+        });
+
+        let decision = prompter.decide(&PermissionRequest {
+            tool_name: "Bash".to_string(),
+            input: r#"{"command":"ls"}"#.to_string(),
+            current_mode: PermissionMode::Prompt,
+            required_mode: PermissionMode::DangerFullAccess,
+            reason: None,
+        });
+
+        responder.join().expect("responder");
+        assert_eq!(decision, runtime::PermissionPromptDecision::Allow);
+    }
+
+    #[test]
+    fn a_frontend_that_quits_mid_prompt_denies_instead_of_hanging() {
+        use runtime::{PermissionMode, PermissionPrompter, PermissionRequest};
+
+        // Receiver dropped: the draw loop is gone. The worker must not block
+        // forever waiting for an answer that can never come.
+        let (asks_tx, asks_rx) = mpsc::channel();
+        drop(asks_rx);
+        let mut prompter = super::ChannelPrompter { asks: asks_tx };
+
+        let decision = prompter.decide(&PermissionRequest {
+            tool_name: "Bash".to_string(),
+            input: "{}".to_string(),
+            current_mode: PermissionMode::Prompt,
+            required_mode: PermissionMode::DangerFullAccess,
+            reason: None,
+        });
+
+        assert!(matches!(
+            decision,
+            runtime::PermissionPromptDecision::Deny { .. }
+        ));
+    }
+
+    #[test]
+    fn a_dropped_reply_channel_denies_rather_than_blocking_forever() {
+        use runtime::{PermissionMode, PermissionPrompter, PermissionRequest};
+
+        let (asks_tx, asks_rx) = mpsc::channel();
+        let mut prompter = super::ChannelPrompter { asks: asks_tx };
+
+        // The frontend takes the ask but dies before answering.
+        let responder = std::thread::spawn(move || {
+            let ask = asks_rx.recv().expect("an ask should arrive");
+            drop(ask);
+        });
+
+        let decision = prompter.decide(&PermissionRequest {
+            tool_name: "read_file".to_string(),
+            input: "{}".to_string(),
+            current_mode: PermissionMode::Prompt,
+            required_mode: PermissionMode::WorkspaceWrite,
+            reason: None,
+        });
+
+        responder.join().expect("responder");
+        assert!(matches!(
+            decision,
+            runtime::PermissionPromptDecision::Deny { .. }
+        ));
     }
 
     #[test]

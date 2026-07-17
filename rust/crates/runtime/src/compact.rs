@@ -389,8 +389,7 @@ fn safe_boundary_at_or_before(session: &Session, prefix_len: usize, raw: usize) 
     let raw = raw.clamp(prefix_len + 1, session.messages.len());
     valid_cut_points(session, prefix_len)
         .into_iter()
-        .filter(|point| *point > prefix_len && *point <= raw)
-        .next_back()
+        .rfind(|point| *point > prefix_len && *point <= raw)
         .unwrap_or(prefix_len + 1)
 }
 
@@ -749,7 +748,8 @@ fn parse_summary_fields(summary: &str) -> SummaryFields {
                 value.to_string(),
                 MAX_SUMMARY_ITEMS_PER_SECTION,
             ),
-            "Critical Context" | _ => push_unique(
+            // Critical Context plus anything unrecognised.
+            _ => push_unique(
                 &mut fields.critical_context,
                 value.to_string(),
                 MAX_SUMMARY_ITEMS_PER_SECTION * 4,

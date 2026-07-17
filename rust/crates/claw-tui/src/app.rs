@@ -232,6 +232,15 @@ enum Overlay {
         title: String,
         body: String,
     },
+    /// A tool is waiting on approval. The turn is blocked until this is
+    /// answered, so it takes over the overlay.
+    Permission {
+        tool_name: String,
+        detail: String,
+        current_mode: String,
+        required_mode: String,
+        reason: Option<String>,
+    },
 }
 
 const PROVIDER_CHOICES: [(&str, &str); 5] = [
@@ -335,6 +344,10 @@ pub struct App {
     session: Option<runtime::Session>,
     session_rx_tx: Sender<Option<runtime::Session>>,
     session_rx: Receiver<Option<runtime::Session>>,
+    permission_tx: Sender<crate::turn::PermissionAsk>,
+    permission_rx: Receiver<crate::turn::PermissionAsk>,
+    /// The approval on screen; holds the channel the worker is blocked on.
+    pending_permission: Option<crate::turn::PermissionAsk>,
 }
 
 pub fn run() -> io::Result<()> {
@@ -349,6 +362,7 @@ fn run_loop(terminal: &mut crate::terminal::TuiTerminal, app: &mut App) -> io::R
     loop {
         app.poll_stream();
         app.poll_session();
+        app.poll_permission();
         app.poll_model_list();
         terminal.hide_cursor()?;
         terminal.draw(|frame| app.draw(frame))?;
@@ -365,6 +379,7 @@ fn run_loop(terminal: &mut crate::terminal::TuiTerminal, app: &mut App) -> io::R
 impl App {
     fn empty() -> Self {
         let (session_rx_tx, session_rx) = mpsc::channel();
+        let (permission_tx, permission_rx) = mpsc::channel();
         Self {
             theme: Theme::default(),
             messages: Vec::new(),
@@ -388,6 +403,9 @@ impl App {
             session: Some(runtime::Session::new()),
             session_rx_tx,
             session_rx,
+            permission_tx,
+            permission_rx,
+            pending_permission: None,
         }
     }
 
@@ -421,6 +439,7 @@ impl App {
             permission_mode: self.permission_mode(),
             session: self.session.take().unwrap_or_default(),
             cwd: std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
+            asks: self.permission_tx.clone(),
         };
         let session_tx = self.session_rx_tx.clone();
         thread::spawn(move || {
@@ -441,11 +460,15 @@ impl App {
     }
 
     /// Map the status bar's mode label onto the runtime's permission model.
+    ///
+    /// `plan` is read-only by design: planning must not mutate the workspace,
+    /// so writes are refused rather than prompted.
     fn permission_mode(&self) -> runtime::PermissionMode {
         match self.status.mode() {
-            "plan" | "ask" => runtime::PermissionMode::Prompt,
+            "plan" => runtime::PermissionMode::ReadOnly,
             "workspace" => runtime::PermissionMode::WorkspaceWrite,
             "bypass" => runtime::PermissionMode::DangerFullAccess,
+            // "ask" and anything unrecognised: prompt before acting.
             _ => runtime::PermissionMode::Prompt,
         }
     }
@@ -462,6 +485,42 @@ impl App {
         if self.session.is_none() && !self.status.streaming {
             self.session = Some(runtime::Session::new());
         }
+    }
+
+    /// Show the next tool waiting on approval. The worker thread is blocked
+    /// until `answer_permission` replies, so this jumps the overlay queue.
+    fn poll_permission(&mut self) {
+        if self.pending_permission.is_some() {
+            return;
+        }
+        let Ok(ask) = self.permission_rx.try_recv() else {
+            return;
+        };
+        self.overlay = Some(Overlay::Permission {
+            tool_name: ask.tool_name.clone(),
+            detail: crate::turn::summarize_tool_input(&ask.input),
+            current_mode: ask.current_mode.as_str().to_string(),
+            required_mode: ask.required_mode.as_str().to_string(),
+            reason: ask.reason.clone(),
+        });
+        self.pending_permission = Some(ask);
+    }
+
+    /// Unblock the waiting turn with the user's decision.
+    fn answer_permission(&mut self, allow: bool) {
+        let Some(ask) = self.pending_permission.take() else {
+            return;
+        };
+        let decision = if allow {
+            runtime::PermissionPromptDecision::Allow
+        } else {
+            runtime::PermissionPromptDecision::Deny {
+                reason: format!("tool '{}' denied from the approval prompt", ask.tool_name),
+            }
+        };
+        // A dead worker means the turn already ended; nothing to unblock.
+        let _ = ask.reply.send(decision);
+        self.overlay = None;
     }
 
     fn poll_stream(&mut self) {
@@ -648,6 +707,15 @@ impl App {
         };
 
         match &mut overlay {
+            Overlay::Permission { .. } => {
+                match key.code {
+                    KeyCode::Char('y' | 'Y') => self.answer_permission(true),
+                    KeyCode::Char('n' | 'N') | KeyCode::Esc => self.answer_permission(false),
+                    // Any other key: keep waiting rather than guess.
+                    _ => self.overlay = Some(overlay),
+                }
+                return;
+            }
             Overlay::Notice { .. } => {
                 if matches!(key.code, KeyCode::Esc | KeyCode::Enter) {
                     return;
@@ -1730,6 +1798,33 @@ impl App {
         let area = frame.area();
 
         match overlay {
+            Overlay::Permission {
+                tool_name,
+                detail,
+                current_mode,
+                required_mode,
+                reason,
+            } => {
+                let mut body = format!(
+                    "Tool             {tool_name}\nInput            {detail}\nCurrent mode     {current_mode}\nRequired mode    {required_mode}",
+                );
+                if let Some(reason) = reason {
+                    body.push_str(&format!("\nReason           {reason}"));
+                }
+                body.push_str("\n\nApprove this tool call?  [y] approve   [n] deny");
+                let popup = centered_rect(area, 88, 12);
+                frame.render_widget(Clear, popup);
+                let block = Block::default()
+                    .title(Span::styled(
+                        " Permission approval required ",
+                        self.theme.title(),
+                    ))
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .border_style(self.theme.error);
+                let paragraph = Paragraph::new(body).block(block).wrap(Wrap { trim: false });
+                frame.render_widget(paragraph, popup);
+            }
             Overlay::Notice { title, body } => {
                 let body_lines = render_markdown(body, self.theme);
                 let desired_height = body_lines.len().saturating_add(4).min(18) as u16;

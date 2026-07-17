@@ -4009,7 +4009,7 @@ mod tests {
         let removed = remove_user_model_alias_in_home("mini", &home).expect("remove");
         assert!(removed);
         let remaining = load_user_model_aliases_in_home(&home).expect("load");
-        assert!(remaining.get("mini").is_none());
+        assert!(!remaining.contains_key("mini"));
         assert_eq!(
             remaining.get("smart").map(String::as_str),
             Some("claude-opus-4-6")

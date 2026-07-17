@@ -488,14 +488,14 @@ pub fn convert_messages_with_mode(
             let content = message
                 .blocks
                 .iter()
-                .filter_map(|block| match block {
-                    ContentBlock::Text { text } => Some(InputContentBlock::Text {
+                .map(|block| match block {
+                    ContentBlock::Text { text } => InputContentBlock::Text {
                         text: if caveman {
                             runtime::compress_caveman(text)
                         } else {
                             text.clone()
                         },
-                    }),
+                    },
                     ContentBlock::Thinking {
                         thinking,
                         signature,
@@ -503,27 +503,27 @@ pub fn convert_messages_with_mode(
                         // Keep signed thinking exact: provider signatures can
                         // cover the thinking text. Compress unsigned reasoning
                         // before sending it back as reasoning_content.
-                        Some(InputContentBlock::Thinking {
+                        InputContentBlock::Thinking {
                             thinking: if caveman && signature.is_none() {
                                 runtime::compress_caveman(thinking)
                             } else {
                                 thinking.clone()
                             },
                             signature: signature.clone(),
-                        })
+                        }
                     }
-                    ContentBlock::ToolUse { id, name, input } => Some(InputContentBlock::ToolUse {
+                    ContentBlock::ToolUse { id, name, input } => InputContentBlock::ToolUse {
                         id: id.clone(),
                         name: name.clone(),
                         input: serde_json::from_str(input)
                             .unwrap_or_else(|_| serde_json::json!({ "raw": input })),
-                    }),
+                    },
                     ContentBlock::ToolResult {
                         tool_use_id,
                         output,
                         is_error,
                         ..
-                    } => Some(InputContentBlock::ToolResult {
+                    } => InputContentBlock::ToolResult {
                         tool_use_id: tool_use_id.clone(),
                         content: vec![ToolResultContentBlock::Text {
                             text: if caveman {
@@ -533,7 +533,7 @@ pub fn convert_messages_with_mode(
                             },
                         }],
                         is_error: *is_error,
-                    }),
+                    },
                 })
                 .collect::<Vec<_>>();
             (!content.is_empty()).then(|| InputMessage {

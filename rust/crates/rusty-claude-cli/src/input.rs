@@ -314,7 +314,7 @@ fn prompt_cursor_column(prompt: &str) -> u16 {
     while let Some(character) = chars.next() {
         if character == '\x1b' {
             if chars.next() == Some('[') {
-                while let Some(code) = chars.next() {
+                for code in chars.by_ref() {
                     if ('@'..='~').contains(&code) {
                         break;
                     }
