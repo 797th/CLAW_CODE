@@ -14,6 +14,7 @@ mod config;
 pub mod config_validate;
 mod conversation;
 pub mod dreamer;
+pub mod skill_weaver;
 mod file_ops;
 pub mod g004_conformance;
 mod git_context;
