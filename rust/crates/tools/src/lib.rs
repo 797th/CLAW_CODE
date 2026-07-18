@@ -4167,6 +4167,7 @@ fn record_skill_invocation(skill: &str) {
     let mut ledger = runtime::skill_weaver::SkillLedger::load(&weaver);
     ledger.record(canonical, runtime::skill_weaver::SkillOutcome::Invoked);
     let _ = ledger.save(&weaver);
+    runtime::skill_weaver::open_attribution_window(&weaver, canonical);
 }
 
 fn validate_todos(todos: &[TodoItem]) -> Result<(), String> {
@@ -9060,8 +9061,12 @@ mod tests {
         .expect("execute_skill should succeed");
         assert_eq!(output.skill, "demo-skill");
 
-        let ledger =
-            runtime::skill_weaver::SkillLedger::load(&runtime::skill_weaver::weaver_dir(&root));
+        let weaver = runtime::skill_weaver::weaver_dir(&root);
+        let pending = runtime::skill_weaver::drain_pending(&weaver);
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].skill, "demo-skill");
+
+        let ledger = runtime::skill_weaver::SkillLedger::load(&weaver);
         assert_eq!(
             ledger
                 .entry("demo-skill")
@@ -9084,8 +9089,11 @@ mod tests {
         .expect("execute_skill should succeed for $-prefixed invocation");
         assert_eq!(output.skill, "$demo-skill");
 
-        let ledger =
-            runtime::skill_weaver::SkillLedger::load(&runtime::skill_weaver::weaver_dir(&root));
+        let pending = runtime::skill_weaver::drain_pending(&weaver);
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].skill, "demo-skill");
+
+        let ledger = runtime::skill_weaver::SkillLedger::load(&weaver);
         assert_eq!(
             ledger
                 .entry("demo-skill")

@@ -33,7 +33,7 @@ use std::process::Command;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crossterm::style::{Color, Stylize};
 use log::debug;
@@ -9044,6 +9044,8 @@ impl LiveCli {
         composer_column: Option<u16>,
         working_input: Option<input::WorkingInputStore>,
     ) -> Result<(), Box<dyn std::error::Error>> {
+        let turn_started_ms = current_time_ms();
+        let attribution_cwd = env::current_dir().ok();
         let (mut runtime, hook_abort_monitor) =
             self.prepare_turn_runtime(!clean_interactive_output)?;
         let mut stdout = io::stdout();
@@ -9086,6 +9088,9 @@ impl LiveCli {
                 print_gate_audit(&summary);
                 self.persist_session()?;
                 self.append_turn_log(input, &summary);
+                if let Some(cwd) = attribution_cwd.as_deref() {
+                    settle_skill_attribution_after_success(cwd, turn_started_ms, &summary);
+                }
                 self.maybe_auto_dream_after_success();
                 self.maybe_auto_weave_after_success();
                 Ok(())
@@ -9113,29 +9118,8 @@ impl LiveCli {
                 // ============================================================================
 
                 let error_str = error.to_string();
-                // Detect context window overflow. Some providers (e.g. OpenAI-compat backends)
-                // return 400 with "no parseable body" instead of a proper context_length_exceeded
-                // error when the request is too large to even parse — treat that as context overflow too.
-                // Also detect model-specific context error markers (e.g. llama.cpp returns
-                // "Context size has been exceeded." / "exceed_context_size_error" / "exceeds the available context size").
-                let is_context_window = error_str.contains("context_window")
-                    || error_str.contains("Context window")
-                    || error_str.contains("no parseable body")
-                    || error_str.contains("exceed_context_size")
-                    || error_str.contains("exceeds the available context size")
-                    || error_str
-                        .to_ascii_lowercase()
-                        .contains("context size has been exceeded");
 
-                // Also treat "assistant stream produced no content" and reqwest decode failures
-                // as recoverable errors that may benefit from auto-compaction. Some backends (e.g.
-                // llama.cpp) return a non-SSE HTTP 500 body when context overflows, causing
-                // reqwest to fail with "error decoding response body" — treat that as context overflow too.
-                let is_no_content = error_str.contains("assistant stream produced no content")
-                    || error_str.contains("Failed to parse input at pos")
-                    || error_str.contains("error decoding response body");
-
-                if is_context_window || is_no_content {
+                if should_retry_with_auto_compact(&error_str) {
                     // Keep automatic recovery out of the interactive transcript. The
                     // activity row is replaced by the eventual response (or one final
                     // failure), rather than exposing each internal retry round.
@@ -9255,20 +9239,8 @@ impl LiveCli {
                             }
                             Err(retry_error) => {
                                 let retry_str = retry_error.to_string();
-                                let still_context_window = retry_str.contains("context_window")
-                                    || retry_str.contains("Context window")
-                                    || retry_str.contains("no parseable body")
-                                    || retry_str.contains("exceed_context_size")
-                                    || retry_str.contains("exceeds the available context size")
-                                    || retry_str
-                                        .to_ascii_lowercase()
-                                        .contains("context size has been exceeded");
-                                let still_no_content = retry_str
-                                    .contains("assistant stream produced no content")
-                                    || retry_str.contains("Failed to parse input at pos")
-                                    || retry_str.contains("error decoding response body");
 
-                                if (still_context_window || still_no_content)
+                                if should_retry_with_auto_compact(&retry_str)
                                     && round + 1 < max_compact_rounds
                                 {
                                     // If the retry error reveals the context window, adapt threshold.
@@ -9298,9 +9270,14 @@ impl LiveCli {
                             }
                         }
                     }
+
+                    activity.fail("Request failed", renderer.color_theme(), &mut stdout)?;
+                    return Err(Box::new(error));
                 }
 
-                // If not a context window error, return original error
+                if let Some(cwd) = attribution_cwd.as_deref() {
+                    settle_skill_attribution_after_terminal_error(cwd, turn_started_ms);
+                }
                 activity.fail("Request failed", renderer.color_theme(), &mut stdout)?;
                 Err(Box::new(error))
             }
@@ -14223,6 +14200,47 @@ fn request_ends_with_tool_result(request: &ApiRequest) -> bool {
         .is_some_and(|message| message.role == MessageRole::Tool)
 }
 
+fn current_time_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+fn should_retry_with_auto_compact(error_str: &str) -> bool {
+    error_str.contains("context_window")
+        || error_str.contains("Context window")
+        || error_str.contains("no parseable body")
+        || error_str.contains("exceed_context_size")
+        || error_str.contains("exceeds the available context size")
+        || error_str
+            .to_ascii_lowercase()
+            .contains("context size has been exceeded")
+        || error_str.contains("assistant stream produced no content")
+        || error_str.contains("Failed to parse input at pos")
+        || error_str.contains("error decoding response body")
+}
+
+fn settle_skill_attribution_after_success(
+    cwd: &Path,
+    turn_started_ms: u64,
+    summary: &runtime::TurnSummary,
+) {
+    let outcome = runtime::skill_weaver::classify_turn_outcome(
+        false,
+        runtime::skill_weaver::turn_tool_error_count(summary),
+    );
+    let _ = runtime::skill_weaver::settle_attribution_windows(cwd, outcome, turn_started_ms);
+}
+
+fn settle_skill_attribution_after_terminal_error(cwd: &Path, turn_started_ms: u64) {
+    let _ = runtime::skill_weaver::settle_attribution_windows(
+        cwd,
+        Some(runtime::skill_weaver::SkillOutcome::Failure),
+        turn_started_ms,
+    );
+}
+
 /// Extract the server-reported context window size from an error message.
 /// Returns `None` if no window size can be parsed.  The server must
 /// mention something like "context size (81920 tokens)" or "available
@@ -15513,14 +15531,14 @@ mod tests {
     use super::{
         acp_status_json, build_runtime_plugin_state_with_loader, build_runtime_with_plugin_state,
         classify_error_kind, classify_session_lifecycle_from_panes, collect_gate_events,
-        collect_session_prompt_history, create_managed_session_handle, describe_tool_progress,
-        filter_tool_specs, format_bughunter_report, format_commit_preflight_report,
-        format_commit_skipped_report, format_compact_report, format_connected_line,
-        format_cost_report, format_history_timestamp, format_internal_prompt_progress_line,
-        format_issue_report, format_model_report, format_model_switch_report,
-        format_permissions_report, format_permissions_switch_report, format_pr_report,
-        format_repl_footer, format_repl_prompt, format_resume_report, format_status_report,
-        format_tool_call_start, format_tool_result, format_ultraplan_report,
+        collect_session_prompt_history, create_managed_session_handle, current_time_ms,
+        describe_tool_progress, filter_tool_specs, format_bughunter_report,
+        format_commit_preflight_report, format_commit_skipped_report, format_compact_report,
+        format_connected_line, format_cost_report, format_history_timestamp,
+        format_internal_prompt_progress_line, format_issue_report, format_model_report,
+        format_model_switch_report, format_permissions_report, format_permissions_switch_report,
+        format_pr_report, format_repl_footer, format_repl_prompt, format_resume_report,
+        format_status_report, format_tool_call_start, format_tool_result, format_ultraplan_report,
         format_unknown_slash_command, format_unknown_slash_command_message,
         format_user_visible_api_error, gate_audit_lines, merge_prompt_with_stdin,
         normalize_permission_mode, parse_args, parse_export_args, parse_git_status_branch,
@@ -15530,7 +15548,9 @@ mod tests {
         render_memory_report, render_prompt_history_report, render_repl_help, render_repl_response,
         render_resume_usage, render_session_list, render_session_markdown, resolve_model_alias,
         resolve_model_alias_with_config, resolve_repl_model, resolve_session_reference,
-        resume_supported_slash_commands, run_resume_command, setup_default_model, short_tool_id,
+        resume_supported_slash_commands, run_resume_command,
+        settle_skill_attribution_after_success, settle_skill_attribution_after_terminal_error,
+        setup_default_model, short_tool_id, should_retry_with_auto_compact,
         slash_command_completion_candidates_with_sessions, split_error_hint, status_context,
         status_json_value, summarize_tool_payload_for_markdown, try_resolve_bare_skill_prompt,
         validate_endpoint_url, validate_no_args, write_mcp_server_fixture, CliAction,
@@ -15592,6 +15612,30 @@ mod tests {
         }
     }
 
+    fn summary_with_tool_results(tool_errors: &[bool]) -> runtime::TurnSummary {
+        runtime::TurnSummary {
+            assistant_messages: Vec::new(),
+            tool_results: tool_errors
+                .iter()
+                .enumerate()
+                .map(|(index, is_error)| {
+                    ConversationMessage::tool_result(
+                        format!("tool-use-{index}"),
+                        format!("tool-{index}"),
+                        format!("output-{index}"),
+                        *is_error,
+                    )
+                })
+                .collect(),
+            prompt_cache_events: Vec::new(),
+            iterations: 1,
+            usage: runtime::TokenUsage::default(),
+            auto_compaction: None,
+            lifecycle_warnings: Vec::new(),
+            gate_events: Vec::new(),
+        }
+    }
+
     /// Task 9 sink: JSON modes serialize gate events (schema-tagged), and the
     /// text-mode audit emits a one-line notice for BLOCKED decisions only.
     #[test]
@@ -15623,6 +15667,51 @@ mod tests {
             lines,
             vec!["gate_check: stop-the-line-spec block (spec)".to_string()]
         );
+    }
+
+    #[test]
+    fn successful_turn_settles_pending_skill_windows() {
+        let dir = temp_dir();
+        fs::create_dir_all(&dir).unwrap();
+        let weaver = runtime::skill_weaver::weaver_dir(&dir);
+        let turn_started_ms = current_time_ms();
+        runtime::skill_weaver::open_attribution_window(&weaver, "demo-skill");
+
+        settle_skill_attribution_after_success(
+            &dir,
+            turn_started_ms,
+            &summary_with_tool_results(&[]),
+        );
+
+        let ledger = runtime::skill_weaver::SkillLedger::load(&weaver);
+        assert_eq!(ledger.entry("demo-skill").unwrap().successes, 1);
+        assert!(runtime::skill_weaver::drain_pending(&weaver).is_empty());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn terminal_error_turn_settles_pending_skill_windows_as_failures() {
+        let dir = temp_dir();
+        fs::create_dir_all(&dir).unwrap();
+        let weaver = runtime::skill_weaver::weaver_dir(&dir);
+        let turn_started_ms = current_time_ms();
+        runtime::skill_weaver::open_attribution_window(&weaver, "demo-skill");
+
+        settle_skill_attribution_after_terminal_error(&dir, turn_started_ms);
+
+        let ledger = runtime::skill_weaver::SkillLedger::load(&weaver);
+        assert_eq!(ledger.entry("demo-skill").unwrap().failures, 1);
+        assert!(runtime::skill_weaver::drain_pending(&weaver).is_empty());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn auto_compact_retry_errors_defer_skill_attribution() {
+        assert!(should_retry_with_auto_compact("context_window_blocked"));
+        assert!(should_retry_with_auto_compact(
+            "assistant stream produced no content"
+        ));
+        assert!(!should_retry_with_auto_compact("permission denied"));
     }
 
     fn registry_with_plugin_tool() -> GlobalToolRegistry {

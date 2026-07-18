@@ -858,7 +858,8 @@ const FOREIGN_PROVIDER_ENV_VARS: &[(&str, &str, &str)] = &[
 fn env_or_dotenv_present(key: &str) -> bool {
     match std::env::var(key) {
         Ok(value) if !value.is_empty() => true,
-        Ok(_) | Err(std::env::VarError::NotPresent) => {
+        Ok(_) => false,
+        Err(std::env::VarError::NotPresent) => {
             dotenv_value(key).is_some_and(|value| !value.is_empty())
         }
         Err(_) => false,

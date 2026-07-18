@@ -284,6 +284,11 @@ mod tests {
         // use OpenAiCompatConfig::dashscope() which reads DASHSCOPE_API_KEY and
         // points at dashscope.aliyuncs.com.
         let _lock = env_lock();
+        let _endpoint_type = EnvVarGuard::set("CLAW_ENDPOINT_TYPE", Some("disabled-for-test"));
+        let _dashscope_base_url = EnvVarGuard::set(
+            "DASHSCOPE_BASE_URL",
+            Some(crate::providers::openai_compat::DEFAULT_DASHSCOPE_BASE_URL),
+        );
         let _dashscope = EnvVarGuard::set("DASHSCOPE_API_KEY", Some("test-dashscope-key"));
         let _openai = EnvVarGuard::set("OPENAI_API_KEY", None);
 

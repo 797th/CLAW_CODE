@@ -121,6 +121,151 @@ impl SkillLedger {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Attribution windows: pending skill invocations awaiting a turn outcome
+// ---------------------------------------------------------------------------
+
+pub const PENDING_FILENAME: &str = "pending.json";
+/// Pending invocations older than this are discarded on drain, never judged
+/// (protects against crashed processes and long-idle sessions).
+pub const PENDING_MAX_AGE: Duration = Duration::from_secs(30 * 60);
+
+/// One Skill-tool invocation awaiting outcome attribution at turn end.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PendingInvocation {
+    pub skill: String,
+    pub opened_ms: u64,
+}
+
+fn load_pending(weaver_dir: &Path) -> Vec<PendingInvocation> {
+    match fs::read_to_string(weaver_dir.join(PENDING_FILENAME)) {
+        Ok(raw) => serde_json::from_str(&raw).unwrap_or_default(),
+        Err(_) => Vec::new(),
+    }
+}
+
+fn save_pending(weaver_dir: &Path, pending: &[PendingInvocation]) -> io::Result<()> {
+    let dest = weaver_dir.join(PENDING_FILENAME);
+    if pending.is_empty() {
+        match fs::remove_file(&dest) {
+            Ok(()) => return Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error),
+        }
+    }
+
+    fs::create_dir_all(weaver_dir)?;
+    let tmp = weaver_dir.join(format!("{PENDING_FILENAME}.tmp"));
+    let raw = serde_json::to_string_pretty(pending)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    fs::write(&tmp, raw)?;
+    fs::rename(&tmp, &dest)?;
+    Ok(())
+}
+
+/// Record that `skill` was just invoked and is awaiting an outcome.
+/// Advisory: failures are swallowed; blank names are ignored. Accepts any
+/// non-empty name (plugin-prefixed hand-written skills included) — the
+/// learned-skill kebab rule only gates file writes, not telemetry.
+pub fn open_attribution_window(weaver_dir: &Path, skill: &str) {
+    let skill = skill.trim();
+    if skill.is_empty() {
+        return;
+    }
+
+    let mut pending = load_pending(weaver_dir);
+    pending.push(PendingInvocation {
+        skill: skill.to_string(),
+        opened_ms: now_ms(),
+    });
+    let _ = save_pending(weaver_dir, &pending);
+}
+
+/// Drop any pending windows for `skill` (used when `/skills mark` supplies
+/// an explicit verdict, which overrides heuristic attribution).
+pub fn clear_pending_for(weaver_dir: &Path, skill: &str) {
+    let mut pending = load_pending(weaver_dir);
+    let before = pending.len();
+    pending.retain(|entry| entry.skill != skill);
+    if pending.len() != before {
+        let _ = save_pending(weaver_dir, &pending);
+    }
+}
+
+/// Remove and return all pending windows, discarding stale entries.
+/// Stale windows are never judged — a crashed process must not count as a
+/// skill failure.
+pub fn drain_pending(weaver_dir: &Path) -> Vec<PendingInvocation> {
+    let pending = load_pending(weaver_dir);
+    let _ = fs::remove_file(weaver_dir.join(PENDING_FILENAME));
+    let now = now_ms();
+    let max_age_ms = PENDING_MAX_AGE.as_millis() as u64;
+    pending
+        .into_iter()
+        .filter(|entry| now.saturating_sub(entry.opened_ms) <= max_age_ms)
+        .collect()
+}
+
+/// Classify a completed turn into a skill outcome using advisory heuristics.
+/// Terminal turn failures always count as `Failure`; otherwise, a clean turn
+/// is `Success`, one tool error is ambiguous (`None`), and two or more tool
+/// errors count as `Failure` because the turn likely cascaded.
+#[must_use]
+pub fn classify_turn_outcome(turn_failed: bool, tool_error_count: usize) -> Option<SkillOutcome> {
+    if turn_failed {
+        return Some(SkillOutcome::Failure);
+    }
+
+    match tool_error_count {
+        0 => Some(SkillOutcome::Success),
+        1 => None,
+        _ => Some(SkillOutcome::Failure),
+    }
+}
+
+/// Count failing tool-result blocks captured in a completed runtime turn.
+#[must_use]
+pub fn turn_tool_error_count(summary: &crate::conversation::TurnSummary) -> usize {
+    summary
+        .tool_results
+        .iter()
+        .flat_map(|message| message.blocks.iter())
+        .filter(|block| matches!(block, ContentBlock::ToolResult { is_error: true, .. }))
+        .count()
+}
+
+/// Drain pending attribution windows, judging only those opened during the
+/// current turn. Older windows are discarded without verdict so a later turn
+/// cannot retroactively judge them.
+pub fn settle_attribution_windows(
+    cwd: &Path,
+    outcome: Option<SkillOutcome>,
+    opened_after_ms: u64,
+) -> Vec<String> {
+    let weaver = weaver_dir(cwd);
+    let pending = drain_pending(&weaver);
+    let current_turn: Vec<PendingInvocation> = pending
+        .into_iter()
+        .filter(|entry| entry.opened_ms >= opened_after_ms)
+        .collect();
+    let settled: Vec<String> = current_turn
+        .iter()
+        .map(|entry| entry.skill.clone())
+        .collect();
+
+    if let Some(outcome) = outcome {
+        if !current_turn.is_empty() {
+            let mut ledger = SkillLedger::load(&weaver);
+            for entry in &current_turn {
+                ledger.record(&entry.skill, outcome);
+            }
+            let _ = ledger.save(&weaver);
+        }
+    }
+
+    settled
+}
+
 #[derive(Debug)]
 pub enum WeaverError {
     Io(io::Error),
@@ -157,6 +302,70 @@ pub struct Episode {
     pub modified: SystemTime,
 }
 
+/// Per-line payload cap in condensed trajectories. Big enough to keep exact
+/// commands, small enough that tool payloads cannot eat the episode budget.
+const CONDENSED_SNIPPET_CHARS: usize = 200;
+
+fn push_condensed_line(out: &mut String, label: &str, body: &str) {
+    let flattened = body.replace('\n', " ");
+    let snippet: String = flattened.chars().take(CONDENSED_SNIPPET_CHARS).collect();
+    let ellipsis = if flattened.chars().count() > CONDENSED_SNIPPET_CHARS {
+        "…"
+    } else {
+        ""
+    };
+    out.push_str(label);
+    out.push_str(": ");
+    out.push_str(&snippet);
+    out.push_str(ellipsis);
+    out.push('\n');
+}
+
+/// Condense a parseable session file into a tool-call trajectory. Returns
+/// `None` when the file does not parse as a session or carries no recipe
+/// signal, letting callers fall back to the raw file content.
+fn condense_session_content(path: &Path) -> Option<String> {
+    let session = crate::session::Session::load_from_path(path).ok()?;
+    if session.messages.is_empty() {
+        return None;
+    }
+
+    let mut out = String::new();
+    for message in &session.messages {
+        for block in &message.blocks {
+            match (message.role, block) {
+                (MessageRole::User, ContentBlock::Text { text }) => {
+                    push_condensed_line(&mut out, "user", text);
+                }
+                (MessageRole::Assistant, ContentBlock::Text { text }) => {
+                    push_condensed_line(&mut out, "assistant", text);
+                }
+                (MessageRole::Assistant, ContentBlock::ToolUse { name, input, .. }) => {
+                    push_condensed_line(&mut out, &format!("tool {name}"), input);
+                }
+                (
+                    _,
+                    ContentBlock::ToolResult {
+                        tool_name,
+                        output,
+                        is_error,
+                        ..
+                    },
+                ) => {
+                    let status = if *is_error { "error" } else { "ok" };
+                    push_condensed_line(&mut out, &format!("result {tool_name} {status}"), output);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    if out.is_empty() {
+        return None;
+    }
+    Some(out)
+}
+
 pub fn collect_episodes(
     cwd: &Path,
     since: Option<SystemTime>,
@@ -187,8 +396,14 @@ pub fn collect_episodes(
     let mut episodes = Vec::new();
     let mut budget = max_total_bytes;
     for (path, modified) in files {
-        let Ok(content) = fs::read_to_string(&path) else {
-            continue;
+        let content = match condense_session_content(&path) {
+            Some(condensed) => condensed,
+            None => {
+                let Ok(raw) = fs::read_to_string(&path) else {
+                    continue;
+                };
+                raw
+            }
         };
         if content.len() > budget {
             // This file alone would blow the remaining budget. Skip it and
@@ -731,6 +946,215 @@ mod tests {
         fs::create_dir_all(&weaver).unwrap();
         fs::write(weaver.join(STATS_FILENAME), "{not json").unwrap();
         assert!(SkillLedger::load(&weaver).is_empty());
+    }
+
+    #[test]
+    fn pending_windows_open_drain_and_clear() {
+        let dir = tempfile::tempdir().unwrap();
+        let weaver = weaver_dir(dir.path());
+
+        assert!(drain_pending(&weaver).is_empty());
+
+        open_attribution_window(&weaver, "fix-clippy-warnings");
+        open_attribution_window(&weaver, "superpowers:brainstorming");
+        open_attribution_window(&weaver, "   ");
+
+        let drained = drain_pending(&weaver);
+        let names: Vec<&str> = drained
+            .iter()
+            .map(|pending| pending.skill.as_str())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["fix-clippy-warnings", "superpowers:brainstorming"]
+        );
+        assert!(drained.iter().all(|pending| pending.opened_ms > 0));
+        assert!(!weaver.join(PENDING_FILENAME).exists());
+        assert!(drain_pending(&weaver).is_empty());
+    }
+
+    #[test]
+    fn clear_pending_for_removes_only_that_skill() {
+        let dir = tempfile::tempdir().unwrap();
+        let weaver = weaver_dir(dir.path());
+        open_attribution_window(&weaver, "skill-alpha");
+        open_attribution_window(&weaver, "skill-beta");
+
+        clear_pending_for(&weaver, "skill-alpha");
+
+        let drained = drain_pending(&weaver);
+        assert_eq!(drained.len(), 1);
+        assert_eq!(drained[0].skill, "skill-beta");
+    }
+
+    #[test]
+    fn drain_pending_discards_stale_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let weaver = weaver_dir(dir.path());
+        fs::create_dir_all(&weaver).unwrap();
+
+        let fresh = now_ms();
+        let raw = format!(
+            r#"[{{"skill":"ancient-skill","opened_ms":1}},{{"skill":"fresh-skill","opened_ms":{fresh}}}]"#
+        );
+        fs::write(weaver.join(PENDING_FILENAME), raw).unwrap();
+
+        let drained = drain_pending(&weaver);
+        assert_eq!(drained.len(), 1);
+        assert_eq!(drained[0].skill, "fresh-skill");
+    }
+
+    #[test]
+    fn pending_load_missing_or_corrupt_is_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let weaver = weaver_dir(dir.path());
+        fs::create_dir_all(&weaver).unwrap();
+        fs::write(weaver.join(PENDING_FILENAME), "{not json").unwrap();
+        assert!(drain_pending(&weaver).is_empty());
+    }
+
+    fn turn_summary_with_tool_errors(tool_errors: &[bool]) -> crate::conversation::TurnSummary {
+        crate::conversation::TurnSummary {
+            assistant_messages: Vec::new(),
+            tool_results: tool_errors
+                .iter()
+                .enumerate()
+                .map(|(index, is_error)| {
+                    crate::session::ConversationMessage::tool_result(
+                        format!("tool-use-{index}"),
+                        format!("tool-{index}"),
+                        format!("output-{index}"),
+                        *is_error,
+                    )
+                })
+                .collect(),
+            prompt_cache_events: Vec::new(),
+            iterations: 1,
+            usage: crate::usage::TokenUsage::default(),
+            auto_compaction: None,
+            lifecycle_warnings: Vec::new(),
+            gate_events: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn classify_turn_outcome_policy() {
+        assert_eq!(classify_turn_outcome(true, 0), Some(SkillOutcome::Failure));
+        assert_eq!(classify_turn_outcome(false, 0), Some(SkillOutcome::Success));
+        assert_eq!(classify_turn_outcome(false, 1), None);
+        assert_eq!(classify_turn_outcome(false, 2), Some(SkillOutcome::Failure));
+    }
+
+    #[test]
+    fn turn_tool_error_count_counts_only_error_results() {
+        let summary = turn_summary_with_tool_errors(&[false, true, true, false]);
+        assert_eq!(turn_tool_error_count(&summary), 2);
+    }
+
+    #[test]
+    fn settle_records_outcome_for_this_turns_windows_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let weaver = weaver_dir(dir.path());
+        open_attribution_window(&weaver, "old-turn-skill");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let turn_start = now_ms();
+        open_attribution_window(&weaver, "this-turn-skill");
+
+        let settled =
+            settle_attribution_windows(dir.path(), Some(SkillOutcome::Success), turn_start);
+        assert_eq!(settled, vec!["this-turn-skill".to_string()]);
+
+        let ledger = SkillLedger::load(&weaver);
+        assert_eq!(ledger.entry("this-turn-skill").unwrap().successes, 1);
+        assert!(ledger.entry("old-turn-skill").is_none());
+        assert!(settle_attribution_windows(dir.path(), Some(SkillOutcome::Success), 0).is_empty());
+    }
+
+    #[test]
+    fn settle_ambiguous_turn_drains_without_recording() {
+        let dir = tempfile::tempdir().unwrap();
+        let weaver = weaver_dir(dir.path());
+        let turn_start = now_ms();
+        open_attribution_window(&weaver, "ambiguous-skill");
+
+        let settled = settle_attribution_windows(dir.path(), None, turn_start);
+        assert_eq!(settled, vec!["ambiguous-skill".to_string()]);
+        assert!(SkillLedger::load(&weaver)
+            .entry("ambiguous-skill")
+            .is_none());
+        assert!(drain_pending(&weaver).is_empty());
+    }
+
+    #[test]
+    fn collect_episodes_condenses_parseable_sessions_to_tool_trajectories() {
+        let dir = tempfile::tempdir().unwrap();
+        let sessions = crate::session::workspace_sessions_dir(dir.path()).unwrap();
+        fs::create_dir_all(&sessions).unwrap();
+
+        let mut session = crate::session::Session::new();
+        session
+            .push_message(ConversationMessage {
+                role: MessageRole::User,
+                blocks: vec![ContentBlock::Text {
+                    text: "Fix the clippy warnings in the runtime crate".to_string(),
+                }],
+                usage: None,
+            })
+            .unwrap();
+        session
+            .push_message(ConversationMessage {
+                role: MessageRole::Assistant,
+                blocks: vec![ContentBlock::ToolUse {
+                    id: "tu1".to_string(),
+                    name: "bash".to_string(),
+                    input: format!(
+                        "{{\"command\":\"cargo clippy\",\"padding\":\"{}\"}}",
+                        "x".repeat(2000)
+                    ),
+                }],
+                usage: None,
+            })
+            .unwrap();
+        session
+            .push_message(ConversationMessage {
+                role: MessageRole::Tool,
+                blocks: vec![ContentBlock::ToolResult {
+                    tool_use_id: "tu1".to_string(),
+                    tool_name: "bash".to_string(),
+                    output: format!("warning: unused import{}", "y".repeat(5000)),
+                    is_error: false,
+                }],
+                usage: None,
+            })
+            .unwrap();
+        let path = sessions.join("condensable.jsonl");
+        session.save_to_path(&path).unwrap();
+        let raw_len = fs::read_to_string(&path).unwrap().len();
+
+        let episodes = collect_episodes(dir.path(), None, 64 * 1024).unwrap();
+        assert_eq!(episodes.len(), 1);
+        let content = &episodes[0].content;
+        assert!(content.contains("user: Fix the clippy warnings"));
+        assert!(content.contains("tool bash:"));
+        assert!(content.contains("result bash ok:"));
+        assert!(
+            content.len() < raw_len / 2,
+            "condensed {} vs raw {}",
+            content.len(),
+            raw_len
+        );
+    }
+
+    #[test]
+    fn collect_episodes_falls_back_to_raw_for_unparseable_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let sessions = crate::session::workspace_sessions_dir(dir.path()).unwrap();
+        fs::create_dir_all(&sessions).unwrap();
+        fs::write(sessions.join("not-a-session.jsonl"), "plain old text\n").unwrap();
+
+        let episodes = collect_episodes(dir.path(), None, 1024).unwrap();
+        assert_eq!(episodes.len(), 1);
+        assert!(episodes[0].content.contains("plain old text"));
     }
 
     #[test]

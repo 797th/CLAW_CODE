@@ -22,6 +22,31 @@ fn env_lock() -> std::sync::MutexGuard<'static, ()> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
+struct EnvVarGuard {
+    key: &'static str,
+    original: Option<std::ffi::OsString>,
+}
+
+impl EnvVarGuard {
+    fn set(key: &'static str, value: Option<&str>) -> Self {
+        let original = std::env::var_os(key);
+        match value {
+            Some(value) => std::env::set_var(key, value),
+            None => std::env::remove_var(key),
+        }
+        Self { key, original }
+    }
+}
+
+impl Drop for EnvVarGuard {
+    fn drop(&mut self) {
+        match self.original.take() {
+            Some(value) => std::env::set_var(self.key, value),
+            None => std::env::remove_var(self.key),
+        }
+    }
+}
+
 #[tokio::test]
 async fn send_message_posts_json_and_parses_response() {
     let state = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
@@ -522,16 +547,20 @@ async fn provider_client_dispatches_anthropic_requests() {
     )
     .await;
 
-    let client = ProviderClient::from_model_with_anthropic_auth(
-        "claude-sonnet-4-6",
-        Some(AuthSource::ApiKey("test-key".to_string())),
-    )
-    .expect("anthropic provider client should be constructed");
-    let client = match client {
-        ProviderClient::Anthropic(client) => {
-            ProviderClient::Anthropic(client.with_base_url(server.base_url()))
+    let client = {
+        let _guard = env_lock();
+        let _endpoint_type = EnvVarGuard::set("CLAW_ENDPOINT_TYPE", Some("disabled-for-test"));
+        let client = ProviderClient::from_model_with_anthropic_auth(
+            "claude-sonnet-4-6",
+            Some(AuthSource::ApiKey("test-key".to_string())),
+        )
+        .expect("anthropic provider client should be constructed");
+        match client {
+            ProviderClient::Anthropic(client) => {
+                ProviderClient::Anthropic(client.with_base_url(server.base_url()))
+            }
+            other => panic!("expected anthropic provider, got {other:?}"),
         }
-        other => panic!("expected anthropic provider, got {other:?}"),
     };
 
     let response = client

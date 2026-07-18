@@ -9,6 +9,7 @@ use crate::config::{
 use crate::dreamer::DreamerError;
 use crate::git_context::GitContext;
 use crate::harness_assets::SkillMeta;
+use crate::skill_weaver::{SkillLedger, QUARANTINE_MIN_INVOCATIONS};
 use crate::workflow::WorkflowPhase;
 use crate::MemoryManager;
 
@@ -220,6 +221,7 @@ pub struct SystemPromptBuilder {
     config: Option<RuntimeConfig>,
     memory_prompt: Option<String>,
     skills: Vec<SkillMeta>,
+    skill_ledger: Option<SkillLedger>,
     workflow_status: Option<String>,
 }
 
@@ -273,6 +275,12 @@ impl SystemPromptBuilder {
         self
     }
 
+    #[must_use]
+    pub fn with_skill_ledger(mut self, ledger: SkillLedger) -> Self {
+        self.skill_ledger = Some(ledger);
+        self
+    }
+
     /// Attach the one-line workflow phase banner (Task 9). Only rendered when
     /// a workflow is active (`phase != Idle`) and gates are not `Off`, so the
     /// model can self-route based on the active gate mode.
@@ -308,7 +316,7 @@ impl SystemPromptBuilder {
                 sections.push(render_instruction_files(&project_context.instruction_files));
             }
         }
-        if let Some(skill_index) = render_skill_index(&self.skills) {
+        if let Some(skill_index) = render_skill_index(&self.skills, self.skill_ledger.as_ref()) {
             sections.push(skill_index);
         }
         if let Some(workflow_status) = &self.workflow_status {
@@ -738,6 +746,7 @@ pub fn load_system_prompt_with_context(
     let memory_prompt =
         MemoryManager::new(cwd.clone(), config.memory().clone()).load_memory_prompt()?;
     let skills = crate::harness_assets::discover(&cwd).skills;
+    let skill_ledger = SkillLedger::load(&crate::skill_weaver::weaver_dir(&cwd));
     let sections = SystemPromptBuilder::new()
         .with_os(os_name, os_version)
         .with_model_family(model_family)
@@ -745,6 +754,7 @@ pub fn load_system_prompt_with_context(
         .with_memory_prompt(memory_prompt)
         .with_runtime_config(config)
         .with_skills(skills)
+        .with_skill_ledger(skill_ledger)
         .build();
     Ok((sections, project_context))
 }
@@ -758,7 +768,7 @@ pub fn load_system_prompt_with_context(
 /// total rendered size; either limit being hit appends a truncation note
 /// pointing at `/skills` for the full list.
 #[must_use]
-pub fn render_skill_index(skills: &[SkillMeta]) -> Option<String> {
+pub fn render_skill_index(skills: &[SkillMeta], ledger: Option<&SkillLedger>) -> Option<String> {
     if skills.is_empty() {
         return None;
     }
@@ -774,7 +784,10 @@ pub fn render_skill_index(skills: &[SkillMeta]) -> Option<String> {
     let mut truncated = skills.len() > MAX_SKILL_INDEX_ENTRIES;
 
     for skill in skills.iter().take(MAX_SKILL_INDEX_ENTRIES) {
-        let entry = format!("- {}: {}", skill.name, skill.description);
+        let entry = match skill_index_annotation(skill, ledger) {
+            Some(annotation) => format!("- {} {}: {}", skill.name, annotation, skill.description),
+            None => format!("- {}: {}", skill.name, skill.description),
+        };
         let entry_len = entry.len() + 1;
         // Reserve room for the truncation note in case we need to stop early.
         if entry_len + note_len > budget {
@@ -790,6 +803,25 @@ pub fn render_skill_index(skills: &[SkillMeta]) -> Option<String> {
     }
 
     Some(lines.join("\n"))
+}
+
+fn skill_index_annotation(skill: &SkillMeta, ledger: Option<&SkillLedger>) -> Option<String> {
+    let learned = skill
+        .path
+        .components()
+        .any(|component| component.as_os_str() == "learned");
+    if !learned {
+        return None;
+    }
+
+    if let Some(record) = ledger.and_then(|entries| entries.entry(&skill.name)) {
+        let judged = record.successes + record.failures;
+        if record.invocations >= QUARANTINE_MIN_INVOCATIONS && judged > 0 {
+            return Some(format!("(learned, {}/{} ok)", record.successes, judged));
+        }
+    }
+
+    Some("(learned, unproven)".to_string())
 }
 
 /// Renders the one-line workflow phase banner (Task 9). Returns `None` when a
@@ -1693,6 +1725,14 @@ mod tests {
         }
     }
 
+    fn learned_skill(name: &str, description: &str) -> SkillMeta {
+        SkillMeta {
+            name: name.to_string(),
+            description: description.to_string(),
+            path: PathBuf::from(format!("/tmp/.claw/skills/learned/{name}/SKILL.md")),
+        }
+    }
+
     #[test]
     fn render_skill_index_lists_names_descriptions_and_invocation_instruction() {
         let skills = vec![
@@ -1700,7 +1740,7 @@ mod tests {
             skill("testing-patterns", "Project test conventions and fixtures"),
         ];
 
-        let rendered = render_skill_index(&skills).expect("skill index should render");
+        let rendered = render_skill_index(&skills, None).expect("skill index should render");
 
         assert!(rendered.contains("# Available skills"));
         assert!(rendered.contains("Invoke with the Skill tool before acting when a task matches:"));
@@ -1710,7 +1750,7 @@ mod tests {
 
     #[test]
     fn render_skill_index_returns_none_for_no_skills() {
-        assert_eq!(render_skill_index(&[]), None);
+        assert_eq!(render_skill_index(&[], None), None);
     }
 
     #[test]
@@ -1719,7 +1759,7 @@ mod tests {
             .map(|i| skill(&format!("skill-{i:02}"), "short description"))
             .collect();
 
-        let rendered = render_skill_index(&skills).expect("skill index should render");
+        let rendered = render_skill_index(&skills, None).expect("skill index should render");
         let entry_count = rendered
             .lines()
             .filter(|line| line.starts_with("- skill-"))
@@ -1736,7 +1776,7 @@ mod tests {
             .map(|i| skill(&format!("skill-{i:02}"), &"x".repeat(200)))
             .collect();
 
-        let rendered = render_skill_index(&skills).expect("skill index should render");
+        let rendered = render_skill_index(&skills, None).expect("skill index should render");
 
         assert!(rendered.len() <= MAX_SKILL_INDEX_BYTES + SKILL_INDEX_TRUNCATION_NOTE.len() + 1);
         assert!(rendered.contains("run /skills for full list"));
@@ -1745,6 +1785,39 @@ mod tests {
             .filter(|line| line.starts_with("- skill-"))
             .count();
         assert!(entry_count < 40);
+    }
+
+    #[test]
+    fn skill_index_annotates_learned_skills_with_ledger_evidence() {
+        use crate::skill_weaver::SkillOutcome;
+
+        let dir = tempfile::tempdir().unwrap();
+        let weaver = crate::skill_weaver::weaver_dir(dir.path());
+        let mut ledger = crate::skill_weaver::SkillLedger::load(&weaver);
+        for _ in 0..3 {
+            ledger.record("proven-skill", SkillOutcome::Invoked);
+        }
+        ledger.record("proven-skill", SkillOutcome::Success);
+        ledger.record("proven-skill", SkillOutcome::Success);
+        ledger.record("proven-skill", SkillOutcome::Failure);
+
+        let skills = vec![
+            skill("hand-written", "A manual skill"),
+            learned_skill("proven-skill", "Earned its keep"),
+            learned_skill("new-skill", "Just woven"),
+        ];
+        let rendered = render_skill_index(&skills, Some(&ledger)).unwrap();
+
+        assert!(rendered.contains("- hand-written: A manual skill"));
+        assert!(rendered.contains("- proven-skill (learned, 2/3 ok): Earned its keep"));
+        assert!(rendered.contains("- new-skill (learned, unproven): Just woven"));
+    }
+
+    #[test]
+    fn skill_index_without_ledger_marks_learned_as_unproven() {
+        let skills = vec![learned_skill("mystery-skill", "No ledger data")];
+        let rendered = render_skill_index(&skills, None).unwrap();
+        assert!(rendered.contains("- mystery-skill (learned, unproven): No ledger data"));
     }
 
     #[test]

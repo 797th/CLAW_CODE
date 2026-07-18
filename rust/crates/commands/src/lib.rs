@@ -5470,6 +5470,7 @@ pub fn run_skills_mark(cwd: &Path, skill: &str, verdict: &str) -> Result<String,
     let mut ledger = runtime::skill_weaver::SkillLedger::load(&weaver);
     ledger.record(skill, outcome);
     ledger.save(&weaver).map_err(|e| e.to_string())?;
+    runtime::skill_weaver::clear_pending_for(&weaver, skill);
     Ok(format!("recorded {verdict} for '{skill}'"))
 }
 
@@ -7359,11 +7360,17 @@ mod tests {
     #[test]
     fn skills_mark_records_outcome() {
         let dir = tempfile::tempdir().unwrap();
+        let weaver = runtime::skill_weaver::weaver_dir(dir.path());
+        runtime::skill_weaver::open_attribution_window(&weaver, "some-skill");
+        runtime::skill_weaver::open_attribution_window(&weaver, "other-skill");
+
         run_skills_mark(dir.path(), "some-skill", "failure").unwrap();
-        let ledger = runtime::skill_weaver::SkillLedger::load(&runtime::skill_weaver::weaver_dir(
-            dir.path(),
-        ));
+        let ledger = runtime::skill_weaver::SkillLedger::load(&weaver);
         assert_eq!(ledger.entry("some-skill").unwrap().failures, 1);
+
+        let pending = runtime::skill_weaver::drain_pending(&weaver);
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].skill, "other-skill");
     }
 
     #[test]
