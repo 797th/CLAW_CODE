@@ -316,7 +316,10 @@ pub struct WeaverConfig {
 impl Default for WeaverConfig {
     fn default() -> Self {
         Self {
-            auto_weave: false,
+            // Auto-weave is on by default: with no `weaver` config present,
+            // the self-improvement loop runs (still gated by the 24h/3-session
+            // auto-weave gate). Set `weaver.autoWeave: false` to opt out.
+            auto_weave: true,
             max_input_bytes: default_weaver_max_input_bytes(),
         }
     }
@@ -2449,7 +2452,7 @@ fn parse_optional_weaver_config(root: &JsonValue) -> Result<WeaverConfig, Config
         return Ok(WeaverConfig::default());
     };
     let weaver = expect_object(weaver_value, "merged settings.weaver")?;
-    let auto_weave = optional_bool(weaver, "autoWeave", "merged settings.weaver")?.unwrap_or(false);
+    let auto_weave = optional_bool(weaver, "autoWeave", "merged settings.weaver")?.unwrap_or(true);
     let max_input_bytes = match optional_u64(weaver, "maxInputBytes", "merged settings.weaver")? {
         Some(value) => usize::try_from(value).map_err(|_| {
             ConfigError::Parse(
