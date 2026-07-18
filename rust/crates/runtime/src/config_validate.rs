@@ -236,6 +236,21 @@ const TOP_LEVEL_FIELDS: &[FieldSpec] = &[
         name: "workflow_gates",
         expected: FieldType::String,
     },
+    FieldSpec {
+        name: "weaver",
+        expected: FieldType::Object,
+    },
+];
+
+const WEAVER_FIELDS: &[FieldSpec] = &[
+    FieldSpec {
+        name: "autoWeave",
+        expected: FieldType::Bool,
+    },
+    FieldSpec {
+        name: "maxInputBytes",
+        expected: FieldType::Number,
+    },
 ];
 
 const HOOKS_FIELDS: &[FieldSpec] = &[
@@ -549,6 +564,15 @@ pub fn validate_config_file(
             sandbox,
             SANDBOX_FIELDS,
             "sandbox",
+            source,
+            &path_display,
+        ));
+    }
+    if let Some(weaver) = object.get("weaver").and_then(JsonValue::as_object) {
+        result.merge(validate_object_keys(
+            weaver,
+            WEAVER_FIELDS,
+            "weaver",
             source,
             &path_display,
         ));
